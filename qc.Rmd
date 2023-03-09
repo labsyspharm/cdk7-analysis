@@ -1,0 +1,459 @@
+---
+title: "DGE"
+author: "Clemens Hug"
+date: "2023-03-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(data.table)
+library(synExtra)
+library(qs)
+
+synapser::synLogin()
+syn <- synDownloader("~/data", .cache = TRUE)
+```
+
+## Reading bcbio count matrices
+
+```{r wrangling_funcs}
+barcode_well_map <- syn("syn12979100") %>%
+  readxl::read_xlsx(sheet = "barcodes_trugrade_384_set1")
+  # rename(Barcode = barcode, Well = well, Plate_ID = plate_id)
+
+ensembl_gtf_file <- "Homo_sapiens.GRCh38.109.gtf.gz"
+if (!file.exists(ensembl_gtf_file)) {
+  download.file(
+    "ftp://ftp.ensembl.org/pub/release-109/gtf/homo_sapiens/Homo_sapiens.GRCh38.109.gtf.gz",
+    ensembl_gtf_file, method = "curl"
+  )
+}
+
+ensembl_gtf <- rtracklayer::readGFF(ensembl_gtf_file) %>%
+  filter(gene_biotype == "protein_coding") %>%
+  distinct(
+    ensembl_gene_id = gene_id,
+    hgnc_symbol = gene_name,
+    gene_biotype
+  ) %>%
+  drop_na(ensembl_gene_id)
+
+prepare_barcode_counts <- function(barcode_count_file, barcode_map) {
+  read_tsv(barcode_count_file, col_names = c("barcode", "count")) %>%
+    mutate(
+      barcode = str_replace(barcode, "^.*([ATCG]{6})$", "\\1")
+    ) %>%
+    left_join(
+      barcode_well_map, by = "barcode"
+    )
+}
+
+prepare_col_meta <- function(colmeta_file, barcode_map) {
+  read_csv(colmeta_file, col_names = "barcode") %>%
+    mutate(
+      barcode = if (all(str_detect(barcode, fixed(":")))) str_split(barcode, fixed(":"), simplify = TRUE)[, 2] else barcode,
+      col_idx = 1:n()
+    ) %>%
+    left_join(
+      barcode_map %>%
+        select(barcode, well),
+      by = "barcode"
+    )
+}
+
+prepare_row_meta <- function(rowmeta_file) {
+  read_csv(rowmeta_file, col_names = "ensembl_gene_id") %>%
+    mutate(row_idx = 1:n())
+}
+
+prepare_mtx_sparse <- function(mtx_file) {
+  read_delim(
+    mtx_file,
+    delim = " ",
+    skip = 3,
+    col_names = c("row_idx", "col_idx", "count"),
+    col_types = "iii"
+  )
+}
+
+prepare_counts <- function(mtx, col_meta, row_meta, gene_mapping) {
+  # browser()
+  mtx %>%
+    left_join(col_meta, by = "col_idx") %>%
+    left_join(row_meta, by = "row_idx") %>%
+    select(well, ensembl_gene_id, count) %>%
+    left_join(
+      gene_mapping, by = "ensembl_gene_id"
+    )
+}
+
+```
+Reading DGE metadata and counts from synapse
+
+```{r load}
+meta <- syn("syn51181405") %>%
+  read_csv() %>%
+  mutate(
+    well_384 = str_replace(well_384, "^([A-Z])([0-9])$", "\\10\\2")
+  ) %>%
+  mutate(
+    experiment_type = case_when(
+      is.na(agent) ~ "empty",
+      agent == "density" ~ "density",
+      TRUE ~ "compound"
+    )
+  )
+
+raw_counts <- prepare_counts(
+  prepare_mtx_sparse(syn("syn51181399")),
+  col_meta = prepare_col_meta(syn("syn51181400"), barcode_well_map),
+  row_meta = prepare_row_meta(syn("syn51181404")),
+  ensembl_gtf
+) %>%
+  select(-gene_biotype)
+
+```
+## Count plots
+
+```{r}
+library(ggbeeswarm)
+
+well_counts <- raw_counts %>%
+  group_by(well) %>%
+  summarize(count = sum(count), .groups = "drop") %>%
+    left_join(
+    meta,
+    by = c("well" = "well_384")
+  )
+
+p <- well_counts %>%
+  drop_na(source_96) %>%
+  ggplot(aes(source_96, count, color = cell_line, shape = experiment_type)) +
+    geom_quasirandom() +
+    scale_y_log10() +
+    geom_hline(yintercept = 5e4) +
+    scale_shape_manual(values = c(density = 3, compound = 16, empty = 4)) +
+    labs(x = "Plate", y = "Total count per well", color = "Cell line", shape = "Experiment type")
+
+dir.create("plots/qc", recursive = TRUE)
+ggsave(
+  "plots/qc/well_counts_beeswarm.pdf", p, width = 10, height = 7
+)
+```
+
+Plotting total gene counts per well against the number of cells seeded into
+each well. Using empty wells as 0 density.
+
+```{r}
+p <- well_counts %>%
+  filter(experiment_type %in% c("density", "empty")) %>%
+  mutate(
+    density = if_else(
+      experiment_type == "density", concentration, 0
+    )
+  ) %>%
+  ggplot(aes(density, count)) +
+    geom_jitter(width = 1000) +
+    labs(x = "Seeding density", y = "Total count per well")
+
+ggsave(
+  "plots/qc/well_counts_vs_density.pdf", p, width = 6, height = 5
+)
+```
+
+## DESeq2
+
+Preparing counts and metadata for DESeq2 analysis.
+
+Excluding any wells with fewer than 5e4 counts.
+
+```{r}
+library(DESeq2)
+
+de_meta <- well_counts %>%
+  filter(
+    experiment_type != "empty",
+    count > 5e4
+  ) %>%
+  drop_na(source_well_96) %>%
+  mutate(
+    condition = paste(cell_line, agent, concentration, timepoint, sep = "_")
+  )
+
+de_counts <- raw_counts %>%
+  filter(well %in% de_meta$well) %>%
+  select(
+    well, ensembl_gene_id, count
+  ) %>%
+  pivot_wider(
+    names_from = well, values_from = count, values_fill = 0
+  )
+
+dir.create("deseq")
+write_csv(
+  de_counts, "deseq/de_counts.csv.gz"
+)
+write_csv(
+  de_meta, "deseq/de_meta.csv.gz"
+)
+```
+
+Only consider genes that have at least 5 counts in more than 10 samples to
+speed up analysis. Doesn't have impact on outcome because DESeq2 would exclude
+these anyways, but take longer.
+
+```{r}
+genes_to_keep <- raw_counts %>%
+  group_by(ensembl_gene_id) %>%
+  summarize(n_over_five = sum(count > 5), .groups = "drop") %>%
+  filter(n_over_five >= 10)
+
+de <- DESeqDataSetFromMatrix(
+  de_counts %>%
+    column_to_rownames("ensembl_gene_id") %>%
+    as.matrix() %>% {
+      .[genes_to_keep$ensembl_gene_id, de_meta$well]
+    },
+  de_meta,
+  design = ~condition
+)
+qsave(
+  de, "deseq/de_input.qs"
+)
+```
+
+For exploratory analysis (PCA etc), use only genes that are differentially
+expressed in *any* condition. To find these genes, use Likelihood-ratio test (LRT)
+from DESeq2, comparing a model with a single term for every condition (~condition) 
+against an intercept-only null model (~1).
+
+```{r}
+des <- DESeq(
+  de, test = "LRT", reduced = ~1,
+  parallel = TRUE, BPPARAM = BiocParallel::MulticoreParam(workers = 4)
+)
+dir.create("qc")
+qsave(
+  des, "qc/deseq_lrt_res.qs"
+)
+
+res_lrt <- results(des, tidy = TRUE)
+
+
+```
+
+## Exploratory analysis
+
+Before PCA, do variance stabilizing transformation improving the distribution
+properties of the counts, similar to, but superior to, to doing log10(x + 1).
+
+Only use genes that have adjusted p-value of <0.01 from LRT before.
+
+```{r}
+vsd <- varianceStabilizingTransformation(de)
+counts_vst <- assay(vsd) %>%
+  as_tibble(rownames = "ensembl_gene_id")
+
+genes_for_pca <- res_lrt %>%
+  filter(padj < 0.01) %>%
+  pull("row")
+
+pca_raw <- prcomp(assay(vsd)[genes_for_pca, ])
+
+pca_tidy <- broom::tidy(pca_raw, matrix = "rotation")
+
+pca_var_tidy <- broom::tidy(pca_raw, matrix = "eigenvalues")
+```
+
+Plot all combinations of components PC1 to PC4 against each other.
+
+```{r}
+ps <- combn(1:4, 2, simplify = FALSE) %>% {
+  tibble(component_1 = map_int(., 1), component_2 = map_int(., 2))
+} %>%
+  rowwise() %>%
+  mutate(
+    p = list(
+      ggplot(
+          pca_tidy %>%
+            filter(PC %in% c(component_1, component_2)) %>%
+            pivot_wider(names_from = PC, values_from = value, names_prefix = "PC_") %>%
+            left_join(meta, by = c("column" = "well_384")),
+          aes_string(paste0("PC_", component_1), paste0("PC_", component_2), color = "cell_line", shape = "source_96")
+        ) +
+          geom_point() +
+          labs(
+            x = paste0("PC ", component_1, " (", signif(filter(pca_var_tidy, PC == component_1)$percent * 100, digits = 2), "%)"),
+            y = paste0("PC ", component_2, " (", signif(filter(pca_var_tidy, PC == component_2)$percent * 100, digits = 2), "%)"),
+            shape = "Plate",
+            color = "Cell line"
+          )
+    )
+  )
+
+library(patchwork)
+ps_combined <- wrap_plots(
+  ps$p, guides = "collect"
+)
+
+ggsave(
+  "plots/qc/vsn_counts_pca.pdf", ps_combined, width = 14, height = 10
+)
+```
+
+For good measure, also attempting UMAP.
+
+```{r}
+set.seed(42)
+umap_raw <- uwot::umap(
+  assay(vsd)[genes_for_pca, ] %>%
+    t(),
+  n_neighbors = 5,
+  init = "spectral",
+  scale = "none"
+)
+
+umap_tidy <- umap_raw %>%
+  as_tibble(rownames = "well") %>%
+  left_join(meta, by = c("well" = "well_384"))
+
+p <- umap_tidy %>%
+  ggplot(
+    aes(V1, V2, color = cell_line, shape = source_96)
+  ) +
+    geom_point()
+ggsave(
+  "plots/qc/vsn_counts_umap.pdf", p, width = 8, height = 6
+)
+```
+
+## Old DGE experiments
+
+Wrangle old DGE experiments, finding conditions that overlap that we can
+compare to the new results.
+
+```{r old_samples}
+library(fst)
+lsp_compound_mapping <- syn("syn26260389") %>%
+  read_fst()
+lsp_compound_names <- syn("syn26260347") %>%
+  read_fst(as.data.table = TRUE) %>% {
+    .[
+      ,
+      head(.SD, n = 1),
+      keyby = .(lspci_id)
+    ]
+  }
+
+raw_counts <- prepare_counts(
+  prepare_mtx_sparse(syn("syn51181399")),
+  col_meta = prepare_col_meta(syn("syn51181400"), barcode_well_map),
+  row_meta = prepare_row_meta(syn("syn51181404")),
+  ensembl_gtf
+) %>%
+  select(-gene_biotype)
+
+
+old_samples_syn <- tribble(
+  ~experiment, ~file_type, ~synapse_id,
+  "dge1", "mtx", "syn18143723",
+  "dge1", "colnames", "syn18143725",
+  "dge1", "rownames", "syn18143724",
+  "dge2", "mtx", "syn17103650",
+  "dge2", "colnames", "syn17103652",
+  "dge2", "rownames", "syn17103651",
+  "dge3", "mtx", "syn25764600",
+  "dge3", "colnames", "syn25764602",
+  "dge3", "rownames", "syn25764604"
+) %>%
+  mutate(
+    file = map_chr(synapse_id, syn)
+  )
+
+old_samples_raw_counts <- old_samples_syn %>%
+  pivot_wider(
+    names_from = file_type, values_from = c(synapse_id, file)
+  ) %>%
+  rowwise() %>%
+  mutate(
+    counts = prepare_counts(
+      prepare_mtx_sparse(file_mtx),
+      col_meta = prepare_col_meta(file_colnames, barcode_well_map),
+      row_meta = prepare_row_meta(file_rownames),
+      ensembl_gtf
+    ) %>%
+      select(-gene_biotype) %>%
+      list()
+  ) %>%
+  ungroup()
+
+old_samples_raw_counts_long <- old_samples_raw_counts %>%
+  select(experiment, counts) %>%
+  unnest(counts)
+
+fwrite(old_samples_raw_counts_long, "deseq/old_samples_raw_counts_long.csv.gz")
+
+old_sample_metas <- tribble(
+  ~experiment, ~meta,
+  "dge1", syn("syn11947020") %>%
+    fread() %>%
+    mutate(
+      `Fluid name` = recode(
+        `Fluid name`,
+        `Drug control` = "DMSO"
+      )
+    ) %>%
+    select(well = `Dispensed well`, agent = `Fluid name`, concentration = `Concentration`),
+  "dge2", syn("syn17114439") %>%
+    fread() %>%
+    mutate(
+      `Fluid name` = if_else(`Fluid name` == "", "DMSO", `Fluid name`)
+    ) %>%
+    transmute(well = `Dispensed well`, agent = `Fluid name`, concentration = as.character(`Concentration`)),
+  "dge3", syn("syn25925490") %>%
+    fread() %>%
+    left_join(
+      lsp_compound_mapping %>%
+        select(lspci_id, external_id),
+      by = c("agent" = "external_id")
+    ) %>%
+    left_join(
+      lsp_compound_names,
+      by = c("lspci_id")
+    ) %>%
+    transmute(well, agent = if_else(agent == "DMSO", "DMSO", name), cell_line, concentration = as.character(concentration), role, timepoint)
+) %>%
+  unnest(meta)
+
+
+fwrite(old_sample_metas, "deseq/old_samples_metas.csv.gz")
+```
+
+Manual inspection reveals that three drug treatments overlap.
+Only consider those.
+
+```{r}
+old_samples_de_meta <- old_sample_metas %>%
+  mutate(
+    agent = recode(
+      agent,
+      `KW-2449` = "KW2449",
+      `kw2449` = "KW2449"
+    )
+  ) %>%
+  filter(
+    agent %in% c(
+      "Baricitinib",
+      "DMSO",
+      "KW2449",
+      "Ruxolitinib"
+    )
+  )
+
+fwrite(old_samples_de_meta, "deseq/old_samples_de_meta.csv.gz")
+
+```
+

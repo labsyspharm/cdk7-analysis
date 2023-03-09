@@ -1,0 +1,245 @@
+---
+title: "DESeq"
+author: "Clemens Hug"
+date: "2023-03-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(data.table)
+library(qs)
+library(DESeq2)
+```
+
+Reading count and metadata tables generated in `qc.Rmd`.
+
+```{r}
+de_meta <- read_csv("deseq/de_meta.csv.gz")
+de_counts <- read_csv("deseq/de_counts.csv.gz")
+
+de_count_mat <- de_counts %>%
+  column_to_rownames("ensembl_gene_id") %>%
+  as.matrix()
+```
+
+Only consider genes that have at least 5 counts in more than 10 samples to
+speed up analysis. Doesn't have impact on outcome because DESeq2 would exclude
+these anyways, but take longer.
+
+```{r}
+genes_to_keep <- de_count_mat %>%
+  magrittr::is_greater_than(5) %>%
+  rowSums() %>% {
+    names(.)[. >= 10]
+  }
+```
+
+Perform differential expression analysis by plate. No treatment / control pairs
+cross plate boundaries so splitting it analysis up by plate makes things easier
+and faster here.
+
+I chose to set up a single model for each plate, instead of separate models for
+each treatment / control pair, because estimates of expression variance might
+be better that way, see https://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#if-i-have-multiple-groups-should-i-run-all-together-or-split-into-pairs-of-groups
+
+```{r}
+de_groups <- de_meta %>%
+  group_by(source_96) %>%
+  summarize(
+    des = DESeqDataSetFromMatrix(
+      de_count_mat[genes_to_keep, well],
+      cur_data(),
+      ~condition
+    ) %>%
+      DESeq(parallel = TRUE, BPPARAM = BiocParallel::MulticoreParam(workers = 6)) %>%
+      list()
+  )
+```
+
+Identifying controls. Anything with DMSO agent is control.
+
+```{r}
+de_controls <- de_meta %>%
+  filter(agent == "DMSO") %>%
+  distinct(
+    source_96, cell_line, timepoint, control_condition = condition
+  )
+```
+
+Matching treatments with appropriate controls by checking whether for any given
+treatment we have DMSO control with matching plate, cell_line, and time point.
+
+```{r}
+de_comps <- de_meta %>%
+  filter(agent != "DMSO") %>%
+  distinct(
+    source_96, cell_line, agent, concentration, timepoint, condition
+  ) %>%
+  inner_join(
+    de_controls
+  )
+
+de_results <- de_groups %>%
+  inner_join(
+    de_comps
+  ) %>%
+  rowwise() %>%
+  mutate(
+    de_res = results(
+      des,
+      contrast = c("condition", condition, control_condition),
+      tidy = TRUE,
+      parallel = TRUE, BPPARAM = BiocParallel::MulticoreParam(workers = 6)
+    ) %>%
+      dplyr::rename(ensembl_gene_id = row) %>%
+      list()
+  ) %>%
+  ungroup()
+```
+
+Compute number of differentially expressed genes per treatment condition and
+average number of gene counts in the contributing wells.
+
+```{r}
+well_counts <- de_count_mat %>%
+  colSums() %>%
+  enframe("well", "count") %>%
+  inner_join(
+    de_meta %>%
+      distinct(well, condition),
+    by = "well"
+  )
+
+de_stats <- de_results %>%
+  select(-des) %>%
+  mutate(
+    n_de = map_int(de_res, ~nrow(filter(.x, padj < 0.05)))
+  ) %>%
+  select(-de_res) %>%
+  rowwise() %>%
+  mutate(
+    count_avg = mean(well_counts[well_counts$condition %in% c(condition, control_condition), ]$count)
+  ) %>%
+  ungroup()
+
+```
+
+Visualize number of DE genes using beeswarm plots.
+
+```{r}
+library(ggbeeswarm)
+library(ggrepel)
+
+p <- de_stats %>%
+  ggplot(aes(cell_line, n_de, color = source_96)) +
+    geom_quasirandom() +
+    geom_text_repel(
+      aes(label = agent),
+      show.legend = FALSE,
+      data = ~.x %>%
+        group_by(cell_line) %>%
+        arrange(desc(n_de)) %>%
+        mutate(agent = if_else(seq_len(n()) <= 4, agent, "")) %>%
+        ungroup()
+    ) +
+    labs(color = "Plate", y = "N differentially expressed", x = "Cell line")
+
+dir.create("plots/deseq")
+ggsave(
+  "plots/deseq/n_de_beeswarm.pdf", p, width = 7, height = 6
+)
+
+p <- de_stats %>%
+  ggplot(aes(source_96, n_de, color = cell_line)) +
+    geom_quasirandom() +
+    geom_text_repel(
+      aes(label = agent, color = NULL),
+      show.legend = FALSE,
+      box.padding = 0.5,
+      max.overlaps = Inf,
+      data = ~.x %>%
+        group_by(source_96) %>%
+        arrange(desc(n_de)) %>%
+        mutate(agent = if_else(seq_len(n()) <= 4, agent, "")) %>%
+        ungroup()
+    ) +
+    labs(x = "Plate", y = "N differentially expressed", color = "Cell line")
+
+ggsave(
+  "plots/deseq/n_de_beeswarm_by_plate.pdf", p, width = 7, height = 6
+)
+```
+
+
+```{r}
+p <- de_stats %>%
+  ggplot(aes(count_avg, n_de, color = cell_line, shape = source_96)) +
+    geom_point() +
+    labs(x = "Mean well count", y = "N differentially expressed", color = "Cell line", shape = "Plate")
+
+ggsave(
+  "plots/deseq/n_de_vs_well_count.pdf", p, width = 7, height = 6
+)
+
+```
+
+Perform differential expression for matching samples from old DGE experiments
+
+```{r old_datasets}
+old_samples_de_meta <- fread("deseq/old_samples_de_meta.csv.gz")
+old_samples_de_counts <- fread("deseq/old_samples_raw_counts_long.csv.gz")
+
+old_samples_de_count_mat <- old_samples_de_counts %>%
+  
+
+de_old_groups <- old_samples_de_meta %>%
+  group_by(experiment) %>%
+  summarize(
+    des = DESeqDataSetFromMatrix(
+      old_samples_de_counts[old_samples_de_meta$well %in% well & old_samples_de_meta$experiment == experiment[1]]
+      de_count_mat[genes_to_keep, well],
+      cur_data(),
+      ~condition
+    ) %>%
+      DESeq(parallel = TRUE, BPPARAM = BiocParallel::MulticoreParam(workers = 6)) %>%
+      list()
+  )
+
+de_controls <- de_meta %>%
+  filter(agent == "DMSO") %>%
+  distinct(
+    source_96, cell_line, timepoint, control_condition = condition
+  )
+
+de_comps <- de_meta %>%
+  filter(agent != "DMSO") %>%
+  distinct(
+    source_96, cell_line, agent, concentration, timepoint, condition
+  ) %>%
+  inner_join(
+    de_controls
+  )
+
+de_results <- de_groups %>%
+  inner_join(
+    de_comps
+  ) %>%
+  rowwise() %>%
+  mutate(
+    de_res = results(
+      des,
+      contrast = c("condition", condition, control_condition),
+      tidy = TRUE,
+      parallel = TRUE, BPPARAM = BiocParallel::MulticoreParam(workers = 6)
+    ) %>%
+      dplyr::rename(ensembl_gene_id = row) %>%
+      list()
+  ) %>%
+  ungroup()
+
+```
+
+
