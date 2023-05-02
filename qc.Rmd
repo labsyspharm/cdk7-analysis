@@ -237,15 +237,52 @@ des <- DESeq(
 )
 dir.create("qc")
 qsave(
-  des, "qc/deseq_lrt_res.qs"
+  des, "qc/deseq_lrt.qs"
 )
 
-res_lrt <- results(des, tidy = TRUE)
-
+res_lrt <- results(des, tidy = TRUE) %>%
+  dplyr::rename(ensembl_gene_id = row)
+write_csv(
+  res_lrt, "qc/deseq_lrt_res.csv.gz"
+)
 
 ```
 
 ## Exploratory analysis
+
+Saving normalized counts (accounting for differences in sequencing depths)
+for manual inspection of results.
+
+Using all genes here, not just the ones with sufficient counts for differential
+expression.
+
+```{r}
+de <- DESeqDataSetFromMatrix(
+  de_counts %>%
+    column_to_rownames("ensembl_gene_id") %>%
+    as.matrix() %>% {
+      .[, de_meta$well]
+    },
+  de_meta,
+  design = ~condition
+)
+
+de <- estimateSizeFactors(de)
+norm_counts <- counts(de, normalized = TRUE) %>%
+  as_tibble(rownames = "ensembl_gene_id")  %>%
+  left_join(
+    ensembl_gtf %>%
+      distinct(ensembl_gene_id, hgnc_symbol),
+    by = "ensembl_gene_id"
+  ) %>%
+  select(ensembl_gene_id, hgnc_symbol, all_of(sort(setdiff(colnames(.), c("hgnc_symbol", "ensembl_gene_id"))))) %>%
+  arrange(ensembl_gene_id)
+
+write_csv(
+  norm_counts, "qc/normalized_counts.csv.gz"
+)
+```
+
 
 Before PCA, do variance stabilizing transformation improving the distribution
 properties of the counts, similar to, but superior to, to doing log10(x + 1).
@@ -255,11 +292,57 @@ Only use genes that have adjusted p-value of <0.01 from LRT before.
 ```{r}
 vsd <- varianceStabilizingTransformation(de)
 counts_vst <- assay(vsd) %>%
-  as_tibble(rownames = "ensembl_gene_id")
+  as_tibble(rownames = "ensembl_gene_id") %>%
+    left_join(
+    ensembl_gtf %>%
+      distinct(ensembl_gene_id, hgnc_symbol),
+    by = "ensembl_gene_id"
+  ) %>%
+  select(ensembl_gene_id, hgnc_symbol, all_of(sort(setdiff(colnames(.), c("hgnc_symbol", "ensembl_gene_id"))))) %>%
+  arrange(ensembl_gene_id)
 
+
+write_csv(
+  counts_vst, "qc/counts_vst.csv.gz"
+)
+```
+
+## Synapse
+
+Upload results to synapse
+
+```{r}
+synStoreMany(
+  c(
+    "qc/normalized_counts.csv.gz",
+    "qc/counts_vst.csv.gz",
+    "qc/deseq_lrt_res.csv.gz",
+    "deseq/de_input.qs",
+    "deseq/de_meta.csv.gz",
+    "deseq/de_counts.csv.gz"
+  ),
+  parentId = "syn51221227",
+  activity = synapser::Activity(
+    used = c(
+      "syn12979100",
+      "syn51181405",
+      "syn51181399",
+      "syn51181400",
+      "syn51181404",
+      "ftp://ftp.ensembl.org/pub/release-109/gtf/homo_sapiens/Homo_sapiens.GRCh38.109.gtf.gz"
+    ),
+    executed = "https://github.com/clemenshug/cdk7-analysis/blob/main/qc.Rmd"
+  ),
+  forceVersion = FALSE
+)
+```
+
+
+
+```{r}
 genes_for_pca <- res_lrt %>%
   filter(padj < 0.01) %>%
-  pull("row")
+  pull("ensembl_gene_id")
 
 pca_raw <- prcomp(assay(vsd)[genes_for_pca, ])
 
