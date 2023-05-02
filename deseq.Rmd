@@ -12,17 +12,58 @@ library(tidyverse)
 library(data.table)
 library(qs)
 library(DESeq2)
+library(synExtra)
+
+synapser::synLogin()
+syn <- synDownloader("~/data", .cache = TRUE)
 ```
 
 Reading count and metadata tables generated in `qc.Rmd`.
 
 ```{r}
-de_meta <- read_csv("deseq/de_meta.csv.gz")
-de_counts <- read_csv("deseq/de_counts.csv.gz")
+de_meta <- syn("syn51221610") %>%
+  read_csv()
+de_counts <- syn("syn51221611") %>%
+  read_csv()
+res_lrt <- syn("syn51221607") %>%
+  read_csv()
+
+genes_for_pca <- res_lrt %>%
+  filter(padj < 0.01) %>%
+  pull("ensembl_gene_id")
+
+ensembl_gtf_file <- "Homo_sapiens.GRCh38.109.gtf.gz"
+if (!file.exists(ensembl_gtf_file)) {
+  download.file(
+    "ftp://ftp.ensembl.org/pub/release-109/gtf/homo_sapiens/Homo_sapiens.GRCh38.109.gtf.gz",
+    ensembl_gtf_file, method = "curl"
+  )
+}
+
+ensembl_gtf <- rtracklayer::readGFF(ensembl_gtf_file) %>%
+  filter(gene_biotype == "protein_coding") %>%
+  distinct(
+    ensembl_gene_id = gene_id,
+    hgnc_symbol = gene_name,
+    gene_biotype
+  ) %>%
+  drop_na(ensembl_gene_id)
 
 de_count_mat <- de_counts %>%
   column_to_rownames("ensembl_gene_id") %>%
   as.matrix()
+
+counts_vst <- syn("syn51221606") %>%
+  read_csv()
+
+vst_mat <- counts_vst %>%
+  select(-hgnc_symbol) %>%
+  column_to_rownames("ensembl_gene_id") %>%
+  as.matrix()
+
+counts_normalized <- syn("syn51221599") %>%
+  read_csv()
+
 ```
 
 Only consider genes that have at least 5 counts in more than 10 samples to
@@ -82,22 +123,46 @@ de_comps <- de_meta %>%
     de_controls
   )
 
+results_deseq_with_shrunk <- function(de, contrast, results_args = list(), shrink_args = list()) {
+  res <- rlang::exec(results, de, contrast = contrast, !!!results_args)
+  res_shrunk <- rlang::exec(lfcShrink, de, res = res, !!!shrink_args)
+  res %>%
+    as.data.frame() %>%
+    rownames_to_column("ensembl_gene_id") %>%
+    left_join(
+      res_shrunk %>%
+        as.data.frame() %>%
+        rownames_to_column("ensembl_gene_id") %>%
+        select(ensembl_gene_id, log2FoldChange, lfcSE),
+      by = "ensembl_gene_id",
+      suffix = c("_mle", "")
+    )
+}
+results_args <- list(
+  parallel = TRUE,
+  BPPARAM = BiocParallel::MulticoreParam(workers = 6)
+)
+
 de_results <- de_groups %>%
   inner_join(
     de_comps
   ) %>%
   rowwise() %>%
   mutate(
-    de_res = results(
+    de_res = results_deseq_with_shrunk(
       des,
       contrast = c("condition", condition, control_condition),
-      tidy = TRUE,
-      parallel = TRUE, BPPARAM = BiocParallel::MulticoreParam(workers = 6)
+      results_args = results_args,
+      shrink_args = c(results_args, list(type = "ashr"))
     ) %>%
-      dplyr::rename(ensembl_gene_id = row) %>%
       list()
   ) %>%
   ungroup()
+
+qsave(
+  de_results,
+  "deseq/deseq_res_vs_dmso.qs"
+)
 ```
 
 Compute number of differentially expressed genes per treatment condition and
@@ -193,7 +258,7 @@ old_samples_de_meta <- fread("deseq/old_samples_de_meta.csv.gz")
 old_samples_de_counts <- fread("deseq/old_samples_raw_counts_long.csv.gz")
 
 old_samples_de_count_mat <- old_samples_de_counts %>%
-  
+
 
 de_old_groups <- old_samples_de_meta %>%
   group_by(experiment) %>%
@@ -242,4 +307,950 @@ de_results <- de_groups %>%
 
 ```
 
+## Vemurafenib + FBS analysis
 
+FBS rescues vemurafenib to some extent. Explore how they interact.
+
+First, identifying relevant samples.
+
+```{r}
+de_meta_vemu <- de_meta %>%
+  filter(source_96 == "Plate 4") %>%
+  extract(
+    agent, c("agent", "concentration_fbs"),
+    regex = "(Vemurafenib)_([0-9]+)%FBS"
+  ) %>%
+  mutate(across(concentration_fbs, as.double))
+
+write_csv(
+  de_meta_vemu,
+  "deseq/de_meta_vemu.csv"
+)
+```
+
+
+Function for plotting expression of a single gene for sanity checking vemurafenib
+results.
+
+
+```{r}
+library(ggbeeswarm)
+counts_normalized_nzmin <- counts_normalized %>%
+  select(-hgnc_symbol) %>%
+  column_to_rownames("ensembl_gene_id") %>%
+  as.matrix() %>% {
+    .5 * min(.[. > 0])
+  }
+plot_expression_single_gene_vemu <- function(gene_symbol, counts = c("normalized", "vst")) {
+  counts <- match.arg(counts)
+  counts_table <- switch(
+    counts,
+    vst = counts_vst,
+    normalized = counts_normalized
+  )
+  df <- counts_table %>%
+    filter(hgnc_symbol == gene_symbol)
+  if (nrow(df) == 0)
+    # Try gene id instead
+    df <- counts_table %>%
+      filter(ensembl_gene_id == gene_symbol)
+   p <- df %>%
+    pivot_longer(
+      -c(ensembl_gene_id, hgnc_symbol), names_to = "well", values_to = "normalized_count"
+    ) %>%
+    inner_join(
+      de_meta_vemu,
+      by = "well"
+    ) %>%
+    #  {
+    #    if (counts == "normalized")
+    #      mutate(
+    #        .,
+    #        zero_count = normalized_count == 0,
+    #        normalized_count = if_else(zero_count, counts_normalized_nzmin, normalized_count)
+    #       )
+    #    else mutate(., zero_count = FALSE)
+    # } %>%
+    # group_by(cell_line, agent, concentration, concentration_fbs, timepoint) %>%
+    # summarize(across(normalized_count, mean), .groups = "drop") %>%
+    mutate(across(starts_with("concentration"), ~fct_inseq(as.character(.x), ordered = TRUE))) %>%
+    ggplot(
+      aes(concentration, y = normalized_count, fill = concentration_fbs, group = concentration_fbs)
+    ) +
+      stat_summary(geom = "col", position = "dodge") +
+      geom_quasirandom(dodge.width = 0.9, varwidth = TRUE, position = "dodge") +
+      facet_wrap(~cell_line) +
+      # scale_shape_manual(values = c(`TRUE` = 25, `FALSE` = 16), guide = "none") +
+      labs(
+        x = "Vemurafenib treatment",
+        fill = "FBS concentration",
+        y = paste(switch(counts, vst = "Variance stabilized", normalized = "Normalized"), "gene count")
+      )
+   if (counts == "normalized")
+     p <- p + scale_y_continuous(
+       trans = scales::pseudo_log_trans(base = 10), breaks = function(...) {
+         l <- list(...)
+         l[[1]][1] <- max(l[[1]][1], 1)
+         x <- rlang::exec(scales::breaks_log(), !!!l)
+         c(0, x)
+       }
+      )
+     # p <- p + scale_y_log10()
+   p
+}
+
+```
+
+
+PCA how FBS and vemurafenib interact qualitatively.
+
+```{r}
+genes_for_pca <- res_lrt %>%
+  filter(padj < 0.01) %>%
+  pull("ensembl_gene_id")
+
+pca_raw_vemu <- prcomp(vst_mat[genes_for_pca, de_meta_vemu$well], scale = FALSE, center = TRUE)
+pca_tidy_vemu <- broom::tidy(pca_raw_vemu, matrix = "rotation")
+pca_var_tidy_vemu <- broom::tidy(pca_raw_vemu, matrix = "eigenvalues")
+
+ps <- combn(1:4, 2, simplify = FALSE) %>% {
+  tibble(component_1 = map_int(., 1), component_2 = map_int(., 2))
+} %>%
+  rowwise() %>%
+  mutate(
+    p = list(
+      ggplot(
+          pca_tidy_vemu %>%
+            filter(PC %in% c(component_1, component_2)) %>%
+            pivot_wider(names_from = PC, values_from = value, names_prefix = "PC_") %>%
+            left_join(de_meta_vemu, by = c("column" = "well")),
+          aes_string(paste0("PC_", component_1), paste0("PC_", component_2), color = "cell_line", shape = "as.factor(concentration)", size = "fct_inseq(as.character(concentration_fbs), ordered = TRUE)")
+        ) +
+          geom_point(alpha = 0.5) +
+          labs(
+            x = paste0("PC ", component_1, " (", signif(filter(pca_var_tidy_vemu, PC == component_1)$percent * 100, digits = 2), "%)"),
+            y = paste0("PC ", component_2, " (", signif(filter(pca_var_tidy_vemu, PC == component_2)$percent * 100, digits = 2), "%)"),
+            shape = "Vemurafenib",
+            color = "Cell line",
+            size = "FBS concentration"
+          )
+    )
+  )
+
+library(patchwork)
+ps_combined <- wrap_plots(
+  ps$p, guides = "collect"
+)
+
+ggsave(
+  "plots/qc/vsn_counts_pca_vemu.pdf", ps_combined, width = 14, height = 10
+)
+```
+
+## DESeq2
+
+Conducting differential expression analysis using different strategies.
+
+### Compare vs baseline sample
+
+Compare each condition to a baseline condition. In this case use the non-vemu
+treated 1% FBS condition as baseline. Compare each condition to the matching
+baseline
+
+```{r}
+de_vemu <- DESeqDataSetFromMatrix(
+  de_count_mat[genes_to_keep, de_meta_vemu$well],
+    de_meta_vemu,
+    ~condition
+) %>%
+  DESeq(parallel = TRUE, BPPARAM = BiocParallel::MulticoreParam(workers = 6))
+```
+
+Use ashr log2FoldChange shrinkage here for moderating extreme fold changes.
+
+```{r }
+de_vs_baseline_vemu <- de_meta_vemu %>%
+  filter(!(concentration == 0 & concentration_fbs == 1)) %>%
+  distinct(
+    cell_line, agent, concentration_fbs, concentration, timepoint, condition
+  ) %>%
+  inner_join(
+    de_meta_vemu %>%
+      filter(concentration == 0, concentration_fbs == 1) %>%
+      distinct(cell_line, agent, timepoint, condition_baseline = condition)
+  ) %>%
+  rowwise() %>%
+  mutate(
+    res = results_deseq_with_shrunk(
+      de_vemu,
+      contrast = c("condition", condition, condition_baseline),
+      results_args = results_args,
+      shrink_args = c(results_args, list(type = "ashr"))
+    ) %>%
+      left_join(
+        ensembl_gtf %>%
+          distinct(ensembl_gene_id, hgnc_symbol),
+        by = "ensembl_gene_id"
+      ) %>%
+      list()
+  ) %>%
+  ungroup()
+
+qsave(
+  de_vs_baseline_vemu,
+  "deseq/deseq_res_vs_baseline.qs"
+)
+```
+
+#### PCA 1-4
+
+Plot all combinations of principal components 1-4 against each other
+
+```{r}
+de_vs_baseline_vemu_res <- de_vs_baseline_vemu %>%
+  unnest(res)
+
+de_vs_baseline_vemu_res %>%
+  filter(hgnc_symbol == "ATP5MF") %>%
+  mutate(across(starts_with("concentration"), ~fct_inseq(as.character(.x), ordered = TRUE))) %>%
+  ggplot(aes(concentration, log2FoldChange, fill = concentration_fbs)) +
+    geom_col(position = position_dodge2(preserve = "single")) +
+    facet_wrap(~cell_line)
+
+de_vs_baseline_vemu_res_mat <- de_vs_baseline_vemu_res %>%
+  select(condition, ensembl_gene_id, log2FoldChange) %>%
+  pivot_wider(names_from = condition, values_from = log2FoldChange) %>%
+  column_to_rownames("ensembl_gene_id") %>%
+  as.matrix()
+
+de_vs_baseline_vemu_res_pca <- prcomp(
+  t(de_vs_baseline_vemu_res_mat)
+)
+
+de_vs_baseline_vemu_res_pca_neat <- de_vs_baseline_vemu_res_pca %>%
+  broom::tidy() %>%
+  dplyr::rename(condition = row) %>%
+  pivot_wider(names_from = PC, values_from = value, names_prefix = "PC_") %>%
+  inner_join(
+    de_meta_vemu %>%
+      filter(!(concentration == 0 & concentration_fbs == 1)) %>%
+      distinct(
+        cell_line, agent, concentration_fbs, concentration, timepoint, condition
+      )
+  )
+
+de_vs_baseline_vemu_res_pca_neat_var <- broom::tidy(de_vs_baseline_vemu_res_pca, matrix = "eigenvalues")
+
+library(ggrepel)
+ps <- combn(1:4, 2, simplify = FALSE) %>% {
+  tibble(component_1 = map_int(., 1), component_2 = map_int(., 2))
+} %>%
+  rowwise() %>%
+  mutate(
+    p = list(
+      ggplot(
+          de_vs_baseline_vemu_res_pca_neat,
+          aes_string(paste0("PC_", component_1), paste0("PC_", component_2), color = "cell_line", shape = "as.factor(concentration)", label = "concentration_fbs")
+        ) +
+          geom_point(alpha = 0.5, size = 3) +
+          geom_text_repel(alpha = 0.7, color = "black", max.overlaps = Inf) +
+          scale_shape_manual(values = c(`1` = 8, `0` = 16)) +
+          labs(
+            x = paste0("PC ", component_1, " (", signif(filter(de_vs_baseline_vemu_res_pca_neat_var, PC == component_1)$percent * 100, digits = 2), "%)"),
+            y = paste0("PC ", component_2, " (", signif(filter(de_vs_baseline_vemu_res_pca_neat_var, PC == component_2)$percent * 100, digits = 2), "%)"),
+            shape = "Vemurafenib",
+            color = "Cell line",
+            size = "FBS concentration"
+          )
+    )
+  )
+
+library(patchwork)
+ps_combined <- wrap_plots(
+  ps$p, guides = "collect"
+)
+
+ggsave(
+  "vemu/plots/pca_1-4_vemu_baseline.pdf", width = 12, height = 8
+)
+```
+
+#### PCA 1-10
+
+Plot PC1 against PC2-10
+
+```{r}
+ps <- 2:10 %>% {
+  tibble(component_1 = 1, component_2 = .)
+} %>%
+  rowwise() %>%
+  mutate(
+    p = list(
+      ggplot(
+          de_vs_baseline_vemu_res_pca_neat,
+          aes_string(paste0("PC_", component_1), paste0("PC_", component_2), color = "cell_line", shape = "as.factor(concentration)", label = "concentration_fbs")
+        ) +
+          geom_point(alpha = 0.5, size = 3) +
+          geom_text_repel(alpha = 0.7, color = "black", max.overlaps = Inf) +
+          scale_shape_manual(values = c(`1` = 8, `0` = 16)) +
+          labs(
+            x = paste0("PC ", component_1, " (", signif(filter(de_vs_baseline_vemu_res_pca_neat_var, PC == component_1)$percent * 100, digits = 2), "%)"),
+            y = paste0("PC ", component_2, " (", signif(filter(de_vs_baseline_vemu_res_pca_neat_var, PC == component_2)$percent * 100, digits = 2), "%)"),
+            shape = "Vemurafenib",
+            color = "Cell line",
+            size = "FBS concentration"
+          )
+    )
+  )
+
+library(patchwork)
+ps_combined <- wrap_plots(
+  ps$p, guides = "collect"
+)
+
+ggsave(
+  "vemu/plots/pca_1-10_vemu_baseline.pdf", width = 12, height = 8
+)
+```
+
+#### PCA by cell line
+
+Same PCA except perform it separately on each cell line. Should make them
+a bit cleaner by removing cell type specific effect.
+
+```{r}
+de_vs_baseline_vemu_res_pca_by_cell_line <- de_vs_baseline_vemu %>%
+  group_by(cell_line) %>%
+  summarize(
+    pca_raw = prcomp(
+      t(de_vs_baseline_vemu_res_mat[, cur_data()$condition])
+    ) %>%
+      list(),
+    .groups = "drop"
+  ) %>%
+  rowwise() %>%
+  mutate(
+    pca_neat = pca_raw %>%
+      broom::tidy() %>%
+      dplyr::rename(condition = row) %>%
+      pivot_wider(names_from = PC, values_from = value, names_prefix = "PC_") %>%
+      inner_join(
+        de_meta_vemu %>%
+          filter(!(concentration == 0 & concentration_fbs == 1)) %>%
+          distinct(
+            cell_line, agent, concentration_fbs, concentration, timepoint, condition
+          )
+      ) %>%
+      list(),
+    pca_var = broom::tidy(pca_raw, matrix = "eigenvalues") %>%
+      list()
+  )
+
+ps <- de_vs_baseline_vemu_res_pca_by_cell_line %>%
+  rowwise() %>%
+  mutate(
+    comps = tibble(component_1 = 1, component_2 = 2:min(8, nrow(pca_raw$x))) %>%
+      list()
+  ) %>%
+  unnest(comps) %>%
+  rowwise() %>%
+  mutate(
+    p = list(
+      ggplot(
+          pca_neat,
+          aes_string(paste0("PC_", component_1), paste0("PC_", component_2), color = "cell_line", shape = "as.factor(concentration)", label = "concentration_fbs")
+        ) +
+          geom_point(alpha = 0.5, size = 3) +
+          geom_text_repel(alpha = 0.7, color = "black", max.overlaps = Inf) +
+          scale_shape_manual(values = c(`1` = 8, `0` = 16)) +
+          labs(
+            x = paste0("PC ", component_1, " (", signif(filter(pca_var, PC == component_1)$percent * 100, digits = 2), "%)"),
+            y = paste0("PC ", component_2, " (", signif(filter(pca_var, PC == component_2)$percent * 100, digits = 2), "%)"),
+            shape = "Vemurafenib",
+            color = "Cell line",
+            size = "FBS concentration",
+            title = cell_line
+          )
+    )
+  )
+
+library(patchwork)
+ps_combined <- ps %>%
+  group_by(cell_line) %>%
+  summarize(
+    p_wrapped = wrap_plots(p, guides = "collect") %>%
+      list(),
+    .groups = "drop"
+  )
+
+pwalk(
+  ps_combined,
+  function(cell_line, p_wrapped, ...)
+    ggsave(
+      paste0("vemu/plots/pca_1-10_by_cell_line_", cell_line, ".pdf"),
+      p_wrapped, width = 12, height = 8
+    )
+)
+
+```
+
+### Compare vemurafenib treated vs untreated pairwise
+
+```{r}
+de_comps_vemu <- de_meta_vemu %>%
+  filter(concentration == 1) %>%
+  distinct(
+    cell_line, agent, concentration_fbs, timepoint, condition
+  ) %>%
+  inner_join(
+    de_meta_vemu %>%
+      filter(concentration == 0) %>%
+      distinct(
+        cell_line, agent, concentration_fbs, timepoint, condition_control = condition
+      )
+  )
+
+de_results_vemu_treated_vs_untreated <- de_comps_vemu %>%
+  rowwise() %>%
+  mutate(
+    de_res = results_deseq_with_shrunk(
+      de_vemu,
+      contrast = c("condition", condition, condition_control),
+      results_args = results_args,
+      shrink_args = c(results_args, list(type = "ashr"))
+    ) %>%
+      left_join(
+        ensembl_gtf %>%
+          distinct(ensembl_gene_id, hgnc_symbol),
+        by = "ensembl_gene_id"
+      ) %>%
+      list()
+  ) %>%
+  ungroup() %>%
+  mutate(
+    n_de = map_int(de_res, ~nrow(filter(.x, padj < 0.05)))
+  )
+
+qsave(
+  de_results_vemu_treated_vs_untreated,
+  "deseq/deseq_res_vemu_treated_vs_untreated.rds"
+)
+```
+
+Make heatmap
+
+```{r}
+de_results_vemu_treated_vs_untreated_res_meta <- de_results_vemu_treated_vs_untreated %>%
+  select(cell_line, agent, concentration_fbs, timepoint, condition) %>%
+  arrange(cell_line, concentration_fbs) %>%
+  mutate(
+    condition = fct_inorder(condition)
+  )
+
+de_results_vemu_treated_vs_untreated_mat <- de_results_vemu_treated_vs_untreated %>%
+  select(condition, de_res) %>%
+  unnest(de_res) %>%
+  select(condition, ensembl_gene_id, log2FoldChange) %>%
+  pivot_wider(names_from = condition, values_from = log2FoldChange, values_fill = 0) %>%
+  column_to_rownames("ensembl_gene_id") %>%
+  as.matrix()
+
+de_results_vemu_treated_vs_untreated %>%
+  select(condition, de_res) %>%
+  unnest(de_res) %>%
+  group_by(ensembl_gene_id) %>%
+  summarise(n_sig = sum(padj < 0.05, na.rm = TRUE), .groups = "drop")
+
+
+library(ComplexHeatmap)
+library(seriation)
+
+ps <- de_results_vemu_treated_vs_untreated_res_meta %>%
+  filter(cell_line != "COLO858") %>%
+  group_by(cell_line) %>%
+  summarize(
+    p = de_results_vemu_treated_vs_untreated_mat[
+      de_results_vemu_treated_vs_untreated %>%
+        select(condition, de_res) %>%
+        unnest(de_res) %>%
+        group_by(ensembl_gene_id) %>%
+        filter(any(padj < 0.05, na.rm = TRUE)) %>%
+        pull(ensembl_gene_id) %>%
+        unique(),
+      as.character(cur_data()$condition)
+    ] %>%
+    Heatmap(
+      cluster_columns = FALSE,
+      cluster_rows = function(mat) {
+        d <- dist(mat)
+        hclust(d, method = "average") %>%
+          reorder(dist = d, method = "olo")
+      }
+    ) %>%
+      list(),
+    .groups = "drop"
+  )
+
+p <- de_results_vemu_treated_vs_untreated_mat[
+    de_results_vemu_treated_vs_untreated %>%
+      select(condition, de_res) %>%
+      unnest(de_res) %>%
+      group_by(ensembl_gene_id) %>%
+      filter(any(padj < 0.05, na.rm = TRUE)) %>%
+      pull(ensembl_gene_id) %>%
+      unique(),
+    as.character(de_results_vemu_treated_vs_untreated_res_meta$condition)
+  ] %>%
+  Heatmap(
+    cluster_columns = FALSE,
+    top_annotation = HeatmapAnnotation(
+      df = de_results_vemu_treated_vs_untreated_res_meta %>%
+        select(condition, cell_line, concentration_fbs, timepoint) %>%
+        column_to_rownames("condition")
+    ),
+    cluster_rows = function(mat) {
+      d <- dist(mat)
+      set.seed(42)
+      hclust(d, method = "average") %>%
+        reorder(dist = d, method = "olo")
+    },
+    show_row_names = FALSE
+  )
+
+
+```
+Plot multiple interactive volcano plots using crosstalk / plotly
+
+```{r}
+de_results_vemu_treated_vs_untreated_long <- de_results_vemu_treated_vs_untreated %>%
+  select(-n_de) %>%
+  unnest(de_res) %>%
+  arrange(cell_line, concentration_fbs) %>%
+  mutate(
+    condition = paste0(cell_line, " ", concentration_fbs, "%") %>%
+      fct_inorder(),
+    gene_id = fcoalesce(hgnc_symbol, ensembl_gene_id)
+  )
+
+
+sd <- crosstalk::SharedData$new(de_results_vemu_treated_vs_untreated_long, key = ~gene_id)
+
+p <- de_results_vemu_treated_vs_untreated_long %>%
+  ggplot(aes(log2FoldChange, -log10(padj), text = paste(gene_id))) +
+    geom_point(alpha = 0.5) +
+    facet_wrap(~condition)
+
+pl <- plotly::ggplotly(p, tooltip = "text") %>%
+  plotly::highlight(on = "plotly_hover", color = "red", selectize = TRUE) %>%
+  plotly::toWebGL()
+```
+
+### Fit linear model
+
+Scaling vemurafenib and FBS concentration to unit variance and zero mean for
+better model convergence. Shouldn't affect outcome except that the magnitude of
+log2FC values are a bit harder to interpret.
+
+```{r}
+de_vemu_lin <- DESeqDataSetFromMatrix(
+  de_count_mat[genes_to_keep, de_meta_vemu$well],
+    de_meta_vemu %>%
+      mutate(across(c(concentration, concentration_fbs), scale)),
+    ~cell_line + concentration_fbs*concentration
+) %>%
+  DESeq(parallel = TRUE, BPPARAM = BiocParallel::MulticoreParam(workers = 6))
+
+de_vemu_lin_res <- resultsNames(de_vemu_lin) %>%
+  setdiff("Intercept") %>%
+  set_names() %>%
+  map(
+    ~lfcShrink(de_vemu_lin, coef = .x) %>%
+      as.data.frame() %>%
+      as_tibble(rownames = "ensembl_gene_id") %>%
+      left_join(
+        ensembl_gtf %>%
+          distinct(ensembl_gene_id, hgnc_symbol),
+        by = "ensembl_gene_id"
+      )
+  ) %>%
+  enframe("coefficient", "res") %>%
+  mutate(
+    n_de = map_int(res, ~nrow(filter(.x, padj < 0.05)))
+  )
+```
+
+
+```{r}
+de_vemu_lin_res_long <- de_vemu_lin_res %>%
+  filter(coefficient != "Intercept") %>%
+  select(coefficient, res) %>%
+  unnest(res) %>%
+  mutate(
+    padj_directed = -log10(if_else(padj == 0, 0.5 * min(padj[padj > 0]), padj)) * sign(log2FoldChange)
+  )
+
+de_vemu_lin_res_long_plot_data <- de_vemu_lin_res_long %>%
+  arrange(pvalue) %>%
+  group_by(coefficient) %>%
+  slice_head(n = 100) %>%
+  ungroup() %>%
+  distinct(ensembl_gene_id) %>%
+  left_join(
+    de_vemu_lin_res_long
+  )
+
+de_vemu_lin_res_long_plot_mat <- de_vemu_lin_res_long_plot_data %>%
+  drop_na(hgnc_symbol) %>%
+  select(hgnc_symbol, coefficient, log2FoldChange) %>%
+  pivot_wider(values_from = log2FoldChange, names_from = coefficient, values_fill = 0) %>%
+  column_to_rownames("hgnc_symbol") %>%
+  as.matrix()
+
+library(ComplexHeatmap)
+library(seriation)
+
+p <- Heatmap(
+  de_vemu_lin_res_long_plot_mat[
+    ,
+    setdiff(colnames(de_vemu_lin_res_long_plot_mat), c("cell_line_COLO858_vs_A375", "cell_line_WM989_vs_A375"))
+  ],
+  cluster_columns = FALSE,
+  cluster_rows = function(mat) {
+    d <- dist(mat)
+    hclust(d, method = "average") %>%
+      reorder(dist = d, method = "olo")
+  }
+)
+
+de_vemu_lin_log2_wide <- de_vemu_lin_res_long %>%
+  select(ensembl_gene_id, coefficient, log2FoldChange, padj) %>%
+  pivot_wider(names_from = coefficient, values_from = c(padj, log2FoldChange))
+
+cor.test(
+  ~ log2FoldChange_concentration_fbs + log2FoldChange_concentration, data = de_vemu_lin_log2_wide
+)
+
+mod <- lm(
+  concentration_fbs ~ concentration, data = de_vemu_lin_log2_wide
+)
+
+p <- de_vemu_lin_log2_wide %>%
+  mutate(
+    signif = (padj_concentration_fbs < 0.05 | padj_concentration < 0.05) %>%
+      replace_na(FALSE)
+  ) %>%
+  arrange(signif) %>%
+  ggplot(
+    aes(
+      log2FoldChange_concentration_fbs, log2FoldChange_concentration,
+      alpha = signif,
+      color = signif
+    )
+  ) +
+    geom_point(shape = 16) +
+    geom_smooth(aes(alpha = NULL, color = NULL), method = "lm", show.legend = FALSE) +
+    scale_alpha_manual(values = c(`TRUE` = 0.5, `FALSE` = 0.05)) +
+    scale_color_manual(values = c(`TRUE` = "black", `FALSE` = "gray50")) +
+    labs(x = "log2 fold change vemurafenib", y = "log2 fold change FBS", color = "significant", alpha = "significant")
+
+dir.create("vemu/plots", recursive = TRUE)
+ggsave(
+  "vemu/plots/vemu_vs_fbs_log2fc_scatter.pdf", width = 7, height = 5
+)
+
+```
+
+
+
+```{r}
+
+de_vemu_lin_by_cell_line <- de_meta_vemu %>%
+  filter(cell_line != "COLO858") %>%
+  group_by(cell_line) %>%
+  summarize(
+    de = DESeqDataSetFromMatrix(
+      de_count_mat[genes_to_keep, cur_data()$well],
+        cur_data() %>%
+          mutate(across(c(concentration, concentration_fbs), scale)),
+        ~concentration_fbs*concentration
+    ) %>%
+      DESeq(parallel = TRUE, BPPARAM = BiocParallel::MulticoreParam(workers = 6)) %>%
+      list(),
+    .groups = "drop"
+  )
+
+de_vemu_lin_res_by_cell_line <- de_vemu_lin_by_cell_line %>%
+  mutate(
+    coefs = map(de, ~tibble(coef = setdiff(resultsNames(.x), "Intercept")))
+  ) %>%
+  unnest(coefs) %>%
+  rowwise() %>%
+  mutate(
+    res = lfcShrink(de, coef = coef) %>%
+      as.data.frame() %>%
+      as_tibble(rownames = "ensembl_gene_id") %>%
+      left_join(
+        ensembl_gtf %>%
+          distinct(ensembl_gene_id, hgnc_symbol),
+        by = "ensembl_gene_id"
+      ) %>%
+      arrange(pvalue) %>%
+      as_tibble() %>%
+      list()
+  ) %>%
+  ungroup() %>%
+  mutate(
+    n_de = map_int(res, ~nrow(filter(.x, padj < 0.05)))
+  )
+```
+How cell-line-specific is DE? Plotting log2FC against each other
+
+```{r}
+ps <- de_vemu_lin_res_by_cell_line %>%
+  select(cell_line, coef, res) %>%
+  unnest(res) %>%
+  select(ensembl_gene_id, hgnc_symbol, coef, cell_line, log2FoldChange, padj) %>%
+  pivot_wider(names_from = cell_line, values_from = c(log2FoldChange, padj)) %>%
+  mutate(
+    signif = replace_na(padj_A375 < 0.05, FALSE) | replace_na(padj_WM989 < 0.05, FALSE)
+  ) %>%
+  arrange(signif) %>%
+  ggplot(
+    aes(
+      log2FoldChange_A375, log2FoldChange_WM989,
+      alpha = signif,
+      color = signif,
+      # for plotly
+      text = paste0(
+        "<b>", fcoalesce(hgnc_symbol, ensembl_gene_id), "</b><br>",
+        "p A375 ", signif(padj_A375, 3), " p WM989 ", signif(padj_WM989, 3), "<br>",
+        "log2FC A375 ", signif(log2FoldChange_A375, 3), " log2FC WM989 ", signif(log2FoldChange_WM989, 3)
+      )
+    )
+  ) +
+    geom_point(shape = 16) +
+    # geom_smooth(aes(alpha = NULL, color = NULL), method = "lm", show.legend = FALSE) +
+    scale_alpha_manual(values = c(`TRUE` = 0.5, `FALSE` = 0.05)) +
+    scale_color_manual(values = c(`TRUE` = "black", `FALSE` = "gray50")) +
+    facet_wrap(~coef, scales = "free")
+
+ggsave(
+  "vemu/plots/cell_line_effect_log2fc_scatter.pdf", ps, width = 13, height = 5
+)
+
+
+library(plotly)
+pl <- ggplotly(ps, tooltip = "text") %>%
+  toWebGL()
+htmlwidgets::saveWidget(
+  pl,
+  "vemu/plots/cell_line_effect_log2fc_scatter.html",
+  selfcontained = TRUE
+)
+```
+
+By cell line in single model with cell-line specific effects
+
+```{r}
+
+de_vemu_lin_by_cell_line_single <- de_meta_vemu %>%
+  filter(cell_line != "COLO858") %>%
+  summarize(
+    de = DESeqDataSetFromMatrix(
+      de_count_mat[genes_to_keep, cur_data()$well],
+        cur_data() %>%
+          mutate(across(c(concentration, concentration_fbs), scale)),
+        ~cell_line*concentration_fbs*concentration
+    ) %>%
+      DESeq(parallel = TRUE, BPPARAM = BiocParallel::MulticoreParam(workers = 6)) %>%
+      list(),
+    .groups = "drop"
+  )
+
+de_vemu_lin_res_by_cell_line_single <- de_vemu_lin_by_cell_line_single %>%
+  mutate(
+    coefs = map(de, ~tibble(coef = setdiff(resultsNames(.x), "Intercept")))
+  ) %>%
+  unnest(coefs) %>%
+  rowwise() %>%
+  mutate(
+    res = lfcShrink(de, coef = coef) %>%
+      as.data.frame() %>%
+      as_tibble(rownames = "ensembl_gene_id") %>%
+      left_join(
+        ensembl_gtf %>%
+          distinct(ensembl_gene_id, hgnc_symbol),
+        by = "ensembl_gene_id"
+      ) %>%
+      arrange(pvalue) %>%
+      as_tibble() %>%
+      list()
+  ) %>%
+  ungroup() %>%
+  mutate(
+    n_de = map_int(res, ~nrow(filter(.x, padj < 0.05)))
+  )
+
+de_vemu_lin_res_by_cell_line_single_pairwise <- de_vemu_lin_by_cell_line_single %>%
+  mutate(
+    contr = tribble(
+      ~coef, ~cell_line, ~contrast,
+      "concentration", "A375", list(c("concentration")),
+      "concentration", "WM989", list(c("concentration", "cell_lineWM989.concentration")),
+      "concentration_fbs", "A375", list(c("concentration_fbs")),
+      "concentration_fbs", "WM989", list(c("concentration_fbs", "cell_lineWM989.concentration_fbs"))
+    ) %>%
+      list()
+  ) %>%
+  unnest(contr) %>%
+  rowwise() %>%
+  mutate(
+    res = lfcShrink(de, contrast = contrast, type = "ashr") %>%
+      as.data.frame() %>%
+      as_tibble(rownames = "ensembl_gene_id") %>%
+      left_join(
+        ensembl_gtf %>%
+          distinct(ensembl_gene_id, hgnc_symbol),
+        by = "ensembl_gene_id"
+      ) %>%
+      arrange(pvalue) %>%
+      as_tibble() %>%
+      list()
+  ) %>%
+  ungroup() %>%
+  mutate(
+    n_de = map_int(res, ~nrow(filter(.x, padj < 0.05)))
+  )
+
+
+
+ps <- de_vemu_lin_res_by_cell_line_single_pairwise %>%
+  select(cell_line, coef, res) %>%
+  unnest(res) %>%
+  select(ensembl_gene_id, hgnc_symbol, coef, cell_line, log2FoldChange, padj) %>%
+  pivot_wider(names_from = cell_line, values_from = c(log2FoldChange, padj)) %>%
+  left_join(
+    de_vemu_lin_res_by_cell_line_single %>%
+      filter(coef %in% c("cell_lineWM989.concentration_fbs", "cell_lineWM989.concentration")) %>%
+      separate(coef, into = c("_", "coef"), sep = "\\.") %>%
+      select(coef, res) %>%
+      unnest(res) %>%
+      select(ensembl_gene_id, coef, padj_interaction = padj)
+  ) %>%
+  mutate(
+    signif = replace_na(padj_interaction < 0.05, FALSE),
+    gene_id = fcoalesce(hgnc_symbol, ensembl_gene_id)
+  ) %>%
+  arrange(signif) %>%
+  {crosstalk::SharedData$new(., key = ~gene_id)} %>%
+  ggplot(
+    aes(
+      log2FoldChange_A375, log2FoldChange_WM989,
+      alpha = signif,
+      color = signif,
+      # for plotly
+      text = paste0(
+        "<b>", gene_id, "</b><br>",
+        "p A375 ", signif(padj_A375, 3), " p WM989 ", signif(padj_WM989, 3), "<br>",
+        "p interaction ", signif(padj_interaction, 3), "<br>",
+        "log2FC A375 ", signif(log2FoldChange_A375, 3), " log2FC WM989 ", signif(log2FoldChange_WM989, 3)
+      )
+    )
+  ) +
+    geom_point(shape = 16) +
+    # geom_smooth(aes(alpha = NULL, color = NULL), method = "lm", show.legend = FALSE) +
+    scale_alpha_manual(values = c(`TRUE` = 0.5, `FALSE` = 0.1)) +
+    scale_color_manual(values = c(`TRUE` = "black", `FALSE` = "gray50")) +
+    facet_wrap(~coef, scales = "free")
+
+ggsave(
+  "vemu/plots/cell_line_effect_log2fc_scatter.pdf", ps, width = 13, height = 5
+)
+
+ggplotly(ps, tooltip = "text") %>%
+  plotly::highlight(on = "plotly_hover", color = "red", opacityDim = 1) %>%
+  toWebGL()
+```
+
+```{r}
+
+de_vemu_lin <- DESeqDataSetFromMatrix(
+  de_count_mat[genes_to_keep, de_meta_vemu$well],
+    de_meta_vemu %>%
+      mutate(across(c(concentration, concentration_fbs), ~as.double(as.integer(fct_inseq(as.character(.x)))))),
+    ~cell_line + concentration_fbs*concentration
+) %>%
+  DESeq(parallel = TRUE, BPPARAM = BiocParallel::MulticoreParam(workers = 6))
+
+de_vemu_lin_res <- resultsNames(de_vemu_lin) %>%
+  set_names() %>%
+  map(
+    ~results(de_vemu_lin, name = .x, tidy = TRUE) %>%
+      dplyr::rename(ensembl_gene_id = row) %>%
+      left_join(
+        ensembl_gtf %>%
+          distinct(ensembl_gene_id, hgnc_symbol),
+        by = "ensembl_gene_id"
+      )
+  ) %>%
+  enframe("coefficient", "res") %>%
+  mutate(
+    n_de = map_int(res, ~nrow(filter(.x, padj < 0.05)))
+  )
+
+de_meta_vemu_nz <- de_meta_vemu %>%
+  filter(concentration_fbs != 0)
+
+de_vemu_lin <- DESeqDataSetFromMatrix(
+  de_count_mat[genes_to_keep, de_meta_vemu_nz$well],
+    de_meta_vemu_nz,
+    ~cell_line + concentration_fbs*concentration
+) %>%
+  DESeq(parallel = TRUE, BPPARAM = BiocParallel::MulticoreParam(workers = 6))
+
+de_vemu_lin_res <- resultsNames(de_vemu_lin) %>%
+  set_names() %>%
+  map(
+    ~results(de_vemu_lin, name = .x, tidy = TRUE) %>%
+      dplyr::rename(ensembl_gene_id = row) %>%
+      left_join(
+        ensembl_gtf %>%
+          distinct(ensembl_gene_id, hgnc_symbol),
+        by = "ensembl_gene_id"
+      )
+  ) %>%
+  enframe("coefficient", "res") %>%
+  mutate(
+    n_de = map_int(res, ~nrow(filter(.x, padj < 0.05)))
+  )
+
+de_meta_vemu_no_colo <- de_meta_vemu_nz %>%
+  filter(cell_line != "COLO858")
+
+de_vemu_lin <- DESeqDataSetFromMatrix(
+  de_count_mat[genes_to_keep, de_meta_vemu_no_colo$well],
+    de_meta_vemu_no_colo %>%
+      mutate(across(c(concentration, concentration_fbs), scale)),
+    ~cell_line*concentration_fbs*concentration
+) %>%
+  DESeq(parallel = TRUE, BPPARAM = BiocParallel::MulticoreParam(workers = 6))
+
+de_vemu_lin_res <- resultsNames(de_vemu_lin) %>%
+  set_names() %>%
+  map(
+    ~results(de_vemu_lin, name = .x, tidy = TRUE) %>%
+      dplyr::rename(ensembl_gene_id = row) %>%
+      left_join(
+        ensembl_gtf %>%
+          distinct(ensembl_gene_id, hgnc_symbol),
+        by = "ensembl_gene_id"
+      )
+  ) %>%
+  enframe("coefficient", "res") %>%
+  mutate(
+    n_de = map_int(res, ~nrow(filter(.x, padj < 0.05)))
+  )
+
+
+
+```
