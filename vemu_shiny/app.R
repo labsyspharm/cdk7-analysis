@@ -15,7 +15,39 @@ vemu_treated_vs_untreated <- qread(
       cell_line,
       "_",
       concentration_fbs
-    )
+    ),
+    across(condition, ~str_replace_all(.x, "[^[:alnum:]]", "_"))
+  ) %>%
+  arrange(
+    cell_line, concentration_fbs
+  )
+
+gene_meta <- vemu_treated_vs_untreated$de_res[[1]] %>%
+  distinct(ensembl_gene_id, hgnc_symbol) %>%
+  mutate(
+    gene_name = coalesce(hgnc_symbol, ensembl_gene_id)
+  ) %>%
+  select(ensembl_gene_id, gene_name)
+
+ensembl_gene_id_2_gene_name <- with(
+  gene_meta,
+  set_names(gene_name, ensembl_gene_id)
+)
+
+vemu_treated_vs_untreated_wide <- vemu_treated_vs_untreated %>%
+  select(condition, de_res) %>%
+  unnest(de_res) %>%
+  mutate(
+    neglog10padj = -log10(if_else(padj == 0, .5 * min(padj[padj > 0]), padj))
+  ) %>%
+  select(condition, ensembl_gene_id, hgnc_symbol, log2FoldChange, neglog10padj) %>%
+  pivot_wider(
+    names_from = condition,
+    values_from = c(log2FoldChange, neglog10padj)
+  ) %>%
+  inner_join(
+    gene_meta,
+    by = "ensembl_gene_id"
   )
 
 normalized_counts <- read_csv(
@@ -51,25 +83,13 @@ plot_expression_single_gene_vemu <- function(gene_symbol, counts = c("normalized
       de_meta_vemu,
       by = "well"
     ) %>%
-    #  {
-    #    if (counts == "normalized")
-    #      mutate(
-    #        .,
-    #        zero_count = normalized_count == 0,
-    #        normalized_count = if_else(zero_count, counts_normalized_nzmin, normalized_count)
-    #       )
-    #    else mutate(., zero_count = FALSE)
-    # } %>%
-    # group_by(cell_line, agent, concentration, concentration_fbs, timepoint) %>%
-    # summarize(across(normalized_count, mean), .groups = "drop") %>%
     mutate(across(starts_with("concentration"), ~fct_inseq(as.character(.x), ordered = TRUE))) %>%
     ggplot(
       aes(concentration, y = normalized_count, fill = concentration_fbs, group = concentration_fbs)
     ) +
-      stat_summary(geom = "col", position = "dodge") +
+      stat_summary(geom = "col", position = "dodge", fun.data = mean_se) +
       geom_quasirandom(dodge.width = 0.9, varwidth = TRUE, position = "dodge") +
       facet_wrap(~cell_line) +
-      # scale_shape_manual(values = c(`TRUE` = 25, `FALSE` = 16), guide = "none") +
       labs(
         x = "Vemurafenib treatment",
         fill = "FBS concentration",
@@ -84,93 +104,131 @@ plot_expression_single_gene_vemu <- function(gene_symbol, counts = c("normalized
          c(0, x)
        }
       )
-     # p <- p + scale_y_log10()
    p
 }
 
 
 
-make_volcano_plot <- function(res) {
+make_volcano_plot <- function(data, condition, title) {
   plot_ly(
-    res %>%
-      drop_na(log2FoldChange, padj),
-    x = ~log2FoldChange,
-    y = ~-log10(padj),
-    customdata = ~hgnc_symbol,
-    hovertext = ~hgnc_symbol,
+    data,
+    x = reformulate(paste0("log2FoldChange_", condition)),
+    y = reformulate(paste0("neglog10padj_", condition)),
+    customdata = ~ensembl_gene_id,
+    hovertext = ~gene_name,
     hoverinfo = "text",
     type = "scatter",
     mode = "markers",
-    width = 200, height = 200
+    # make the points a bit transparent
+    opacity = 0.5
   ) %>%
-    htmlwidgets::onRender(
-      "
-      function(el) {
-        el.on('plotly_hover', function(d) {
-          var id = d.points[0].customdata;
-          console.log(id);
-          PlotlyHoverGroups.setHoveredPoint('volcano-plots', id);
-        });
-      }
-    ") %>%
-    toWebGL()
+    layout(
+      annotations = list(
+        x = 0.5 , y = 1, text = title, showarrow = FALSE,
+        xref = 'paper', yref = 'paper',
+        xanchor = "center", yanchor = "bottom"
+      ),
+      showlegend = FALSE
+    )
 }
 
-        # el.on('plotly_unhover', function(d) {
-        #   PlotlyHoverGroups.resetHoveredPoints('volcano-plots');
-        # });
-
-volcano_plot_outputs <- pmap(
-  vemu_treated_vs_untreated,
-  function(plot_output_name, cell_line, concentration_fbs, de_res, ...) {
-    card(
-      card_header(cell_line),
-      card_body(
-        p(concentration_fbs, "% FBS"),
-        plotlyOutput(
-          plot_output_name
-          # width = "50rem", height = "50rem"
-        )
+ui <- fluidPage(
+  plotlyOutput("plot_out_volcano", height = "600px"),
+  fluidRow(
+    column(
+      width = 4,
+      uiOutput("out_selected_gene"),
+    ),
+    column(
+      width = 8,
+      radioButtons(
+        "count_type",
+        "Count normalization",
+        choices = c(
+          "normalized" = "normalized",
+          "variance stabilized" = "vst"
+        ),
+        selected = "normalized"
       )
     )
-  }
+  ),
+  plotOutput("plot_out_expression_bars")
 )
 
-ui <- page_fluid(
-  theme = bs_theme(version = 5),
-  tags$head(tags$script(src="js/plotly_hover_groups.js")),
-  verticalLayout(
-    rlang::exec(layout_column_wrap, width = "200px", !!!volcano_plot_outputs),
-    plotOutput("plot_out_expression_bars", width = "50rem", height = "50rem"),
-  )
+library(crosstalk)
+vemu_treated_vs_untreated_ct <- SharedData$new(
+  vemu_treated_vs_untreated_wide,
+  key = ~gene_name,
+  group = "Gene symbol"
 )
-
-server <- function(input, output, session) {
-  pwalk(
-    vemu_treated_vs_untreated,
-    function(plot_output_name, de_res, ...) {
-      output[[plot_output_name]] <- renderPlotly(
-        make_volcano_plot(de_res)
+volcano_plots <- vemu_treated_vs_untreated %>%
+  pmap(
+    function(cell_line, concentration_fbs, condition, ...) {
+      make_volcano_plot(
+        data = vemu_treated_vs_untreated_ct,
+        condition = condition,
+        title = paste0(cell_line, " ", concentration_fbs, "% FBS")
       )
     }
   )
-  session$sendCustomMessage(
-    type = "add-plotly-hover-group",
-    message = list(
-      id = "volcano-plots",
-      members = vemu_treated_vs_untreated$plot_output_name
+
+volcano_plots_combined <- subplot(
+  volcano_plots,
+  nrows = 3,
+  shareX = TRUE,
+  shareY = TRUE,
+  titleX = FALSE,
+  titleY = FALSE
+) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "log2FoldChange"),
+      yaxis = list(title = "-log10(padj)")
     )
+  ) %>%
+  event_register("plotly_click") %>%
+  highlight(
+    on = "plotly_hover",
+    persistent = FALSE,
+    selectize = TRUE,
+    selected = attrs_selected(
+      opacity = 1,
+      marker = list(color = "black", size = 10)
+    )
+  ) %>%
+  toWebGL()
+
+volcano_plots_combined$x$source <- "plot_out_volcano"
+
+server <- function(input, output, session) {
+  output$plot_out_volcano <- renderPlotly(
+    volcano_plots_combined
   )
+  r_selected_gene <- reactive({
+    event_data("plotly_click", source = "plot_out_volcano")$customdata
+  })
+  output$out_selected_gene <- renderUI({
+    req(r_selected_gene())
+    tags$b(ensembl_gene_id_2_gene_name[r_selected_gene()])
+  })
+  output$plot_out_expression_bars <- renderPlot({
+    validate(
+      need(r_selected_gene(), "Click on a point in the volcano plot to select a gene")
+    )
+    plot_expression_single_gene_vemu(
+      gene_symbol = r_selected_gene(),
+      counts = input$count_type
+    )
+  })
 }
 
-addResourcePath(
-  prefix = "js",
-  directoryPath = here("vemu_shiny", "js")
-)
 shinyApp(
   ui, server,
   options = list(port = 4321, launch.browser = FALSE)
 )
+
+
+
 
 
 
