@@ -1,5 +1,4 @@
 library(shiny)
-library(bslib)
 library(plotly)
 library(tidyverse)
 library(here)
@@ -170,7 +169,10 @@ make_volcano_plot <- function(data, condition, title) {
     #   "<i>adjusted p-value:</i> %{text}"
     # ),
     type = "scatter",
-    mode = "markers"
+    mode = "markers",
+    marker = list(
+      opacity = 0.8
+    )
   ) %>%
     layout(
       annotations = list(
@@ -183,7 +185,10 @@ make_volcano_plot <- function(data, condition, title) {
 }
 
 ui <- fluidPage(
-  plotlyOutput("plot_out_volcano", height = "600px"),
+  tagList(
+    actionButton("plot_gene", "Plot selected gene"),
+    plotlyOutput("plot_out_volcano", height = "600px"),
+  ),
   fluidRow(
     column(
       width = 4,
@@ -245,11 +250,17 @@ volcano_plots_combined <- subplot(
       yaxis = list(title = "-log10(padj)")
     )
   ) %>%
-  event_register("plotly_click") %>%
   highlight(
     on = "plotly_hover",
     persistent = FALSE,
-    selectize = TRUE,
+    selectize = list(
+      onItemAdd = htmlwidgets::JS(r"{
+        function(value, $item) {
+          Shiny.setInputValue("hovered_gene", value);
+        }
+      }"),
+      closeAfterSelect = TRUE
+    ),
     opacityDim = 1,
     selected = attrs_selected(
       opacity = 1,
@@ -265,12 +276,28 @@ server <- function(input, output, session) {
   output$plot_out_volcano <- renderPlotly(
     volcano_plots_combined
   )
-  r_selected_gene <- reactive({
-    event_data("plotly_click", source = "plot_out_volcano")$customdata
+  r_selected_gene <- reactiveVal()
+  observe({
+    r_selected_gene(
+      ensembl_gene_id_2_gene_name[
+        event_data("plotly_click", source = "plot_out_volcano")$customdata
+      ]
+    )
   })
+  bindEvent(
+    observe({
+      new_gene <- input$hovered_gene
+      # Leave reactive unchanged if current selection is invalid
+      if(!is.null(new_gene))
+      r_selected_gene(new_gene)
+    }),
+    input$plot_gene
+  )
   output$out_selected_gene <- renderUI({
-    req(r_selected_gene())
-    tags$b(ensembl_gene_id_2_gene_name[r_selected_gene()])
+    validate(
+      need(r_selected_gene(), "No gene selected")
+    )
+    tags$b(r_selected_gene())
   })
   output$plot_out_expression_bars <- renderPlot({
     validate(
