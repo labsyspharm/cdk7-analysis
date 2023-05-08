@@ -23,6 +23,10 @@ vemu_treated_vs_untreated <- qread(
     cell_line, concentration_fbs
   )
 
+vemu_linear_res <- qread(
+  here("data", "deseq_res_linear_ordinal_by_cell_line.qs")
+)
+
 vemu_treated_vs_untreated_long <- vemu_treated_vs_untreated %>%
   mutate(
     condition_print = paste0(
@@ -68,7 +72,13 @@ vemu_treated_vs_untreated_wide <- vemu_treated_vs_untreated %>%
     values_from = c(log2FoldChange, neglog10padj, padj, hovertext)
   )
 
-
+vemu_linear_res_long <- vemu_linear_res %>%
+  select(-n_de) %>%
+  unnest(res) %>%
+  inner_join(
+    gene_meta,
+    by = "ensembl_gene_id"
+  )
 
 normalized_counts <- read_csv(
   here("data", "normalized_counts.csv.gz")
@@ -136,7 +146,7 @@ plot_expression_single_gene_vemu <- function(gene_symbol, counts = c("normalized
       aes(concentration, y = normalized_count, fill = concentration_fbs, group = concentration_fbs)
     ) +
       stat_summary(geom = "col", position = "dodge", fun.data = mean_se) +
-      geom_quasirandom(dodge.width = 0.9, varwidth = TRUE, position = "dodge") +
+      geom_quasirandom(dodge.width = 0.9, varwidth = TRUE, position = "dodge", groupOnX = TRUE) +
       facet_wrap(~cell_line) +
       labs(
         x = "Vemurafenib treatment",
@@ -185,9 +195,21 @@ make_volcano_plot <- function(data, condition, title) {
 }
 
 ui <- fluidPage(
-  tagList(
-    actionButton("plot_gene", "Plot selected gene"),
-    plotlyOutput("plot_out_volcano", height = "600px"),
+  actionButton("plot_gene", "Plot selected gene"),
+  tabsetPanel(
+    type = "tabs",
+    tabPanel(
+      "Vemurafenib vs. untreated",
+      plotlyOutput("plot_out_volcano", height = "600px")
+    ),
+    tabPanel(
+      "Linear model",
+      plotlyOutput("plot_out_linear", height = "400px")
+    ),
+    tabPanel(
+      "Selected genes",
+      uiOutput("out_selected_genes")
+    )
   ),
   fluidRow(
     column(
@@ -268,13 +290,69 @@ volcano_plots_combined <- subplot(
     ),
     debounce = 10
   ) %>%
+  event_register("plotly_selected") %>%
   toWebGL()
 
 volcano_plots_combined$x$source <- "plot_out_volcano"
 
+vemu_linear_res_ct <- vemu_linear_res_long %>%
+  select(ensembl_gene_id, gene_name, coef, cell_line, log2FoldChange, padj) %>%
+  pivot_wider(names_from = cell_line, values_from = c(log2FoldChange, padj)) %>%
+  mutate(
+    signif = replace_na(padj_A375 < 0.05, FALSE) | replace_na(padj_WM989 < 0.05, FALSE)
+  ) %>%
+  arrange(signif) %>%
+  SharedData$new(key = ~gene_name, group = "Gene symbol ")
+
+linear_res_plots_combined <- vemu_linear_res_ct %>%
+  ggplot(
+    aes(
+      log2FoldChange_A375, log2FoldChange_WM989,
+      alpha = signif,
+      color = signif,
+      customdata = ensembl_gene_id,
+      # for plotly
+      text = paste0(
+        "<b>", gene_name, "</b><br>",
+        "p A375 ", signif(padj_A375, 3), " p WM989 ", signif(padj_WM989, 3), "<br>",
+        "log2FC A375 ", signif(log2FoldChange_A375, 3), " log2FC WM989 ", signif(log2FoldChange_WM989, 3)
+      )
+    )
+  ) +
+    geom_point(shape = 16) +
+    scale_alpha_manual(values = c(`TRUE` = 0.5, `FALSE` = 0.2)) +
+    scale_color_manual(values = c(`TRUE` = "black", `FALSE` = "gray50")) +
+    facet_wrap(~coef, scales = "free")
+
+linear_res_plots_combined_plotly <- linear_res_plots_combined %>%
+  ggplotly(source = "plot_out_volcano", tooltip = "text") %>%
+  highlight(
+    on = "plotly_hover",
+    persistent = FALSE,
+    selectize = list(
+      onItemAdd = htmlwidgets::JS(r"{
+        function(value, $item) {
+          Shiny.setInputValue("hovered_gene", value);
+        }
+      }"),
+      closeAfterSelect = TRUE
+    ),
+    opacityDim = 1,
+    selected = attrs_selected(
+      opacity = 1,
+      marker = list(color = "red", size = 10)
+    ),
+    debounce = 10
+  ) %>%
+  event_register("plotly_selected") %>%
+  toWebGL()
+
 server <- function(input, output, session) {
   output$plot_out_volcano <- renderPlotly(
     volcano_plots_combined
+  )
+  output$plot_out_linear <- renderPlotly(
+    linear_res_plots_combined_plotly
   )
   r_selected_gene <- reactiveVal()
   observe({
@@ -293,6 +371,26 @@ server <- function(input, output, session) {
     }),
     input$plot_gene
   )
+  r_brushed_genes <- reactive({
+    data <- event_data("plotly_selected", source = "plot_out_volcano")
+    req(nrow(data) > 0)
+    data$customdata
+  })
+  output$out_selected_genes <- renderUI({
+    validate(
+      need(r_brushed_genes(), "No genes brushed")
+    )
+    tagList(
+      tags$b("Brushed genes:"),
+      rlang::exec(
+        tags$ul,
+        !!!map(
+          r_brushed_genes(),
+          ~tags$li(ensembl_gene_id_2_gene_name[.x])
+        )
+      )
+    )
+  })
   output$out_selected_gene <- renderUI({
     validate(
       need(r_selected_gene(), "No gene selected")
@@ -322,3 +420,4 @@ shinyApp(
   ui, server,
   options = list(port = 4321, launch.browser = FALSE)
 )
+
