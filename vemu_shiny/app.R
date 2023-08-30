@@ -105,7 +105,10 @@ filter_by_gene <- function(data, gene_symbol) {
 }
 
 plot_de_single_gene_vemu <- function(gene_symbol) {
-  filtered <- filter_by_gene(vemu_treated_vs_untreated_long, gene_symbol)
+  filtered <- filter_by_gene(vemu_treated_vs_untreated_long, gene_symbol) %>%
+    mutate(
+      padj = replace_na(padj, 1),
+    )
   p <- ggplot(
     filtered,
     aes(
