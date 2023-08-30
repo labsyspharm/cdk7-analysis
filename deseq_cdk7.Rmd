@@ -1,0 +1,1362 @@
+---
+title: "CDK7 DESeq2"
+author: "Clemens Hug"
+date: "2023-07-28"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(data.table)
+library(qs)
+library(DESeq2)
+library(synExtra)
+library(IHW)
+
+synapser::synLogin()
+syn <- synDownloader("~/data", .cache = TRUE)
+
+syn_analysis <- "syn51221227"
+```
+
+Reading count and metadata tables generated in `qc.Rmd`.
+
+```{r}
+
+ensembl_gtf_file <- "Homo_sapiens.GRCh38.109.gtf.gz"
+if (!file.exists(ensembl_gtf_file)) {
+  download.file(
+    "ftp://ftp.ensembl.org/pub/release-109/gtf/homo_sapiens/Homo_sapiens.GRCh38.109.gtf.gz",
+    ensembl_gtf_file, method = "curl"
+  )
+}
+
+ensembl_gtf <- rtracklayer::readGFF(
+  ensembl_gtf_file
+) %>%
+  distinct(
+    ensembl_gene_id = gene_id,
+    hgnc_symbol = gene_name,
+    gene_biotype
+  ) %>%
+  drop_na(ensembl_gene_id) %>%
+  mutate(
+    gene_name = coalesce(hgnc_symbol, ensembl_gene_id)
+  )
+
+barcode_well_map <- syn("syn12979100") %>%
+  readxl::read_xlsx(sheet = "barcodes_trugrade_384_set1")
+  # rename(Barcode = barcode, Well = well, Plate_ID = plate_id)
+
+
+
+prepare_barcode_counts <- function(barcode_count_file, barcode_map) {
+  read_tsv(barcode_count_file, col_names = c("barcode", "count")) %>%
+    mutate(
+      barcode = str_replace(barcode, "^.*([ATCG]{6})$", "\\1")
+    ) %>%
+    left_join(
+      barcode_well_map, by = "barcode"
+    )
+}
+
+prepare_col_meta <- function(colmeta_file, barcode_map) {
+  read_csv(colmeta_file, col_names = "barcode") %>%
+    mutate(
+      barcode = if (all(str_detect(barcode, fixed(":")))) str_split(barcode, fixed(":"), simplify = TRUE)[, 2] else barcode,
+      col_idx = 1:n()
+    ) %>%
+    left_join(
+      barcode_map %>%
+        select(barcode, well),
+      by = "barcode"
+    )
+}
+
+prepare_row_meta <- function(rowmeta_file) {
+  read_csv(rowmeta_file, col_names = "ensembl_gene_id") %>%
+    mutate(row_idx = 1:n())
+}
+
+prepare_mtx_sparse <- function(mtx_file) {
+  read_delim(
+    mtx_file,
+    delim = " ",
+    skip = 3,
+    col_names = c("row_idx", "col_idx", "count"),
+    col_types = "iii"
+  )
+}
+
+prepare_counts <- function(mtx, col_meta, row_meta, gene_mapping) {
+  # browser()
+  mtx %>%
+    left_join(col_meta, by = "col_idx") %>%
+    left_join(row_meta, by = "row_idx") %>%
+    select(well, ensembl_gene_id, count) %>%
+    left_join(
+      gene_mapping, by = "ensembl_gene_id"
+    )
+}
+
+
+```
+
+```{r}
+raw_synapse_old <- synGlob(
+  "syn52226362", "*", "*mtx*"
+)
+
+meta_old <- syn("syn21544269") %>%
+  read_csv() %>%
+  transmute(
+    experiment = "cdk_467_2019_08",
+    plate_id = plate,
+    batch_id = plate,
+    well,
+    cell_line,
+    agent  = recode(agent, "DMSO" = "control"),
+    agent_conc = concentration,
+    time = timepoint
+  ) %>%
+  drop_na(cell_line)
+
+meta_new <- syn("syn51181405") %>%
+  read_csv() %>%
+  filter(
+    source_96 %in% c("Plate 2", "Plate 3"),
+    agent != "7 Fluids"
+  ) %>%
+  transmute(
+    experiment = "cdk_467_2023_02",
+    plate_id = 1,
+    batch_id = str_match(source_96, "Plate ([0-9]+)")[, 2] %>% as.numeric(),
+    well = str_replace(well_384, "^([A-Z])([0-9])$", "\\10\\2"),
+    cell_line,
+    agent  = recode(agent, "DMSO" = "control"),
+    agent_conc = concentration,
+    time = timepoint
+  ) %>%
+  mutate(
+    agent = if_else(str_detect(cell_line, "YKLr"), "YKLr", agent),
+    agent_conc = if_else(str_detect(cell_line, "YKLr"), 1, agent_conc),
+    cell_line = str_replace(cell_line, "-YKLr", "")
+  )
+
+meta_all <- bind_rows(meta_old, meta_new) %>%
+  mutate(
+    sample_id = paste(experiment, plate_id, well, sep = "_")
+  )
+```
+
+
+```{r}
+meta_all %>%
+  dplyr::count(agent) %>%
+  View()
+
+meta_all %>%
+  dplyr::count(cell_line, agent) %>%
+  View()
+```
+
+
+
+```{r}
+raw_synapse_all <- raw_synapse_old %>%
+  enframe("file_name", "synapse_id") %>%
+  filter(!str_detect(file_name, "dupes")) %>%
+  mutate(
+    file_type = case_when(
+      str_ends(file_name, ".mtx") ~ "mtx",
+      str_ends(file_name, "colnames") ~ "colnames",
+      str_ends(file_name, "rownames") ~ "rownames"
+    ),
+    plate_id = as.double(str_match(file_name, "S([0-9]+)")[, 2]),
+    experiment = "cdk_467_2019_08"
+  ) %>%
+  bind_rows(
+    tribble(
+      ~synapse_id, ~file_type,
+      "syn51181399", "mtx",
+      "syn51181400", "colnames",
+      "syn51181404", "rownames"
+    ) %>%
+      mutate(
+        plate_id = 1,
+        experiment = "cdk_467_2023_02"
+      )
+  ) %>%
+  mutate(
+    file_path = map_chr(synapse_id, syn)
+  )
+
+files_all <- raw_synapse_all %>%
+  pivot_wider(values_from = c(file_name, synapse_id, file_path), names_from = file_type)
+
+counts_raw <- files_all %>%
+  mutate(
+    col_meta = map(file_path_colnames, ~prepare_col_meta(.x, barcode_map = barcode_well_map)),
+    row_meta = map(file_path_rownames, ~prepare_row_meta(.x)),
+    mtx = map(file_path_mtx, ~prepare_mtx_sparse(.x)),
+    counts = pmap(
+      list(mtx, col_meta, row_meta),
+      prepare_counts,
+      gene_mapping = ensembl_gtf
+    )
+  )
+
+```
+
+
+
+```{r}
+counts_all <- counts_raw %>%
+  select(experiment, plate_id, counts) %>%
+  unnest(counts)
+
+well_counts <- counts_all %>%
+  group_by(experiment, plate_id, well) %>%
+  summarize(
+    total_count = sum(count),
+    .groups = "drop"
+  ) %>%
+  inner_join(
+    meta_all,
+    by = c("experiment", "plate_id", "well")
+  )
+
+samples_to_keep <- well_counts %>%
+  filter(total_count > 80000)
+
+genes_to_keep <- counts_all %>%
+  group_by(
+    ensembl_gene_id
+  ) %>%
+  summarize(
+    keep = sum(count > 5) > 5,
+    .groups = "drop"
+  )
+```
+
+```{r}
+meta_kept <- meta_all %>%
+  semi_join(
+    samples_to_keep,
+    by = c("experiment", "plate_id", "well")
+  )
+
+conditions_kept <- meta_kept %>%
+  distinct(experiment, plate_id, batch_id,cell_line, agent, time) %>%
+  mutate(
+    condition_id = paste(experiment, plate_id, batch_id, cell_line, agent, time, sep = "_")
+  )
+
+counts_kept <- counts_all %>%
+  semi_join(
+    samples_to_keep,
+    by = c("experiment", "plate_id", "well")
+  ) %>%
+  semi_join(
+    genes_to_keep %>%
+      filter(keep),
+    by = "ensembl_gene_id"
+  ) %>%
+  inner_join(
+    meta_all %>%
+      select(experiment, plate_id, well, sample_id),
+    by = c("experiment", "plate_id", "well")
+  )
+```
+
+```{r}
+counts_mat <- counts_kept %>%
+  select(sample_id, ensembl_gene_id, count) %>%
+  pivot_wider(names_from = sample_id, values_from = count, values_fill = 0L) %>%
+  column_to_rownames("ensembl_gene_id") %>%
+  as.matrix()
+
+size_factors <- DESeq2::estimateSizeFactorsForMatrix(counts_mat)
+
+counts_mat_corrected <- t(t(counts_mat) / size_factors)
+
+counts_corrected <- counts_mat_corrected %>%
+  as_tibble(rownames = "ensembl_gene_id") %>%
+  pivot_longer(
+    cols = -ensembl_gene_id,
+    names_to = "sample_id",
+    values_to = "count"
+  )
+```
+
+```{r}
+meta_deseq <- meta_kept %>%
+  mutate(
+    across(time, ~as.factor(as.character(.x))),
+    across(batch_id, ~as.factor(as.character(.x)))
+  ) %>%
+  arrange(match(sample_id, colnames(counts_mat))) %>%
+  column_to_rownames("sample_id")
+```
+
+
+Variance stabilizing transformation
+
+```{r}
+dds <- DESeqDataSetFromMatrix(
+  counts_mat,
+  colData = meta_deseq,
+  design = ~experiment + agent + cell_line + time
+)
+
+vsd <- varianceStabilizingTransformation(dds)
+
+vsd_mat <- assay(vsd)
+```
+
+```{r}
+pca_vsd <- vsd_mat %>%
+  t() %>%
+  prcomp()
+
+pca_vsd_df <- pca_vsd$x[, 1:10] %>%
+  as_tibble(rownames = "sample_id") %>%
+  inner_join(
+    meta_deseq %>%
+      rownames_to_column("sample_id"),
+    by = "sample_id"
+  )
+
+p <- ggplot(
+  pca_vsd_df,
+  aes(x = PC1, y = PC2, color = cell_line, shape = experiment)
+) +
+  geom_point()
+```
+
+Overlapping conditions between batches
+
+```{r}
+meta_batch_correction <- meta_kept %>%
+  semi_join(
+    meta_kept %>%
+      distinct(experiment, cell_line, agent) %>%
+      filter(agent == "control") %>%
+      group_by(cell_line, agent) %>%
+      filter(n() > 1)
+  )
+```
+
+Remove batch effects using ComBat
+
+```{r}
+library(sva)
+
+source("combat_with_reference.R")
+combat_res <- combat_with_reference(
+  counts_mat[, meta_batch_correction$sample_id],
+  batch = with(
+    meta_batch_correction,
+    paste(experiment, sep = "_")
+  ),
+  covar_mod = model.matrix(
+    ~cell_line,
+    data = meta_batch_correction
+  ),
+  covar_mod_all = model.matrix(
+    ~cell_line + agent,
+    data = meta_deseq
+  ),
+  batch_all = with(
+    meta_deseq,
+    paste(experiment, sep = "_")
+  ),
+  counts_all = counts_mat
+)
+```
+
+```{r}
+dds_bc <- DESeqDataSetFromMatrix(
+  combat_res,
+  colData = meta_deseq,
+  design = ~experiment + agent + cell_line + time
+)
+
+vsd_bc <- varianceStabilizingTransformation(dds_bc)
+
+vsd_mat_bc <- assay(vsd_bc)
+```
+
+```{r}
+pca_vsd_bc <- vsd_mat_bc %>%
+  t() %>%
+  prcomp()
+
+pca_vsd_bc_df <- pca_vsd_bc$x[, 1:10] %>%
+  as_tibble(rownames = "sample_id") %>%
+  inner_join(
+    meta_deseq %>%
+      rownames_to_column("sample_id"),
+    by = "sample_id"
+  )
+
+p <- ggplot(
+  pca_vsd_bc_df,
+  aes(x = PC1, y = PC2, color = cell_line, shape = experiment)
+) +
+  geom_point()
+```
+
+Much improved batch effect
+
+
+```{r}
+deseq_input <- meta_kept %>%
+  filter(agent != "control") %>%
+  group_nest(experiment, plate_id, batch_id, agent, cell_line, time, .key = "treated") %>%
+  left_join(
+    meta_kept %>%
+      filter(agent == "control") %>%
+      group_nest(experiment, plate_id, batch_id, cell_line, time, .key = "control"),
+    by = c("experiment", "plate_id", "batch_id", "cell_line", "time")
+  ) %>%
+  filter(
+    map_int(treated, nrow) > 1,
+    map_int(control, nrow) > 1
+  ) %>%
+  mutate(
+    meta_deseq = map2(
+      treated, control,
+      ~bind_rows(.x, .y) %>%
+        mutate(
+          log_agent_conc = log10(agent_conc + 1)
+        )
+    )
+  )
+  
+library(furrr)
+plan(multicore, workers = 6)
+
+deseq_fit <- deseq_input %>%
+  mutate(
+    deseq = map(
+      meta_deseq,
+      \(m) {
+        DESeqDataSetFromMatrix(
+          counts_mat[, m$sample_id],
+          colData = column_to_rownames(m, "sample_id"),
+          design = ~log_agent_conc
+        ) %>%
+          DESeq(
+            parallel = TRUE,
+            BPPARAM = BiocParallel::MulticoreParam(workers = 4)
+          )
+      }
+    )
+  )
+
+qsave(
+  deseq_fit,
+  file.path("deseq", "cdk7_deseq_res_raw2.qs")
+)
+# deseq_fit <- qread("deseq/cdk7_deseq_res_raw2.qs")
+
+deseq_res <- deseq_fit %>%
+  rowwise() %>%
+  mutate(
+    res = {
+      r <- results(deseq, name = "log_agent_conc")
+      left_join(
+        as.data.frame(r) %>%
+          as_tibble(rownames = "ensembl_gene_id"),
+        lfcShrink(
+          deseq, coef = "log_agent_conc", res = r, type = "ashr"
+        ) %>%
+          as_tibble(rownames = "ensembl_gene_id") %>%
+          select(ensembl_gene_id, log2FoldChange),
+        by = "ensembl_gene_id",
+        suffix = c("_MLE", "")
+      ) %>%
+        left_join(
+          ensembl_gtf %>%
+            select(ensembl_gene_id, hgnc_symbol),
+          by = "ensembl_gene_id"
+        ) %>%
+        list()
+    }
+  ) %>%
+  ungroup()
+
+```
+
+```{r}
+deseq_fit_lrt <- deseq_input %>%
+  rowwise() %>%
+  mutate(
+    meta_deseq = meta_deseq %>%
+      mutate(
+        agent_conc_fct = fct_inseq(as.character(agent_conc))
+      ) %>%
+      list(),
+    deseq = DESeqDataSetFromMatrix(
+      counts_mat[, meta_deseq$sample_id],
+      colData = column_to_rownames(meta_deseq, "sample_id"),
+      design = ~agent_conc_fct
+    ) %>%
+      DESeq(
+        test = "LRT",
+        reduced = ~1,
+        parallel = TRUE,
+        BPPARAM = BiocParallel::MulticoreParam(workers = 4)
+      ) %>%
+      list()
+  ) %>%
+  ungroup()
+
+qsave(
+  deseq_fit_lrt,
+  file.path("deseq", "cdk7_deseq_res_lrt_raw2.qs")
+)
+
+deseq_fit_lrt <- qread("deseq/cdk7_deseq_res_lrt_raw2.qs")
+
+deseq_res_lrt <- deseq_fit_lrt %>%
+  rowwise() %>%
+  mutate(
+    res = results(
+      deseq, tidy = TRUE
+    ) %>%
+      dplyr::rename(ensembl_gene_id = row) %>%
+      left_join(
+        ensembl_gtf %>%
+          select(ensembl_gene_id, hgnc_symbol),
+        by = "ensembl_gene_id"
+      ) %>%
+      as_tibble() %>%
+      list()
+  ) %>%
+  ungroup()
+```
+
+Checking goodness of fit of the log-linear model using advice
+from https://support.bioconductor.org/p/117448
+
+```{r}
+
+x <- deseq_fit$deseq[[1]]
+y <- mcols(x)$deviance - 2*rowSums(dnbinom(counts(x), mu=counts(x), size=1/dispersions(x), log=TRUE))
+
+counts_corrected %>%
+  filter(
+    ensembl_gene_id %in% names(head(sort(y, decreasing = TRUE))),
+    sample_id %in% colnames(x)
+  ) %>%
+  inner_join(
+    deseq_fit$meta_deseq[[1]] %>%
+      rownames_to_column("sample_id")
+  ) %>%
+  ggplot(
+    aes(log_agent_conc, count, color = agent)
+  ) +
+    geom_point() +
+    facet_wrap(~ensembl_gene_id, scales = "free_y")
+```
+
+```{r}
+deseq_res_lrt_long <- deseq_res_lrt %>%
+  select(experiment, plate_id, batch_id, agent, cell_line, time, res) %>%
+  unnest(res)
+
+
+deseq_res_long <- deseq_res %>%
+  select(experiment, plate_id, batch_id, agent, cell_line, time, res) %>%
+  unnest(res)
+
+write_csv(
+  deseq_res_long,
+  file.path("deseq", "cdk7_deseq_res_long.csv")
+)
+# deseq_res_long <- read_csv(
+#   file.path("deseq", "cdk7_deseq_res_long.csv")
+# )
+
+write_csv(
+  deseq_res_lrt_long,
+  file.path("deseq", "cdk7_deseq_res_lrt_long.csv")
+)
+# deseq_res_lrt_long <- read_csv(
+#   file.path("deseq", "cdk7_deseq_res_lrt_long.csv")
+# )
+```
+
+Apeglm leads to some weird artifacts where the log2FoldChange is not shrunk but
+expanded multifold. Using ashr instead.
+
+```{r}
+p <- deseq_res_long %>%
+  filter(
+    experiment == "cdk_467_2019_08",
+    agent == "YKL-5-124"
+  ) %>%
+  ggplot(
+    aes(log2FoldChange, -log10(padj))
+  ) +
+    ggrastr::rasterize(
+      geom_point(shape = 16, alpha = 0.3),
+      dev = "ragg", dpi = 200
+    ) +
+    facet_wrap(~cell_line, scale = "free")
+
+```
+
+
+```{r}
+deseq_res_long %>%
+  group_by(experiment, plate_id, agent, cell_line, time) %>%
+  summarize(
+    n_sig = sum(padj < 0.05, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes("0", n_sig, color = cell_line)) +
+    ggbeeswarm::geom_quasirandom() +
+    facet_wrap(~experiment + plate_id)
+
+deseq_res_lrt_long %>%
+  group_by(experiment, plate_id, agent, cell_line, time) %>%
+  summarize(
+    n_sig = sum(padj < 0.05, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes("0", n_sig, color = cell_line)) +
+    ggbeeswarm::geom_quasirandom() +
+    facet_wrap(~experiment + plate_id)
+
+deseq_n_res_lin_vs_lrt <- deseq_res_long %>%
+  group_by(experiment, plate_id, agent, cell_line, time) %>%
+  summarize(
+    n_sig_lin = sum(padj < 0.05, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    deseq_res_lrt_long %>%
+      group_by(experiment, plate_id, agent, cell_line, time) %>%
+      summarize(
+        n_sig_lrt = sum(padj < 0.05, na.rm = TRUE),
+        .groups = "drop"
+      )
+  )
+
+deseq_n_res_lin_vs_lrt %>%
+  ggplot(
+    aes(n_sig_lin, n_sig_lrt, color = cell_line)
+  ) +
+    geom_point() +
+    facet_wrap(~experiment + plate_id) +
+    coord_equal() +
+    geom_abline(slope = 1, intercept = 0) +
+    scale_x_continuous(
+      trans = scales::pseudo_log_trans(base = 10),
+      breaks = function(...) {
+        l <- list(...)
+        l[[1]][1] <- max(l[[1]][1], 1)
+        x <- rlang::exec(scales::breaks_log(), !!!l)
+        c(0, x)
+      }
+    ) +
+    scale_y_continuous(
+      trans = scales::pseudo_log_trans(base = 10),
+      breaks = function(...) {
+        l <- list(...)
+        l[[1]][1] <- max(l[[1]][1], 1)
+        x <- rlang::exec(scales::breaks_log(), !!!l)
+        c(0, x)
+      }
+    )
+
+deseq_n_res_lin_vs_lrt %>% filter(n_sig_lrt > 10*n_sig_lin)
+
+deseq_n_res_lin_vs_lrt %>% filter(n_sig_lrt > 10*n_sig_lin) %>%
+  dplyr::slice(2) %>%
+  inner_join(
+    deseq_res_lrt %>%
+      select(experiment, plate_id, agent, cell_line, time, res, meta_deseq)
+  ) %>%
+  mutate(
+    across(res, map, \(x) filter(x, padj < 0.05)),
+    across(meta_deseq, map, \(x) select(x, sample_id, log_agent_conc))
+  ) %>%
+  unnest(res) %>%
+  unnest(meta_deseq) %>%
+  inner_join(
+    counts_corrected
+  ) %>%
+  ggplot(
+    aes(log_agent_conc, count, color = agent)
+  ) +
+    geom_point() +
+    facet_wrap(~ensembl_gene_id, scales = "free_y")
+
+counts_corrected %>%
+  inner_join(
+    deseq_res_lrt_long %>%
+      inner_join(
+        deseq_n_res_lin_vs_lrt %>% filter(n_sig_lrt > 10*n_sig_lin)
+      ) %>%
+      filter(padj < 0.05) %>%
+      inner_join(
+        meta_kept
+      )
+  ) %>%
+  ggplot(
+    aes(agent_conc, count, color = agent)
+  ) +
+    geom_point() +
+    facet_wrap(~ensembl_gene_id, scales = "free_y")
+```
+
+
+```{r}
+
+
+deseq_res_lfc_shrunk_wide <- deseq_res_long %>%
+  inner_join(
+    conditions_kept
+  ) %>%
+  select(condition_id, ensembl_gene_id, log2FoldChange) %>%
+  mutate(across(log2FoldChange, ~replace_na(.x, 0))) %>%
+  pivot_wider(names_from = condition_id, values_from = log2FoldChange, values_fill = 0)
+
+deseq_res_lfc_shrunk_wide_mat <- deseq_res_lfc_shrunk_wide %>%
+  column_to_rownames("ensembl_gene_id") %>%
+  as.matrix()
+```
+
+
+```{r}
+pca_lfc_shrunk <- deseq_res_lfc_shrunk_wide_mat[
+  deseq_res_long %>%
+    group_by(ensembl_gene_id) %>%
+    filter(any(padj < 0.05)) %>%
+    ungroup() %>%
+    pull(ensembl_gene_id) %>%
+    unique(),
+] %>%
+  t() %>%
+  prcomp()
+
+pca_lfc_shrunk_df <- pca_lfc_shrunk$x[, 1:10] %>%
+  as_tibble(rownames = "condition_id") %>%
+  inner_join(
+    conditions_kept,
+    by = "condition_id"
+  )
+
+p <- ggplot(
+  pca_lfc_shrunk_df,
+  aes(x = PC1, y = PC2, color = cell_line, shape = experiment)
+) +
+  geom_point()
+```
+
+Comparing gene expression of each cell line compared to the grand
+mean of all cell lines at baseline (DMSO)
+
+Because there are big batch effects between cell lines (evidenced)
+by the PCA plots, only use the 2019_08 experiment here. That way
+we also only have 24h time point instead of 24h and 48h.
+
+
+```{r}
+
+baseline_meta <- meta_kept %>%
+  filter(
+    agent == "control",
+    experiment == "cdk_467_2019_08"
+  )
+
+de_baseline <- DESeqDataSetFromMatrix(
+  counts_mat[, baseline_meta$sample_id],
+  colData = column_to_rownames(baseline_meta, "sample_id"),
+  design = ~0 + cell_line
+) %>%
+  DESeq()
+
+qsave(
+  de_baseline,
+  file.path("deseq", "cdk7_deseq_baseline.qs")
+)
+
+de_baseline_res <- resultsNames(de_baseline) %>%
+  set_names() %>%
+  map(
+    ~{
+      n <- length(resultsNames(de_baseline))
+      contrast_vec <- rep(
+        -1/(n - 1),
+        n
+      ) %>%
+        set_names(resultsNames(de_baseline))
+      contrast_vec[match(.x, names(contrast_vec))] <- (n - 1) / n
+      r <- results(de_baseline, contrast = contrast_vec)
+      left_join(
+        as.data.frame(r) %>%
+          as_tibble(rownames = "ensembl_gene_id"),
+        lfcShrink(
+          de_baseline, contrast = contrast_vec, res = r, type = "ashr"
+        ) %>%
+          as_tibble(rownames = "ensembl_gene_id") %>%
+          select(ensembl_gene_id, log2FoldChange),
+        by = "ensembl_gene_id",
+        suffix = c("_MLE", "")
+      ) %>%
+        left_join(
+          ensembl_gtf %>%
+            select(ensembl_gene_id, hgnc_symbol),
+          by = "ensembl_gene_id"
+        )
+    }
+  ) %>%
+  bind_rows(.id = "cell_line") %>%
+  mutate(across(cell_line, \(x) str_replace(x, "cell_line", "")))
+
+write_csv(
+  de_baseline_res,
+  file.path("deseq", "cdk7_deseq_baseline_res.csv")
+)
+# de_baseline_res <- read_csv(
+#   file.path("deseq", "cdk7_deseq_baseline_res.csv")
+# )
+```
+
+```{r}
+p <- de_baseline_res %>%
+  ggplot(
+    aes(log2FoldChange, -log10(padj))
+  ) +
+  ggrastr::rasterize(geom_point(shape = 16, alpha = 0.3), dev = "ragg", dpi = 200) +
+  facet_wrap(~cell_line)
+ggsave(
+  file.path("plots_cdk7", "baseline_lfc_padj.pdf"),
+  p,
+  width = 10,
+  height = 8
+)
+```
+
+
+```{r}
+
+de_baseline_n_sig <- de_baseline_res %>%
+  group_by(cell_line) %>%
+  summarize(
+    n_sig = sum(padj < 0.05, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+p <- de_baseline_n_sig %>%
+  ggplot(
+    aes(cell_line, n_sig)
+  ) +
+    geom_col() +
+    coord_flip() +
+    labs(x = NULL, y = "Number of significant genes")
+
+ggsave(
+  file.path("plots_cdk7", "baseline_n_sig.pdf"),
+  p,
+  width = 6,
+  height = 4
+)
+
+de_baseline_selected_genes <- de_baseline_res %>%
+  group_by(ensembl_gene_id) %>%
+  filter(any(padj < 0.05)) %>%
+  ungroup() %>%
+  pull(ensembl_gene_id) %>%
+  unique()
+```
+
+Correlate GR50 vs log2FC of each cell line compared to the grand
+mean. Hopefully we're able to identify some genes that are correlated
+
+```{r}
+baseline_lfc_mat <- de_baseline_res %>%
+  select(cell_line, ensembl_gene_id, log2FoldChange) %>%
+  pivot_wider(names_from = cell_line, values_from = log2FoldChange, values_fill = 0) %>%
+  column_to_rownames("ensembl_gene_id") %>%
+  as.matrix()
+
+gr_raw <- syn("syn52242760") %>%
+  read_csv() %>%
+  mutate(neglog_GR50 = -log10(GR50))
+
+setdiff(gr_raw$cell_line, colnames(baseline_lfc_mat))
+setdiff(colnames(baseline_lfc_mat), gr_raw$cell_line)
+cell_line_overlap <- intersect(colnames(baseline_lfc_mat), gr_raw$cell_line)
+
+gr_mats <- gr_raw %>%
+  select(cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
+  column_to_rownames("cell_line") %>%
+  as.matrix() %>%
+  t() %>% {
+    .[, cell_line_overlap]
+  }
+
+baseline_lfc_mat_overlap <- baseline_lfc_mat[
+  de_baseline_selected_genes, cell_line_overlap
+]
+
+baseline_lfc_cor <- psych::corr.test(
+  t(baseline_lfc_mat_overlap),
+  t(gr_mats),
+  adjust = "fdr",
+  ci = FALSE
+)
+
+baseline_lfc_cor_df <- baseline_lfc_cor[c("r", "p", "p.adj")] %>%
+  imap(
+    ~as_tibble(.x, rownames = "ensembl_gene_id") %>%
+      pivot_longer(
+        cols = -ensembl_gene_id,
+        names_to = "gr_metric",
+        values_to = .y
+      )
+  ) %>%
+  purrr::reduce(
+    left_join,
+    by = c("ensembl_gene_id", "gr_metric")
+  ) %>%
+  left_join(
+    ensembl_gtf %>%
+      select(ensembl_gene_id, hgnc_symbol, gene_name),
+    by = "ensembl_gene_id"
+  ) %>%
+  inner_join(
+    de_baseline_res %>%
+      group_by(ensembl_gene_id) %>%
+      summarize(lfc_var = var(log2FoldChange), .groups = "drop"),
+    by = "ensembl_gene_id"
+  ) %>%
+  group_by(gr_metric) %>%
+  mutate(
+    p.adj = p.adjust(
+      p, method = "BH"
+    )
+  ) %>%
+  ungroup()
+
+p <- baseline_lfc_cor_df %>%
+  select(-lfc_var) %>%
+  pivot_longer(
+    cols = -c(ensembl_gene_id, hgnc_symbol, gene_name, gr_metric),
+    names_to = "cor_metric",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(value, color = cor_metric)) +
+    stat_ecdf(geom = "step") +
+    facet_wrap(~gr_metric)
+
+dir.create("plots_cdk7")
+ggsave(
+  file.path("plots_cdk7", "baseline_lfc_cor_ecdf.pdf"),
+  p,
+  width = 10,
+  height = 8
+)
+
+p <- baseline_lfc_cor_df %>%
+  select(-lfc_var) %>%
+  pivot_longer(
+    cols = -c(ensembl_gene_id, hgnc_symbol, gene_name, gr_metric),
+    names_to = "cor_metric",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(value, color = cor_metric)) +
+    geom_freqpoly() +
+    facet_wrap(~gr_metric)
+
+baseline_lfc_cor_sig <- baseline_lfc_cor_df %>%
+  group_by(gr_metric) %>%
+  arrange(p) %>%
+  slice_head(n = 10) %>%
+  ungroup()
+  # filter(p.adj < 0.1) %>%
+  # arrange(p.adj)
+
+p <- baseline_lfc_cor_df %>%
+  inner_join(
+    de_baseline_res
+  ) %>%
+  inner_join(
+    gr_raw %>%
+      select(cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
+      pivot_longer(-cell_line, names_to = "gr_metric", values_to = "gr_value"),
+  ) %>%
+  ggplot(
+    aes(gr_value, log2FoldChange, color = gr_metric)
+  ) +
+    geom_point() +
+    geom_smooth(method = "lm") +
+    facet_wrap(~gene_name, scales = "free")
+
+p <- baseline_lfc_cor_df %>%
+  filter(gr_metric %in% c("GR50", "neglog_GR50")) %>%
+  filter(
+    ensembl_gene_id %in% {
+      group_by(., gr_metric) %>%
+        arrange(p) %>%
+        slice_head(n = 10) %>%
+        pull(ensembl_gene_id)
+    }
+  ) %>%
+  inner_join(
+    de_baseline_res
+  ) %>%
+  inner_join(
+    gr_raw %>%
+      select(cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
+      pivot_longer(-cell_line, names_to = "gr_metric", values_to = "gr_value"),
+  ) %>%
+  group_nest(gr_metric) %>%
+  mutate(
+    p = map2(
+      data, gr_metric,
+      function(df, g) {
+        ggplot(
+          df %>%
+            arrange(p) %>%
+            mutate(across(gene_name, fct_inorder)),
+          aes(gr_value, log2FoldChange)
+        ) +
+          geom_point() +
+          geom_smooth(method = "lm") +
+          geom_text(
+            aes(x = x, y = y, label = p),
+            hjust = 0, vjust = 1,
+            nudge_x = 0.1, nudge_y = -0.1,
+            data = \(df) distinct(df, gene_name, p) %>%
+              mutate(
+                across(p, \(x) signif(x, digits = 2)),
+                x = if (g == "GR50") Inf else -Inf, y = Inf
+              )
+          ) +
+          facet_wrap(~gene_name, scales = "free") + 
+          scale_x_continuous(
+            trans = switch(
+              g,
+              neglog_GR50 = "identity",
+              GR50 = c("reverse"),
+              "identity"
+            )
+          ) +
+          labs(
+            x = g,
+            y = "log2FoldChange cell line vs grand mean",
+            title = g
+          )
+      }
+    )
+  )
+
+ps <- patchwork::wrap_plots(p$p)
+
+ggsave(
+  file.path("plots_cdk7", "baseline_lfc_cor_most_sig.pdf"),
+  ps,
+  width = 16,
+  height = 8
+)
+
+p <- baseline_lfc_cor_df %>%
+  ggplot(
+    aes(cor, color = metric)
+  ) +
+    stat_ecdf(geom = "step")
+
+baseline_lfc_cor_highest <- baseline_lfc_cor_df %>%
+  arrange(cor) %>%
+  group_by(metric) %>%
+  dplyr::slice(
+    1:10, (n() - 9):n()
+  ) %>%
+  ungroup() %>%
+  left_join(
+    ensembl_gtf %>%
+      select(ensembl_gene_id, hgnc_symbol),
+    by = "ensembl_gene_id"
+  )
+```
+
+```{r}
+ykl_cell_lines_to_keep <- intersect(
+  deseq_res_long %>%
+    filter(agent == "YKL-5-124", experiment == "cdk_467_2019_08") %>%
+    pull(cell_line),
+  gr_raw$cell_line
+)
+
+ykl_genes_to_keep <- deseq_res_long %>%
+  filter(
+    agent == "YKL-5-124",
+    experiment == "cdk_467_2019_08",
+    cell_line %in% ykl_cell_lines_to_keep
+  ) %>%
+  group_by(ensembl_gene_id) %>%
+  filter(any(padj < 0.05)) %>%
+  ungroup() %>%
+  pull(ensembl_gene_id) %>%
+  unique()
+
+ykl_lfc_mat <- deseq_res_long %>%
+  filter(
+    agent == "YKL-5-124",
+    experiment == "cdk_467_2019_08",
+    cell_line %in% ykl_cell_lines_to_keep,
+    ensembl_gene_id %in% ykl_genes_to_keep
+  ) %>%
+  select(ensembl_gene_id, cell_line, log2FoldChange) %>%
+  replace_na(list(log2FoldChange = 0)) %>%
+  pivot_wider(names_from = cell_line, values_from = log2FoldChange, values_fill = 0) %>%
+  column_to_rownames("ensembl_gene_id") %>%
+  as.matrix()
+
+ykl_gr_mat <- gr_raw %>%
+  filter(cell_line %in% ykl_cell_lines_to_keep) %>%
+  select(cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
+  column_to_rownames("cell_line") %>%
+  as.matrix() %>%
+  t()
+
+ykl_gr_cor <- psych::corr.test(
+  t(ykl_lfc_mat),
+  t(ykl_gr_mat),
+  adjust = "fdr",
+  ci = FALSE
+)
+
+
+ykl_gr_cor_df <- ykl_gr_cor[c("r", "p", "p.adj")] %>%
+  imap(
+    ~as_tibble(.x, rownames = "ensembl_gene_id") %>%
+      pivot_longer(
+        cols = -ensembl_gene_id,
+        names_to = "gr_metric",
+        values_to = .y
+      )
+  ) %>%
+  purrr::reduce(
+    left_join,
+    by = c("ensembl_gene_id", "gr_metric")
+  ) %>%
+  left_join(
+    ensembl_gtf %>%
+      select(ensembl_gene_id, hgnc_symbol, gene_name),
+    by = "ensembl_gene_id"
+  )
+
+p <- ykl_gr_cor_df %>%
+  pivot_longer(
+    cols = c(r, p, p.adj),
+    names_to = "cor_metric",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(value, color = cor_metric)) +
+    stat_ecdf(geom = "step") +
+    facet_wrap(~gr_metric)
+
+ggsave(
+  file.path("plots_cdk7", "ykl_gr_cor_ecdf.pdf"),
+  p,
+  width = 10,
+  height = 8
+)
+
+```
+
+```{r}
+ykl_gr_cor_sig <- ykl_gr_cor_df %>%
+  filter(gr_metric %in% c("GR50", "neglog_GR50")) %>%
+  filter(
+    ensembl_gene_id %in% {
+      group_by(., gr_metric) %>%
+        arrange(p) %>%
+        slice_head(n = 10) %>%
+        pull(ensembl_gene_id)
+    }
+  )
+  
+
+ykl_gr_cor_sig_lfc <- ykl_gr_cor_sig %>%
+  inner_join(
+    ykl_lfc_mat %>%
+      as_tibble(rownames = "ensembl_gene_id") %>%
+      pivot_longer(
+        cols = -ensembl_gene_id,
+        names_to = "cell_line",
+        values_to = "log2FoldChange"
+      )
+  ) %>%
+  inner_join(
+    gr_raw %>%
+      select(cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
+      pivot_longer(-cell_line, names_to = "gr_metric", values_to = "gr_value"),
+  )
+
+p <- ykl_gr_cor_sig_lfc %>%
+  group_nest(gr_metric) %>%
+  mutate(
+    p = map2(
+      data, gr_metric,
+      function(df, g) {
+        ggplot(
+          df %>%
+            arrange(p) %>%
+            mutate(across(gene_name, fct_inorder)),
+          aes(gr_value, log2FoldChange)
+        ) +
+          geom_point() +
+          geom_smooth(method = "lm") +
+          geom_text(
+            aes(x = x, y = y, label = p),
+            hjust = 0, vjust = 1,
+            nudge_x = 0.1, nudge_y = -0.1,
+            data = \(df) distinct(df, gene_name, p) %>%
+              mutate(
+                across(p, \(x) signif(x, digits = 2)),
+                x = if (g == "GR50") Inf else -Inf, y = Inf
+              )
+          ) +
+          facet_wrap(~gene_name, scales = "free") + 
+          scale_x_continuous(
+            trans = switch(
+              g,
+              neglog_GR50 = "identity",
+              GR50 = c("reverse"),
+              "identity"
+            )
+          ) +
+          labs(
+            x = g,
+            y = "log2FoldChange YKL-5-124 vs DMSO",
+            title = g
+          )
+      }
+    )
+  )
+
+ps <- patchwork::wrap_plots(p$p)
+
+ggsave(
+  file.path("plots_cdk7", "ykl_gr_cor_most_sig.pdf"),
+  ps,
+  width = 16,
+  height = 8
+)
+ 
+```
+
+```{r}
+cv_model <- glmnet::cv.glmnet(
+  t(ykl_lfc_mat), ykl_gr_mat["neglog_GR50",],
+  alpha = 0.5,
+  # nfolds = ncol(ykl_lfc_mat),
+  foldid = 1:ncol(ykl_lfc_mat)
+)
+
+best_model <- glmnet::glmnet(
+  t(ykl_lfc_mat), ykl_gr_mat["neglog_GR50",],
+  alpha = 0.5, lambda = cv_model$lambda.min
+)
+
+sparse_mat_to_df <- function(x) {
+  y <- summary(as(x, "dgTMatrix"))
+  y$row = rownames(x)[y$i]
+  y$col = colnames(x)[y$j]
+  y
+}
+
+best_model_coef <- sparse_mat_to_df(coef(best_model)) %>%
+  dplyr::rename(
+    ensembl_gene_id = row,
+    coef = x
+  ) %>%
+  left_join(
+    ensembl_gtf %>%
+      select(ensembl_gene_id, hgnc_symbol, gene_name),
+    by = "ensembl_gene_id"
+  ) %>%
+  as_tibble()
+
+best_model_coef_lfc <- best_model_coef %>%
+  mutate(gr_metric = "neglog_GR50") %>%
+  inner_join(
+    ykl_lfc_mat %>%
+      as_tibble(rownames = "ensembl_gene_id") %>%
+      pivot_longer(
+        cols = -ensembl_gene_id,
+        names_to = "cell_line",
+        values_to = "log2FoldChange"
+      )
+  ) %>%
+  inner_join(
+    gr_raw %>%
+      select(cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
+      pivot_longer(-cell_line, names_to = "gr_metric", values_to = "gr_value"),
+  )
+
+p <- best_model_coef_lfc %>%
+  group_nest(gr_metric) %>%
+  mutate(
+    p = map2(
+      data, gr_metric,
+      function(df, g) {
+        ggplot(
+          df %>%
+            arrange(coef) %>%
+            mutate(across(gene_name, fct_inorder)),
+          aes(gr_value, log2FoldChange)
+        ) +
+          geom_point() +
+          geom_smooth(method = "lm") +
+          geom_text(
+            aes(x = x, y = y, label = coef),
+            hjust = 0, vjust = 1,
+            nudge_x = 0.1, nudge_y = -0.1,
+            data = \(df) distinct(df, gene_name, coef) %>%
+              mutate(
+                across(coef, \(x) signif(x, digits = 2)),
+                x = if (g == "GR50") Inf else -Inf, y = Inf
+              )
+          ) +
+          facet_wrap(~gene_name, scales = "free") + 
+          scale_x_continuous(
+            trans = switch(
+              g,
+              neglog_GR50 = "identity",
+              GR50 = c("reverse"),
+              "identity"
+            )
+          ) +
+          labs(
+            x = g,
+            y = "log2FoldChange YKL-5-124 vs DMSO",
+            title = g
+          )
+      }
+    )
+  )
+
+ps <- patchwork::wrap_plots(p$p)
+
+ggsave(
+  file.path("plots_cdk7", "ykl_gr_lasso_most_sig.pdf"),
+  ps,
+  width = 8,
+  height = 8
+)
+ 
+
+```
