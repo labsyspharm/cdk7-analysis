@@ -170,7 +170,12 @@ de_results <- de_groups %>%
       contrast = c("condition", condition, control_condition),
       results_args = results_args,
       shrink_args = c(results_args, list(type = "ashr"))
-    ) %>%
+    )  %>%
+      left_join(
+        ensembl_gtf %>%
+          distinct(ensembl_gene_id, hgnc_symbol),
+        by = "ensembl_gene_id"
+      ) %>%
       list()
   ) %>%
   ungroup()
@@ -178,6 +183,24 @@ de_results <- de_groups %>%
 qsave(
   de_results,
   "deseq/deseq_res_vs_dmso.qs"
+)
+# de_results <- qread("deseq/deseq_res_vs_dmso.qs")
+
+de_results_long <- de_results %>%
+  select(-des) %>%
+  unnest(de_res)
+
+fwrite(
+  de_results_long,
+  "deseq/deseq_res_vs_dmso.csv.gz"
+)
+
+synStoreMany(
+  c(
+    "deseq/deseq_res_vs_dmso.csv.gz"
+  ),
+  parentId = "syn51221227",
+  forceVersion = FALSE
 )
 ```
 
@@ -848,38 +871,13 @@ p <- de_results_vemu_treated_vs_untreated_mat[
     cluster_rows = function(mat) {
       d <- dist(mat)
       set.seed(42)
-      hclust(d, method = "average") %>%
+      (d, method = "average") %>%
         reorder(dist = d, method = "olo")
     },
     show_row_names = FALSE
   )
 
 
-```
-Plot multiple interactive volcano plots using crosstalk / plotly
-
-```{r}
-de_results_vemu_treated_vs_untreated_long <- de_results_vemu_treated_vs_untreated %>%
-  select(-n_de) %>%
-  unnest(de_res) %>%
-  arrange(cell_line, concentration_fbs) %>%
-  mutate(
-    condition = paste0(cell_line, " ", concentration_fbs, "%") %>%
-      fct_inorder(),
-    gene_id = fcoalesce(hgnc_symbol, ensembl_gene_id)
-  )
-
-
-sd <- crosstalk::SharedData$new(de_results_vemu_treated_vs_untreated_long, key = ~gene_id)
-
-p <- de_results_vemu_treated_vs_untreated_long %>%
-  ggplot(aes(log2FoldChange, -log10(padj), text = paste(gene_id))) +
-    geom_point(alpha = 0.5) +
-    facet_wrap(~condition)
-
-pl <- plotly::ggplotly(p, tooltip = "text") %>%
-  plotly::highlight(on = "plotly_hover", color = "red", selectize = TRUE) %>%
-  plotly::toWebGL()
 ```
 
 ### Fit linear model
@@ -960,7 +958,7 @@ p <- Heatmap(
   cluster_columns = FALSE,
   cluster_rows = function(mat) {
     d <- dist(mat)
-    hclust(d, method = "average") %>%
+    (d, method = "average") %>%
       reorder(dist = d, method = "olo")
   }
 )
@@ -1056,10 +1054,13 @@ qsave(
 # de_vemu_lin_res_by_cell_line <- qread("deseq/deseq_res_linear_ordinal_by_cell_line.qs")
 
 de_vemu_lin_res_by_cell_line_long <- de_vemu_lin_res_by_cell_line %>%
-  select(-starts_with("n_de"), -de) %>%
+  select(-starts_with("n_de"), -any_of("de")) %>%
   unnest(res)
 fwrite(
   de_vemu_lin_res_by_cell_line_long,
+  "deseq/deseq_res_linear_ordinal_by_cell_line_long.csv.gz"
+)
+de_vemu_lin_res_by_cell_line_long <- fread(
   "deseq/deseq_res_linear_ordinal_by_cell_line_long.csv.gz"
 )
 
@@ -1256,6 +1257,147 @@ ggsave(
 ggplotly(ps, tooltip = "text") %>%
   plotly::highlight(on = "plotly_hover", color = "red", opacityDim = 1) %>%
   toWebGL()
+```
+
+Get only baseline cell line effect across FBS concentrations. Get log2FoldChange
+for each cell line compared to average of all cell lines
+
+Use custom contrast in `results()` to get log2FoldChange for each cell line compared to
+the average of all cell lines.
+
+```{r}
+de_vemu_cell_line_at_baseline <- de_meta_vemu %>%
+  filter(concentration == 0, concentration_fbs == 5) %>%
+  summarize(
+    de = DESeqDataSetFromMatrix(
+      de_count_mat[genes_to_keep, cur_data()$well],
+      # cur_data(),
+      # ~cell_line
+       cur_data() %>%
+        mutate(across(c(concentration, concentration_fbs), ~scale(as.integer(fct_inseq(as.character(.x)))))),
+      ~cell_line*concentration_fbs
+    ) %>%
+      DESeq(parallel = TRUE, BPPARAM = BiocParallel::MulticoreParam(workers = 6)) %>%
+      list(),
+    .groups = "drop"
+  )
+
+de_vemu_res_cell_line_at_baseline <- de_vemu_cell_line_at_baseline %>%
+  mutate(
+    coefs = map(de, ~tibble(coef = setdiff(resultsNames(.x), "Intercept")))
+  ) %>%
+  unnest(coefs) %>%
+  rowwise() %>%
+  mutate(
+    res = results_deseq_with_shrunk(
+      de,
+      results_args = c(results_args, list(name = coef)),
+      shrink_args = c(results_args, list(type = "ashr"))
+    ) %>%
+    left_join(
+      ensembl_gtf %>%
+        distinct(ensembl_gene_id, hgnc_symbol),
+      by = "ensembl_gene_id"
+    ) %>%
+    as_tibble() %>%
+    list()
+  ) %>%
+  ungroup() %>%
+  mutate(
+    n_de = map_int(res, ~nrow(filter(.x, padj < 0.05))),
+    n_de_ihw = map_int(res, ~nrow(filter(.x, padj_ihw < 0.05)))
+  )
+
+
+de_vemu_res_cell_line_at_baseline <- de_vemu_cell_line_at_baseline %>%
+  mutate(
+    contr = tribble(
+      # de_vemu_cell_line_at_baseline$de[[1]] %>% resultsNames()
+      # [1] "Intercept"                          "cell_line_COLO858_vs_A375"
+      # [3] "cell_line_WM989_vs_A375"            "concentration_fbs"
+      # [5] "cell_lineCOLO858.concentration_fbs" "cell_lineWM989.concentration_fbs"
+      ~contrast_name, ~contrast,
+      "cell_line_A375_vs_mean", c(0, -1/3, -1/3, 0, 0, 0),
+      "cell_line_WM989_vs_mean", c(0, -1/3, 2/3, 0, 0, 0),
+      "cell_line_COLO858_vs_mean", c(0, 2/3, -1/3, 0, 0, 0),
+      # "cell_line_A375_vs_mean", c(0, -1/3, -1/3),
+      # "cell_line_WM989_vs_mean", c(0, -1/3, 2/3),
+      # "cell_line_COLO858_vs_mean", c(0, 2/3, -1/3),
+    ) %>%
+      list()
+  ) %>%
+  unnest(contr) %>%
+  rowwise() %>%
+  mutate(
+    res = results_deseq_with_shrunk(
+      de,
+      results_args = c(results_args, list(contrast = contrast)),
+      shrink_args = c(results_args, list(type = "ashr"))
+    ) %>%
+    left_join(
+      ensembl_gtf %>%
+        distinct(ensembl_gene_id, hgnc_symbol),
+      by = "ensembl_gene_id"
+    ) %>%
+    as_tibble() %>%
+    list()
+  ) %>%
+  ungroup() %>%
+  mutate(
+    n_de = map_int(res, ~nrow(filter(.x, padj < 0.05))),
+    n_de_ihw = map_int(res, ~nrow(filter(.x, padj_ihw < 0.05)))
+  )
+
+qsave(
+  de_vemu_res_cell_line_at_baseline %>%
+    select(-de),
+  "deseq/deseq_res_cell_line_effect_vs_mean.qs"
+)
+# de_vemu_res_cell_line_at_baseline <- qread("deseq/deseq_res_cell_line_effect_vs_mean.qs")
+
+
+ de_vemu_res_cell_line_at_baseline_long <- de_vemu_res_cell_line_at_baseline %>%
+  select(-any_of("de"), -starts_with("n_de"), -contrast) %>%
+  unnest(res)
+
+```
+
+Plot cell line effects vs each other
+
+```{r}
+de_vemu_res_cell_line_at_baseline_comp <- de_vemu_res_cell_line_at_baseline %>%
+  pull(contrast_name) %>%
+  combn(2) %>%
+  t() %>%
+  magrittr::set_colnames(c("contrast_1", "contrast_2")) %>%
+  as_tibble() %>%
+  inner_join(
+    de_vemu_res_cell_line_at_baseline_long %>%
+      select(contrast_name, ensembl_gene_id, hgnc_symbol, log2FoldChange, padj, padj_ihw),
+    by = c("contrast_1" = "contrast_name"),
+    relationship = "many-to-many"
+  ) %>%
+  inner_join(
+    de_vemu_res_cell_line_at_baseline_long %>%
+      select(contrast_name, ensembl_gene_id, log2FoldChange, padj, padj_ihw),
+    by = c("contrast_2" = "contrast_name", "ensembl_gene_id"),
+    suffix = c("_1", "_2")
+  )
+
+p <- de_vemu_res_cell_line_at_baseline_comp %>%
+  ggplot(
+    aes(
+      log2FoldChange_1,
+      log2FoldChange_2
+    )
+  ) +
+    geom_point(shape = 16, alpha = 0.5) +
+    facet_wrap(~contrast_1 + contrast_2)
+
+ggsave(
+  "vemu/plots/deseq_cell_line_vs_mean_comp.pdf",
+  p, width = 10, height = 10
+)
 ```
 
 ```{r}
@@ -1537,7 +1679,7 @@ p <- GGally::ggpairs(
   theme_bw()
 
 ggsave(
-  "vemu/plots/phenotypic_meta_ggpairs.pdf", p, width = 15, height = 15
+  "vemu/plots/phenotypic_meta_ggpairs.pdf", p, width = 10, height = 10
 )
 
 universal_cor <- function(x, y) {
@@ -1576,13 +1718,13 @@ phenotypic_meta_cor_pairs <- phenotypic_meta_ordinal %>%
 ```
 
 The correlations between Vemurafenib concentration and pretty much all phenotypic
-traits, except cell_concentration and apoptosis_events, are high. This
+traits, except *cell_elongation* and *apoptosis_events*, are high. This
 means that we might not be able to distinguish between the raw effects of
 vemurafenib and what genes cause the different phenotypes.
 
 There is almost no correlation between FBS concentration and phenotypic effects.
 
-With regards to the cell_line effect, only cell_elongation is confounded.
+With regards to the *cell_line* effect, only *cell_elongation* is confounded.
 
 ```{r}
 
@@ -1628,48 +1770,868 @@ de_vemu_phenotypic_res <- resultsNames(de_vemu_phenotypic) %>%
     n_de_ihw = map_int(res, ~nrow(filter(.x, padj_ihw < 0.05)))
   )
 
-
-de_vemu_phenotypic <- phenotypic_meta_scaled %>%
-  filter(cell_line != "COLO858") %>% {
-    DESeqDataSetFromMatrix(
-      countData = de_count_mat[genes_to_keep, .$well],
-      colData = .,
-      design = reformulate(setdiff(names(phenotypic_traits_map), c("nuclear_shuttling")))
-    ) %>%
-      DESeq(
-        parallel = TRUE, BPPARAM = BiocParallel::MulticoreParam(workers = 6)
-      )
-  }
-
-de_vemu_phenotypic_res <- resultsNames(de_vemu_phenotypic) %>%
-  setdiff("Intercept") %>%
-  set_names() %>%
-  map(
-    ~results_deseq_with_shrunk(
-      de_vemu_phenotypic,
-      results_args = c(results_args, list(name = .x)),
-      shrink_args = c(results_args, list(type = "ashr"))
-    ) %>%
-    left_join(
-      ensembl_gtf %>%
-        distinct(ensembl_gene_id, hgnc_symbol),
-      by = "ensembl_gene_id"
-    ) %>%
-    as_tibble()
-  ) %>%
-  enframe("coefficient", "res") %>%
-  mutate(
-    n_de = map_int(res, ~nrow(filter(.x, padj < 0.05))),
-    n_de_ihw = map_int(res, ~nrow(filter(.x, padj_ihw < 0.05)))
-  )
-
 qsave(
   de_vemu_phenotypic_res,
   "deseq/deseq_res_phenotypic.qs"
 )
+# de_vemu_phenotypic_res <- qread("deseq/deseq_res_phenotypic.qs")
+
+de_vemu_phenotypic_res_long <- de_vemu_phenotypic_res %>%
+  select(-starts_with("n_de")) %>%
+  unnest(res)
 ```
+
+Check how the differential gene expression results from the phenotypic
+covariates relate to the differential expression results from the vemurafenib +
+fbs covariates.
+
+```{r}
+de_vemu_lin_res_by_cell_line_with_pheno <- de_vemu_lin_res_by_cell_line_long %>%
+  select(cell_line, coef, ensembl_gene_id, hgnc_symbol, log2FoldChange, padj, padj_ihw) %>%
+  pivot_wider(
+    names_from = c(cell_line),
+    values_from = c(log2FoldChange, padj, padj_ihw)
+  ) %>%
+  mutate(
+    linear_signif = replace_na(padj_A375 < 0.05, FALSE) | replace_na(padj_WM989 < 0.05, FALSE)
+  ) %>%
+  inner_join(
+    de_vemu_phenotypic_res_long %>%
+      transmute(
+        pheno_coefficent = coefficient,
+        ensembl_gene_id,
+        expression = case_when(
+          padj > 0.05 | is.na(padj) ~ "Not DE",
+          log2FoldChange > 0 ~ "Up",
+          log2FoldChange < 0 ~ "Down",
+          TRUE ~ NA_character_
+        ) %>%
+          factor(levels = c("Up", "Down", "Not DE"))
+      ),
+    by = "ensembl_gene_id"
+  )
+
+de_vemu_lin_res_by_cell_line_with_pheno_scatter <- de_vemu_lin_res_by_cell_line_with_pheno %>%
+  ggplot(
+    aes(
+      log2FoldChange_A375, log2FoldChange_WM989,
+      alpha = linear_signif,
+      color = expression,
+      shape = linear_signif
+    )
+  ) +
+    geom_point(shape = 16) +
+    scale_alpha_manual(values = c(`TRUE` = 0.5, `FALSE` = 0.2)) +
+    scale_shape_manual(values = c(`TRUE` = 16, `FALSE` = 4)) +
+    scale_color_manual(
+      values = c(
+        `Not DE` = "gray50",
+        `Up` = "red",
+        `Down` = "blue"
+      )
+    ) +
+    facet_grid(
+      pheno_coefficent ~ coef,
+      scales = "free"
+    )
+
+ggsave(
+  "vemu/plots/cell_line_effect_log2fc_scatter_pheno.pdf",
+  de_vemu_lin_res_by_cell_line_with_pheno_scatter, width = 10, height = 10
+)
+
+de_vemu_lin_res_by_cell_line_with_pheno_scatter_plots <- de_vemu_lin_res_by_cell_line_with_pheno %>%
+  group_by(pheno_coefficent) %>%
+  summarize(
+    p = list(ggplot(
+      cur_data() %>%
+        arrange(linear_signif),
+      aes(
+        log2FoldChange_A375, log2FoldChange_WM989,
+        alpha = linear_signif,
+        color = linear_signif
+        # shape = linear_signif
+      )
+    ) +
+      geom_point(shape = 16) +
+      scale_alpha_manual(values = c(`TRUE` = 0.5, `FALSE` = 0.2)) +
+      scale_color_manual(values = c(`TRUE` = "black", `FALSE` = "gray50")) +
+      # scale_shape_manual(values = c(`TRUE` = 16, `FALSE` = 4)) +
+      # scale_color_manual(
+      #   values = c(
+      #     `Not DE` = "gray50",
+      #     `Up` = "red",
+      #     `Down` = "blue"
+      #   )
+      # ) +
+      ggh4x::facet_grid2(expression~coef, scales = "free", independent = "none")),
+    .groups = "drop"
+  )
+
+pwalk(
+  de_vemu_lin_res_by_cell_line_with_pheno_scatter_plots,
+  function(pheno_coefficent, p) {
+    ggsave(
+      paste0("vemu/plots/cell_line_effect_log2fc_scatter_pheno_", pheno_coefficent, ".pdf"),
+      p + labs(title = pheno_coefficent), width = 10, height = 6
+    )
+  }
+)
+
+
+```
+
+Plot gene expression changes associated with phenotypic effects against gene expression
+changes due to vemurafenib and FBS
+
+```{r}
+de_vemu_lin_res_by_cell_line_with_vs_pheno <- crossing(
+  experimental_coefficient = unique(de_vemu_lin_res_by_cell_line_long$coef),
+  phenotypic_coefficient = unique(de_vemu_phenotypic_res_long$coefficient)
+) %>%
+  inner_join(
+    de_vemu_phenotypic_res_long %>%
+      select(
+        phenotypic_coefficient = coefficient,
+        ensembl_gene_id, hgnc_symbol,
+        log2FoldChange, padj, padj_ihw
+      ),
+    by = c("phenotypic_coefficient"),
+    relationship = "many-to-many"
+  ) %>%
+  inner_join(
+    de_vemu_lin_res_by_cell_line_long %>%
+      select(
+        coefficient = coef,
+        cell_line, ensembl_gene_id, log2FoldChange, padj, padj_ihw
+      ),
+    suffix = c("_phenotypic", "_experimental"),
+    by = c("experimental_coefficient" = "coefficient", "ensembl_gene_id"),
+    relationship = "many-to-many"
+  )
+
+p <- de_vemu_lin_res_by_cell_line_with_vs_pheno %>%
+  unite("experimental_coefficient", c(experimental_coefficient, cell_line)) %>%
+  ggplot(
+    aes(
+      log2FoldChange_experimental,
+      log2FoldChange_phenotypic
+    )
+  ) +
+    geom_point(shape = 16, alpha = 0.5) +
+    coord_equal() +
+    ggh4x::facet_grid2(
+      phenotypic_coefficient ~ experimental_coefficient,
+      scales = "free"
+    )
+
+ggsave(
+  "vemu/plots/cell_line_effect_log2fc_scatter_pheno_vs_experimental.pdf",
+  p, width = 12, height = 10
+)
+```
+
+Compute GSEA for phenotypic and experimental effects
+
+```{r}
+library(msigdbr)
+library(fgsea)
+all_msigdbr <- msigdbr()
+
+msigdbr_of_interest <- all_msigdbr %>%
+  filter(
+    gs_cat == "H" |
+    gs_subcat %in% c(
+      "CP:PID",
+      "CP:KEGG"
+      # "CP:REACTOME"
+      # "GO:BP",
+      # "GO:MF"
+    )
+  )
+
+msigdbr_of_interest_gs <- msigdbr_of_interest %>%
+  group_by(gs_name) %>%
+  summarize(
+    gs = list(ensembl_gene),
+    .groups = "drop"
+  ) %>%
+  with(
+    set_names(
+      gs,
+      gs_name
+    )
+  )
+
+fgsea_gene_stats <- bind_rows(
+  de_vemu_res_cell_line_at_baseline %>%
+    dplyr::select(-any_of("de"), -starts_with("n_de")) %>%
+    unnest(res) %>%
+    transmute(
+      comparison = contrast_name,
+      comparison_type = "cell_line",
+      ensembl_gene_id,
+      log2FoldChange,
+      pvalue = replace_na(pvalue, .5),
+      padj_ihw,
+      padj,
+      signed_p = -sign(log2FoldChange) * log10(pvalue)
+    ),
+  de_vemu_lin_res_by_cell_line_long %>%
+    transmute(
+      comparison = paste(coef, cell_line, sep = "_"),
+      comparison_type = "experimental",
+      ensembl_gene_id,
+      log2FoldChange,
+      pvalue = replace_na(pvalue, .5),
+      padj_ihw,
+      padj,
+      signed_p = -sign(log2FoldChange) * log10(pvalue)
+    ),
+  de_vemu_phenotypic_res_long %>%
+    transmute(
+      comparison = coefficient,
+      comparison_type = "phenotypic",
+      ensembl_gene_id,
+      log2FoldChange,
+      pvalue = replace_na(pvalue, .5),
+      padj_ihw,
+      padj,
+      signed_p = -sign(log2FoldChange) * log10(pvalue)
+    )
+)
+
+fgsea_gene_stats_grouped <- fgsea_gene_stats %>%
+  group_by(comparison_type, comparison) %>%
+  summarize(
+    gene_stats = set_names(
+      signed_p, ensembl_gene_id
+    ) %>%
+      list(),
+    .groups = "drop"
+  )
+
+fgsea_res_raw <- fgsea_gene_stats_grouped %>%
+  rowwise() %>%
+  mutate(
+    res = fgseaMultilevel(
+      msigdbr_of_interest_gs,
+      gene_stats,
+      BPPARAM = BiocParallel::MulticoreParam(workers = 6)
+    ) %>%
+      list()
+  ) %>%
+  ungroup()
+
+fgsea_res <- fgsea_res_raw %>%
+  dplyr::select(-gene_stats) %>%
+  unnest(res)
+
+qsave(
+  fgsea_res,
+  "vemu/fgsea_res.qs"
+)
+
+cluster_mat <- function(mat) {
+  d <- dist(mat)
+  set.seed(42)
+  hclust(d, method = "average") %>%
+    seriation:::reorder.hclust(dist = d, method = "olo")
+}
+
+cluster_df <- function(df, x, y, z) {
+  # browser()
+  mat <- df %>%
+    dplyr::select({{x}}, {{y}}, {{z}}) %>%
+    pivot_wider(
+      names_from = {{x}},
+      values_from = {{z}}
+    ) %>%
+    column_to_rownames(rlang::as_name(rlang::ensym(y))) %>%
+    as.matrix()
+  # browser()
+  clustering <- cluster_mat(t(mat))
+  df %>%
+    mutate(
+      across(
+        c({{x}}),
+        ~factor(.x, levels = clustering$labels[clustering$order])
+      )
+    )
+}
+
+fgsea_res_mat <- fgsea_res %>%
+  transmute(comparison, pathway, signed_padj = -sign(NES)*log10(padj)) %>%
+  pivot_wider(
+    names_from = comparison,
+    values_from = signed_padj
+  ) %>%
+  column_to_rownames("pathway") %>%
+  as.matrix() %>% {
+    clust_rows <- cluster_mat(.)
+    clust_cols <- cluster_mat(t(.))
+    .[clust_rows$order, clust_cols$order]
+  }
+
+library(cmapR)
+fgsea_res_gct <- new(
+  "GCT",
+  mat = fgsea_res_mat,
+  rdesc = msigdbr_of_interest %>%
+    distinct(
+      id = gs_name,
+      gs_cat, gs_subcat
+    ) %>%
+    dplyr::slice(match(rownames(fgsea_res_mat), id)) %>%
+    as.data.frame(),
+  cdesc = fgsea_gene_stats %>%
+    distinct(
+      id = comparison,
+      comparison_type
+    ) %>%
+    dplyr::slice(match(colnames(fgsea_res_mat), id)) %>%
+    as.data.frame()
+)
+write_gct(
+  fgsea_res_gct,
+  "vemu/fgsea_res_h_pid_kegg.gct",
+  appenddim = FALSE
+)
+```
+
+Use topGO
+
+
+```{r}
+library(topGO)
+
+topgo_gene_stats <- fgsea_gene_stats %>%
+  mutate(
+    signed_p = -sign(log2FoldChange) * log10(pvalue),
+    across(signed_p, ~replace_na(.x, 0))
+  ) %>%
+  group_by(comparison, comparison_type) %>%
+  summarize(
+    gene_stats = set_names(
+      signed_p, ensembl_gene_id
+    ) %>%
+      list(),
+    .groups = "drop"
+  )
+
+select_significant <- function(x) replace_na(x < 0.05, FALSE)
+
+topgo_bp_object <- new(
+  "topGOdata",
+  ontology = "BP",
+  allGenes = topgo_gene_stats$gene_stats[[1]],
+  geneSelectionFun = select_significant,
+  nodeSize = 10,
+  annot = annFUN.org,
+  ID = "ensembl",
+  mapping = "org.Hs.eg.db"
+)
+
+topgo_direction_funs <- tribble(
+  ~direction, ~fun,
+  "up", function(x) x > -log10(0.05),
+  "down", function(x) x < log10(0.05),
+  "all", function(x) abs(x) > -log10(0.05)
+)
+
+topgo_res_raw <- topgo_gene_stats %>%
+  crossing(topgo_direction_funs) %>%
+  rowwise() %>%
+  mutate(
+    res = runTest(
+      updateGenes(
+        topgo_bp_object,
+        geneList = gene_stats,
+        geneSelFun = fun
+      ),
+      algorithm = "weight01",
+      statistic = "fisher",
+      scoreOrder = "increasing"
+    ) %>%
+      list()
+  ) %>%
+  ungroup()
+
+qsave(
+  topgo_res_raw,
+  "vemu/topgo_res_raw.qs"
+)
+
+
+topgo_res <- topgo_res_raw %>%
+  rowwise() %>%
+  mutate(
+    res_table = GenTable(
+      topgo_bp_object,
+      fisher = res,
+      topNodes = length(usedGO(topgo_bp_object)),
+      numChar = 300
+    ) %>%
+      list()
+  ) %>%
+  ungroup() %>%
+  dplyr::select(-res, -fun) %>%
+  unnest(res_table) %>%
+  mutate(
+    term_unique = paste(
+      Term, GO.ID, sep = "_"
+    )
+  )
+qsave(
+  topgo_res,
+  "vemu/topgo_res.qs"
+)
+
+```
+
+
+```{r}
+fgsea_res_top_pathways <- fgsea_res %>%
+  filter(
+    pathway %in% {
+      msigdbr_of_interest %>%
+        # filter(gs_cat == "H") %>%
+        pull(gs_name)
+    }
+  ) %>%
+  group_by(comparison) %>%
+  filter(padj < 0.05) %>%
+  arrange(pval) %>%
+  slice_head(n = 10) %>%
+  ungroup() %>%
+  pull(pathway) %>%
+  unique()
+
+fgsea_res_top_clustered <- fgsea_res %>%
+  filter(pathway %in% fgsea_res_top_pathways) %>%
+  cluster_df(comparison, pathway, NES) %>%
+  cluster_df(pathway, comparison, NES)
+
+p <- fgsea_res_top_clustered %>%
+  ggplot(
+    aes(
+      comparison,
+      pathway,
+      fill = NES
+    )
+  ) +
+    geom_raster() +
+    geom_text(
+      aes(label = padj_text),
+      data = ~.x %>%
+        mutate(
+          padj_text = cut(
+            padj,
+            breaks = c(0, 0.001, 0.01, 0.05, 1),
+            labels = c("***", "**", "*", "")
+          )
+        )
+    ) +
+    scale_fill_distiller(palette = "RdBu") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    coord_equal() +
+    labs(x = NULL, y = NULL)
+
+ggsave(
+  "vemu/plots/fgsea_res_h_pid_kegg_top10_clustered.pdf", p, width = 14, height = 16
+)
+
+
+p <- fgsea_res_top_clustered %>%
+  ggplot(
+    aes(
+      comparison,
+      pathway,
+      fill = NES
+    )
+  ) +
+    geom_raster() +
+    geom_text(
+      aes(label = padj_text),
+      data = ~.x %>%
+        mutate(
+          padj_text = cut(
+            padj,
+            breaks = c(0, 0.001, 0.01, 0.05, 1),
+            labels = c("***", "**", "*", "")
+          )
+        )
+    ) +
+    scale_fill_distiller(palette = "RdBu") +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+      # aspect.ratio = 10
+    ) +
+    # coord_equal() +
+    labs(x = NULL, y = NULL) +
+    ggforce::facet_row(~comparison_type, scales = "free_x", space = "free", drop = TRUE)
+
+ggsave(
+  "vemu/plots/fgsea_res_h_pid_kegg_top10_clustered_grouped.pdf", p, width = 12, height = 15
+)
+
+# Only cell line comparisons
+fgsea_res_top_only_cell_clustered <- fgsea_res %>%
+  filter(
+    comparison_type == "cell_line",
+    pathway %in% {
+      fgsea_res %>%
+        filter(
+          comparison_type == "cell_line",
+          pathway %in% {
+            msigdbr_of_interest %>%
+              # filter(gs_cat == "H") %>%
+              pull(gs_name)
+          }
+        ) %>%
+        group_by(comparison) %>%
+        filter(padj < 0.05) %>%
+        arrange(pval) %>%
+        slice_head(n = 10) %>%
+        ungroup() %>%
+        pull(pathway) %>%
+        unique()
+    }
+  ) %>%
+  cluster_df(comparison, pathway, NES) %>%
+  cluster_df(pathway, comparison, NES)
+
+
+p <- fgsea_res_top_only_cell_clustered %>%
+  ggplot(
+    aes(
+      comparison,
+      pathway,
+      fill = NES
+    )
+  ) +
+    geom_raster() +
+    geom_text(
+      aes(label = padj_text),
+      data = ~.x %>%
+        mutate(
+          padj_text = cut(
+            padj,
+            breaks = c(0, 0.001, 0.01, 0.05, 1),
+            labels = c("***", "**", "*", "")
+          )
+        )
+    ) +
+    scale_fill_distiller(palette = "RdBu") +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+      # aspect.ratio = 10
+    ) +
+    # coord_equal() +
+    labs(x = NULL, y = NULL) +
+    ggforce::facet_row(~comparison_type, scales = "free_x", space = "free", drop = TRUE)
+
+ggsave(
+  "vemu/plots/fgsea_res_h_pid_kegg_top10_clustered_only_cell_lines_grouped.pdf", p, width = 5, height = 6
+)
+
+p <- Heatmap(
+  fgsea_res_gct@mat[fgsea_res_top_pathways, ],
+  right_annotation = rowAnnotation(
+    df = fgsea_res_gct@rdesc %>%
+      dplyr::slice(match(fgsea_res_top_pathways, id)) %>%
+      select(gs_cat, gs_subcat)
+  ),
+  top_annotation = HeatmapAnnotation(
+    df = fgsea_res_gct@cdesc %>%
+      select(comparison_type)
+  ),
+  cluster_rows = cluster_mat,
+  cluster_columns = cluster_mat
+)
+```
+
+Topgo Heatmap
+
+
+```{r}
+top_go_top_clustered <- topgo_res %>%
+  transmute(
+    enrichment_method = "topgo",
+    comparison_type, comparison, direction,
+    term = term_unique,
+    signed_p = -log10(as.numeric(fisher))
+  ) %>%
+  group_by(direction) %>%
+  summarize(
+    data = filter(
+      cur_data(),
+      term %in% {
+        mutate(cur_data(), significant = abs(signed_p) > -log10(0.05)) %>%
+          # Remove terms that are significant for >50% of comparisons
+          group_by(term) %>%
+          filter(!((sum(significant) / n()) > 0.5)) %>%
+          ungroup() %>%
+          group_by(comparison) %>%
+          filter(significant) %>%
+          arrange(desc(abs(signed_p))) %>%
+          slice_head(n = 10) %>%
+          ungroup() %>%
+          pull(term) %>%
+          unique()
+      }
+    ) %>%
+    cluster_df(comparison, term, signed_p) %>%
+    cluster_df(term, comparison, signed_p) %>%
+    list()
+  )
+
+top_go_top_clustered_ps <- top_go_top_clustered %>%
+  rowwise() %>%
+  mutate(
+    p = list(ggplot(
+      data,
+      aes(
+        comparison,
+        term,
+        fill = signed_p
+      )
+    ) +
+      geom_raster() +
+      geom_text(
+        aes(label = padj_text),
+        data = ~.x %>%
+          mutate(
+            padj_text = cut(
+              10**(-abs(signed_p)),
+              breaks = c(0, 0.001, 0.01, 0.05, 1),
+              labels = c("***", "**", "*", "")
+            )
+          ),
+        color = "white"
+      ) +
+      # scale_fill_distiller(palette = "RdBu") +
+      scale_fill_viridis_c(option = "plasma", limits = c(0, 8), oob = scales::squish) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+      # coord_equal() +
+      labs(x = NULL, y = NULL) +
+      ggforce::facet_row(~comparison_type, scales = "free_x", space = "free", drop = TRUE))
+  ) %>%
+  ungroup()
+
+top_go_top_res_directional <- topgo_res %>%
+  transmute(
+    enrichment_method = "topgo",
+    comparison_type, comparison, direction,
+    term = term_unique,
+    p = as.numeric(fisher),
+    significant = p < 0.05
+  ) %>%
+  pivot_wider(
+    names_from = direction,
+    values_from = c(p, significant)
+  ) %>%
+  mutate(
+    signed_p = case_when(
+      significant_up & significant_down ~ NA_real_,
+      significant_up ~ -log10(p_up),
+      significant_down ~ log10(p_down),
+      TRUE ~ .5 * (-log10(p_up) -log10(p_down))
+    )
+  )
+
+top_go_top_clustered_directional <- top_go_top_res_directional %>%
+  filter(
+    term %in% {
+      mutate(., significant = abs(signed_p) > -log10(0.05)) %>%
+        # Remove terms that are significant for >50% of comparisons
+        group_by(term) %>%
+        filter(!((sum(significant, na.rm = TRUE) / n()) > 0.5)) %>%
+        ungroup() %>%
+        group_by(comparison) %>%
+        filter(significant) %>%
+        arrange(desc(abs(signed_p))) %>%
+        slice_head(n = 10) %>%
+        ungroup() %>%
+        pull(term) %>%
+        unique()
+      }
+    ) %>%
+    cluster_df(comparison, term, signed_p) %>%
+    cluster_df(term, comparison, signed_p) 
+
+p <- ggplot(
+  top_go_top_clustered_directional,
+  aes(
+    comparison,
+    term,
+    fill = signed_p
+  )
+) +
+  geom_raster() +
+  geom_text(
+    aes(label = padj_text),
+    data = ~.x %>%
+      mutate(
+        padj_text = cut(
+          10**(-abs(signed_p)),
+          breaks = c(0, 0.001, 0.01, 0.05, 1),
+          labels = c("***", "**", "*", "")
+        )
+      ),
+    color = "white"
+  ) +
+  scale_fill_distiller(palette = "RdBu", limits = c(-4, 4), oob = scales::squish) +
+  # scale_fill_viridis_c(option = "plasma", limits = c(0, 8), oob = scales::squish) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  # coord_equal() +
+  labs(x = NULL, y = NULL) +
+  ggforce::facet_row(~comparison_type, scales = "free_x", space = "free", drop = TRUE)
+
+ggsave(
+  "vemu/plots/topgo_top10_clustered_directional.pdf",
+  p,
+  width = 10,
+  height = 18
+)
+
+
+top_go_top_clustered_directional_cells_only <- top_go_top_res_directional %>%
+  filter(
+    comparison_type == "cell_line"
+  ) %>%
+  filter(
+    term %in% {
+      mutate(., significant = abs(signed_p) > -log10(0.05)) %>%
+        # # Remove terms that are significant for >50% of comparisons
+        # group_by(term) %>%
+        # filter(!((sum(significant, na.rm = TRUE) / n()) > 0.5)) %>%
+        # ungroup() %>%
+        group_by(comparison) %>%
+        filter(significant) %>%
+        arrange(desc(abs(signed_p))) %>%
+        slice_head(n = 10) %>%
+        ungroup() %>%
+        pull(term) %>%
+        unique()
+      }
+    ) %>%
+    cluster_df(comparison, term, signed_p) %>%
+    cluster_df(term, comparison, signed_p) 
+
+p <- ggplot(
+  top_go_top_clustered_directional_cells_only,
+  aes(
+    comparison,
+    term,
+    fill = signed_p
+  )
+) +
+  geom_raster() +
+  geom_text(
+    aes(label = padj_text),
+    data = ~.x %>%
+      mutate(
+        padj_text = cut(
+          10**(-abs(signed_p)),
+          breaks = c(0, 0.001, 0.01, 0.05, 1),
+          labels = c("***", "**", "*", "")
+        )
+      ),
+    color = "white"
+  ) +
+  scale_fill_distiller(palette = "RdBu", limits = c(-4, 4), oob = scales::squish) +
+  # scale_fill_viridis_c(option = "plasma", limits = c(0, 8), oob = scales::squish) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  # coord_equal() +
+  labs(x = NULL, y = NULL) +
+  ggforce::facet_row(~comparison_type, scales = "free_x", space = "free", drop = TRUE)
+
+  
+```
+
+Combined FGSEA and topGO results
+
+```{r}
+combined_enrichment_results <- bind_rows(
+  topgo_res %>%
+    transmute(
+      enrichment_method = "topgo",
+      comparison_type, comparison,
+      term = term_unique,
+      signed_p = -log10(as.numeric(fisher))
+    ),
+  fgsea_res %>%
+    transmute(
+      enrichment_method = "fgsea",
+      comparison_type, comparison,
+      term = pathway,
+      signed_p = -sign(NES) * log10(padj)
+    )
+)
+
+combined_top_pathways <- combined_enrichment_results %>%
+  group_by(comparison) %>%
+  filter(abs(signed_p) > -log10(0.05)) %>%
+  arrange(desc(abs(signed_p))) %>%
+  slice_head(n = 10) %>%
+  ungroup() %>%
+  pull(term) %>%
+  unique()
+
+combined_top_clustered <- combined_enrichment_results %>%
+  filter(term %in% combined_top_pathways) %>%
+  cluster_df(comparison, term, signed_p) %>%
+  cluster_df(term, comparison, signed_p)
+
+p <- combined_top_clustered %>%
+  ggplot(
+    aes(
+      comparison,
+      term,
+      fill = signed_p
+    )
+  ) +
+    geom_raster() +
+    geom_text(
+      aes(label = padj_text),
+      data = ~.x %>%
+        mutate(
+          padj_text = cut(
+            10**(-abs(signed_p)),
+            breaks = c(0, 0.001, 0.01, 0.05, 1),
+            labels = c("***", "**", "*", "")
+          )
+        )
+    ) +
+    scale_fill_distiller(palette = "RdBu") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    # coord_equal() +
+    labs(x = NULL, y = NULL) +
+    ggforce::facet_row(~comparison_type, scales = "free_x", space = "free", drop = TRUE)
+
+
+ggsave(
+  "vemu/plots/fgsea_res_h_pid_kegg_topgo_top10_clustered.pdf", p, width = 10, height = 16
+)
+
+
+```
+
 
 * Compute GSEA for vemurafenib cell line specific effects
 * Copmute GSEA for interaction term
 * Compute GSEA for genes rescued by high FBS from pairwise comparison
-*
+
+
+* Show heatmap of gene expression for all genes that are correlated with each
+phenotypic trait - one heatmap per trait - separate by cell line
+
+* Compute difference between cell lines at baseline (5% FBS) ignoring Vemu effect
+* Do GSEA on this difference and include it in the existing heatmaps
+* Make big heatmap using Morpheus
+
+
+* Use not Reactome, but H, PID, and KEGG
+
+
