@@ -43,7 +43,9 @@ if (!file.exists(ensembl_gtf_file)) {
   )
 }
 
-ensembl_gtf <- rtracklayer::readGFF(ensembl_gtf_file) %>%
+ensembl_gtf <- rtracklayer::readGFF(
+  ensembl_gtf_file
+) %>%
   filter(gene_biotype == "protein_coding") %>%
   distinct(
     ensembl_gene_id = gene_id,
@@ -67,6 +69,18 @@ vst_mat <- counts_vst %>%
 counts_normalized <- syn("syn51221599") %>%
   read_csv()
 
+```
+
+```{r}
+de_meta %>%
+  filter(source_96 != "Plate 4") %>%
+  dplyr::count(
+    cell_line, agent, concentration, timepoint
+  ) %>%
+  arrange(
+    cell_line, agent, concentration
+  ) %>%
+  View()
 ```
 
 Only consider genes that have at least 5 counts in more than 10 samples to
@@ -539,6 +553,7 @@ qsave(
   de_vs_baseline_vemu,
   "deseq/deseq_res_vs_baseline.qs"
 )
+# de_vs_baseline_vemu <- qread("deseq/deseq_res_vs_baseline.qs")
 ```
 
 #### PCA 1-4
@@ -1266,67 +1281,50 @@ Use custom contrast in `results()` to get log2FoldChange for each cell line comp
 the average of all cell lines.
 
 ```{r}
+# Do comparision separately for each FBS concentration
+
 de_vemu_cell_line_at_baseline <- de_meta_vemu %>%
-  filter(concentration == 0, concentration_fbs == 5) %>%
+  filter(concentration == 0) %>%
+  group_by(concentration_fbs) %>%
   summarize(
     de = DESeqDataSetFromMatrix(
       de_count_mat[genes_to_keep, cur_data()$well],
       # cur_data(),
       # ~cell_line
-       cur_data() %>%
-        mutate(across(c(concentration, concentration_fbs), ~scale(as.integer(fct_inseq(as.character(.x)))))),
-      ~cell_line*concentration_fbs
+       cur_data(),
+      ~0 + cell_line
     ) %>%
       DESeq(parallel = TRUE, BPPARAM = BiocParallel::MulticoreParam(workers = 6)) %>%
       list(),
     .groups = "drop"
   )
 
-de_vemu_res_cell_line_at_baseline <- de_vemu_cell_line_at_baseline %>%
-  mutate(
-    coefs = map(de, ~tibble(coef = setdiff(resultsNames(.x), "Intercept")))
-  ) %>%
-  unnest(coefs) %>%
-  rowwise() %>%
-  mutate(
-    res = results_deseq_with_shrunk(
-      de,
-      results_args = c(results_args, list(name = coef)),
-      shrink_args = c(results_args, list(type = "ashr"))
-    ) %>%
-    left_join(
-      ensembl_gtf %>%
-        distinct(ensembl_gene_id, hgnc_symbol),
-      by = "ensembl_gene_id"
-    ) %>%
-    as_tibble() %>%
-    list()
-  ) %>%
-  ungroup() %>%
-  mutate(
-    n_de = map_int(res, ~nrow(filter(.x, padj < 0.05))),
-    n_de_ihw = map_int(res, ~nrow(filter(.x, padj_ihw < 0.05)))
-  )
+de_vemu_cell_line_at_baseline_results_names <- de_vemu_cell_line_at_baseline %>%
+  chuck("de", 1) %>%
+  resultsNames()
 
+de_vemu_cell_line_at_baseline_results_contrasts <- map(
+    de_vemu_cell_line_at_baseline_results_names %>%
+      set_names(
+        paste(str_replace(., "cell_line", ""), "vs_mean", sep = "_")
+      ),
+    \(x) {
+      n <- length(de_vemu_cell_line_at_baseline_results_names)
+      contrast_vec <- rep(
+        -1/n,
+        n
+      ) %>%
+        set_names(de_vemu_cell_line_at_baseline_results_names)
+      contrast_vec[match(x, names(contrast_vec))] <- (n - 1) / n
+      contrast_vec
+    }
+) %>%
+  enframe("contrast_name", "contrast")
 
 de_vemu_res_cell_line_at_baseline <- de_vemu_cell_line_at_baseline %>%
-  mutate(
-    contr = tribble(
-      # de_vemu_cell_line_at_baseline$de[[1]] %>% resultsNames()
-      # [1] "Intercept"                          "cell_line_COLO858_vs_A375"
-      # [3] "cell_line_WM989_vs_A375"            "concentration_fbs"
-      # [5] "cell_lineCOLO858.concentration_fbs" "cell_lineWM989.concentration_fbs"
-      ~contrast_name, ~contrast,
-      "cell_line_A375_vs_mean", c(0, -1/3, -1/3, 0, 0, 0),
-      "cell_line_WM989_vs_mean", c(0, -1/3, 2/3, 0, 0, 0),
-      "cell_line_COLO858_vs_mean", c(0, 2/3, -1/3, 0, 0, 0),
-      # "cell_line_A375_vs_mean", c(0, -1/3, -1/3),
-      # "cell_line_WM989_vs_mean", c(0, -1/3, 2/3),
-      # "cell_line_COLO858_vs_mean", c(0, 2/3, -1/3),
-    ) %>%
-      list()
+  cross_join(
+    de_vemu_cell_line_at_baseline_results_contrasts
   ) %>%
-  unnest(contr) %>%
   rowwise() %>%
   mutate(
     res = results_deseq_with_shrunk(
@@ -1355,7 +1353,6 @@ qsave(
 )
 # de_vemu_res_cell_line_at_baseline <- qread("deseq/deseq_res_cell_line_effect_vs_mean.qs")
 
-
  de_vemu_res_cell_line_at_baseline_long <- de_vemu_res_cell_line_at_baseline %>%
   select(-any_of("de"), -starts_with("n_de"), -contrast) %>%
   unnest(res)
@@ -1371,20 +1368,26 @@ de_vemu_res_cell_line_at_baseline_comp <- de_vemu_res_cell_line_at_baseline %>%
   t() %>%
   magrittr::set_colnames(c("contrast_1", "contrast_2")) %>%
   as_tibble() %>%
+  crossing(
+    concentration_fbs = de_vemu_res_cell_line_at_baseline %>%
+      pull(concentration_fbs) %>%
+      unique()
+  ) %>%
   inner_join(
     de_vemu_res_cell_line_at_baseline_long %>%
-      select(contrast_name, ensembl_gene_id, hgnc_symbol, log2FoldChange, padj, padj_ihw),
-    by = c("contrast_1" = "contrast_name"),
+      select(concentration_fbs, contrast_name, ensembl_gene_id, hgnc_symbol, log2FoldChange, padj, padj_ihw),
+    by = c("contrast_1" = "contrast_name", "concentration_fbs"),
     relationship = "many-to-many"
   ) %>%
   inner_join(
     de_vemu_res_cell_line_at_baseline_long %>%
-      select(contrast_name, ensembl_gene_id, log2FoldChange, padj, padj_ihw),
-    by = c("contrast_2" = "contrast_name", "ensembl_gene_id"),
+      select(concentration_fbs, contrast_name, ensembl_gene_id, log2FoldChange, padj, padj_ihw),
+    by = c("contrast_2" = "contrast_name", "ensembl_gene_id", "concentration_fbs"),
     suffix = c("_1", "_2")
   )
 
 p <- de_vemu_res_cell_line_at_baseline_comp %>%
+  filter(concentration_fbs == 0) %>%
   ggplot(
     aes(
       log2FoldChange_1,
@@ -1968,6 +1971,7 @@ fgsea_gene_stats <- bind_rows(
     dplyr::select(-any_of("de"), -starts_with("n_de")) %>%
     unnest(res) %>%
     transmute(
+      concentration_fbs,
       comparison = contrast_name,
       comparison_type = "cell_line",
       ensembl_gene_id,
@@ -2000,6 +2004,35 @@ fgsea_gene_stats <- bind_rows(
       signed_p = -sign(log2FoldChange) * log10(pvalue)
     )
 )
+
+library(powerjoin)
+fgsea_gene_stats_w_symbol <- fgsea_gene_stats %>%
+  power_left_join(
+    ensembl_gtf %>%
+      select(ensembl_gene_id, hgnc_symbol),
+    by = "ensembl_gene_id",
+    check = check_specs(
+      duplicate_keys_right = "warn",
+      unmatched_keys_left = "warn",
+      na_keys = "warn"
+    )
+  )
+
+fwrite(
+  fgsea_gene_stats_w_symbol,
+  "vemu/deseq_res_all.csv.gz",
+)
+
+synStoreMany(
+  "vemu/deseq_res_all.csv.gz",
+  parentId = "syn51221227",
+  forceVersion = FALSE
+)
+```
+
+
+
+```{r}
 
 fgsea_gene_stats_grouped <- fgsea_gene_stats %>%
   group_by(comparison_type, comparison) %>%
@@ -2458,7 +2491,48 @@ top_go_top_clustered_directional <- top_go_top_res_directional %>%
       }
     ) %>%
     cluster_df(comparison, term, signed_p) %>%
-    cluster_df(term, comparison, signed_p) 
+    cluster_df(term, comparison, signed_p)
+
+library(gt)
+top_go_top_clustered_directional_gt <- top_go_top_clustered_directional %>%
+  dplyr::select(term, comparison_type, comparison, signed_p) %>%
+  unite(comparison, comparison_type, comparison, sep = "|") %>%
+  arrange(comparison) %>%
+  pivot_wider(names_from = comparison, values_from = signed_p) %>%
+  arrange(desc(term)) %>%
+  gt(
+    auto_align = TRUE,
+    rowname_col = "term"
+  ) %>%
+  tab_spanner_delim(delim = "|") %>%
+  fmt_number(
+    columns = everything(),
+    n_sigfig = 2
+  ) %>%
+  data_color(
+    columns = everything(),
+    method = "numeric",
+    # palette = "RdBu",
+    # domain = c(-4, 4),
+    fn = function(x) scales::col_numeric(
+      palette = "RdBu",
+      reverse = TRUE,
+      domain = c(-4, 4)
+    )(scales::oob_squish(x, range = c(-4, 4)))
+  )
+
+gtsave(
+  top_go_top_clustered_directional_gt,
+  filename = "vemu/top_go_top_clustered_directional.html",
+)
+
+openxlsx::write.xlsx(
+  top_go_top_clustered_directional %>%
+    dplyr::select(term, comparison, signed_p) %>%
+    pivot_wider(names_from = comparison, values_from = signed_p),
+  "vemu/top_go_top_clustered_directional.xlsx"
+)
+
 
 p <- ggplot(
   top_go_top_clustered_directional,
@@ -2517,7 +2591,7 @@ top_go_top_clustered_directional_cells_only <- top_go_top_res_directional %>%
       }
     ) %>%
     cluster_df(comparison, term, signed_p) %>%
-    cluster_df(term, comparison, signed_p) 
+    cluster_df(term, comparison, signed_p)
 
 p <- ggplot(
   top_go_top_clustered_directional_cells_only,
