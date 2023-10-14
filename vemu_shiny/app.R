@@ -4,11 +4,101 @@ library(tidyverse)
 library(here)
 library(qs)
 library(ggbeeswarm)
+library(data.table)
+library(InteractiveComplexHeatmap)
 
 theme_set(theme_minimal())
 
+PATH_PREFIX = "vemu"
+
+cluster_mat <- function(mat) {
+  d <- dist(mat)
+  set.seed(42)
+  hclust(d, method = "average") %>%
+    seriation:::reorder.hclust(dist = d, method = "olo")
+}
+
+find_scale_range <- function(x, percentile = 0.05) {
+  abs_max <- quantile(x, c(percentile, 1 - percentile), names = FALSE, na.rm = TRUE) %>%
+    abs() %>%
+    max()
+  c(-abs_max, abs_max)
+}
+
+cluster_df <- function(df, x, y, z) {
+  # browser()
+  mat <- df %>%
+    dplyr::select({{x}}, {{y}}, {{z}}) %>%
+    pivot_wider(
+      names_from = {{x}},
+      values_from = {{z}}
+    ) %>%
+    column_to_rownames(rlang::as_name(rlang::ensym(y))) %>%
+    as.matrix()
+  # browser()
+  clustering <- cluster_mat(t(mat))
+  df_clustered <- df %>%
+    mutate(
+      across(
+        c({{x}}),
+        ~factor(.x, levels = clustering$labels[clustering$order])
+      )
+    )
+  if (is.null(attr(df_clustered, "clusters")))
+    attr(df_clustered, "clusters") <- list()
+  attr(df_clustered, "clusters")[[rlang::as_name(rlang::ensym(x))]] <- clustering
+  df_clustered
+}
+
+fgsea_res <- qread(file.path(PATH_PREFIX, "fgsea_res.qs"))
+msigdbr_of_interest <- fread(file.path(PATH_PREFIX, "msigdbr_of_interest.csv.gz")) %>%
+  as_tibble()
+topgo_res <- qread(file.path(PATH_PREFIX, "topgo_res.qs")) %>%
+  mutate(
+    term_unique = paste(
+      str_sub(Term, 1L, 20L),
+      GO.ID,
+      sep = " "
+    )
+  )
+topgo_bp_genes <- qread(file.path(PATH_PREFIX, "topgo_bp_genes.qs"))
+
+top_go_top_res_directional <- topgo_res %>%
+  transmute(
+    comparison_type, comparison, comparison_unique, direction,
+    term = term_unique, GO.ID,
+    p = as.numeric(str_replace(fisher, "< ", "")),
+    significant = p < 0.05
+  ) %>%
+  pivot_wider(
+    names_from = direction,
+    values_from = c(p, significant)
+  ) %>%
+  mutate(
+    signed_p = case_when(
+      significant_up & significant_down ~ case_when(
+        p_up < .1 * p_down ~ -log10(p_up),
+        p_down < .1 * p_up ~ log10(p_down),
+        TRUE ~ NA_real_
+      ),
+      significant_up ~ -log10(p_up),
+      significant_down ~ log10(p_down),
+      TRUE ~ .5 * (-log10(p_up) -log10(p_down))
+    )
+  )
+
+fgsea_gene_stats_w_symbol <- fread(file.path(PATH_PREFIX, "deseq_res_all.csv.gz")) %>%
+  as_tibble() %>%
+  mutate(
+    gene_name = if_else(
+      is.na(hgnc_symbol),
+      ensembl_gene_id,
+      hgnc_symbol
+    )
+  )
+
 vemu_treated_vs_untreated <- qread(
-  here("data", "deseq_res_vemu_treated_vs_untreated.qs")
+  file.path(PATH_PREFIX, "deseq_res_vemu_treated_vs_untreated.qs")
 ) %>%
   mutate(
     plot_output_name = paste0(
@@ -24,7 +114,7 @@ vemu_treated_vs_untreated <- qread(
   )
 
 vemu_linear_res <- qread(
-  here("data", "deseq_res_linear_ordinal_by_cell_line.qs")
+  file.path(PATH_PREFIX, "deseq_res_linear_ordinal_by_cell_line.qs")
 )
 
 vemu_treated_vs_untreated_long <- vemu_treated_vs_untreated %>%
@@ -80,17 +170,20 @@ vemu_linear_res_long <- vemu_linear_res %>%
     by = "ensembl_gene_id"
   )
 
-normalized_counts <- read_csv(
-  here("data", "normalized_counts.csv.gz")
-)
+normalized_counts <- fread(
+  here("vemu_shiny", "data", "normalized_counts.csv.gz")
+) %>%
+  as_tibble()
 
-vst_counts <- read_csv(
-  here("data", "counts_vst.csv.gz")
-)
+vst_counts <- fread(
+  here("vemu_shiny", "data", "counts_vst.csv.gz")
+) %>%
+  as_tibble()
 
-de_meta_vemu <- read_csv(
-  here("data", "de_meta_vemu.csv")
-)
+de_meta_vemu <- fread(
+  here("vemu_shiny", "data", "de_meta_vemu.csv")
+) %>%
+  as_tibble()
 
 filter_by_gene <- function(data, gene_symbol) {
   filtered <- data %>%
@@ -212,6 +305,52 @@ ui <- fluidPage(
     tabPanel(
       "Selected genes",
       uiOutput("out_selected_genes")
+    ),
+    tabPanel(
+      "Gene set enrichment",
+      fluidRow(
+        sliderInput(
+          "n_significant_per_term",
+          "Number of pathways to show per comparison",
+          min = 1, max = 100, value = 10
+        )
+      ),
+      fluidRow(
+        column(
+          width = 6,
+          tabsetPanel(
+            type = "tabs",
+            id = "tabs_gene_set_enrichment",
+            tabPanel(
+              "FGSEA",
+              plotlyOutput("plot_out_fgsea", height = "800px"),
+              value = "fgsea"
+            ),
+            tabPanel(
+              "TOPGO",
+              plotlyOutput("plot_out_topgo", height = "800px"),
+              value = "topgo"
+            )
+          )
+        ),
+        column(
+          width = 6,
+          tabsetPanel(
+            type = "tabs",
+            tabPanel(
+              "Gene set heatmap",
+              plotlyOutput("plot_out_gene_set_heatmap", height = "800px")
+              # InteractiveComplexHeatmapOutput(
+              #   "out_heatmap_gene_expression"
+              # )
+            ),
+            tabPanel(
+              "Gene set beeswarm",
+              plotOutput("plot_out_gene_set_beeswarm", height = "800px")
+            )
+          )
+        )
+      )
     )
   ),
   fluidRow(
@@ -351,11 +490,236 @@ linear_res_plots_combined_plotly <- linear_res_plots_combined %>%
   toWebGL()
 
 server <- function(input, output, session) {
+  r_fgsea_top_pathways <- reactive({
+    fgsea_res %>%
+      filter(
+        pathway %in% {
+          msigdbr_of_interest %>%
+            # filter(gs_cat == "H") %>%
+            pull(gs_name)
+        }
+      ) %>%
+      group_by(comparison, comparison_unique) %>%
+      filter(padj < 0.05) %>%
+      arrange(pval) %>%
+      slice_head(n = input$n_significant_per_term) %>%
+      ungroup() %>%
+      pull(pathway) %>%
+      unique()
+  })
+  r_fgsea_clustered <- reactive({
+    fgsea_res %>%
+      filter(pathway %in% r_fgsea_top_pathways()) %>%
+      cluster_df(comparison_unique, pathway, NES) %>%
+      cluster_df(pathway, comparison_unique, NES)
+  })
+  r_fgsea_plot <- reactive({
+    p <- ggplot(
+      r_fgsea_clustered(),
+      aes(
+        comparison_unique,
+        pathway,
+        fill = NES,
+        customdata = pathway
+      )
+    ) +
+      geom_raster() +
+      geom_text(
+        aes(label = padj_text),
+        data = ~.x %>%
+          mutate(
+            padj_text = cut(
+              padj,
+              breaks = c(0, 0.001, 0.01, 0.05, 1),
+              labels = c("***", "**", "*", "")
+            )
+          ),
+        size = 2
+      ) +
+      scale_fill_distiller(palette = "RdBu") +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        # aspect.ratio = 10
+      ) +
+      # coord_equal() +
+      labs(x = NULL, y = NULL) +
+      ggforce::facet_row(~comparison_type, scales = "free_x", space = "free", drop = TRUE)
+    ggplotly(p, source = "plotly_fgsea") %>%
+      event_register("plotly_click")
+  })
+  r_topgo_top_pathways <- reactive({
+    top_go_top_res_directional %>%
+      group_by(comparison, comparison_unique) %>%
+      filter(abs(signed_p) > -log10(0.05)) %>%
+      arrange(desc(abs(signed_p))) %>%
+      slice_head(n = input$n_significant_per_term) %>%
+      ungroup() %>%
+      pull(term) %>%
+      unique()
+  })
+  r_topgo_clustered <- reactive({
+    top_go_top_res_directional %>%
+      filter(term %in% r_topgo_top_pathways()) %>%
+      cluster_df(comparison_unique, term, signed_p) %>%
+      cluster_df(term, comparison_unique, signed_p)
+  })
+  r_topgo_plot <- reactive({
+    plot_range <- find_scale_range(r_topgo_clustered()$signed_p, 0.05)
+    # browser()
+    p <- ggplot(
+      r_topgo_clustered() %>%
+        mutate(across(signed_p, ~replace_na(.x, 5))),
+      aes(
+        comparison_unique,
+        term,
+        fill = signed_p,
+        customdata = GO.ID,
+        text = paste0(
+          "<b>", term, "<br>", comparison_unique, "</b><br>",
+          "p up ", signif(p_up, 3), " p down ", signif(p_down, 3), "<br>",
+          "p signed ", signif(signed_p, 3)
+        )
+      )
+    ) +
+      geom_raster() +
+      scale_fill_distiller(
+        palette = "RdBu", type = "div", limits = plot_range, na.value = "gray50",
+        oob = scales::squish
+      ) +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        # aspect.ratio = 10
+      ) +
+      # coord_equal() +
+      labs(x = NULL, y = NULL) +
+      ggforce::facet_row(~comparison_type, scales = "free_x", space = "free", drop = TRUE)
+    ggplotly(p, source = "plotly_topgo", tooltip = "text") %>%
+      event_register("plotly_click")
+  })
+  r_selected_genes_clustered <- reactive({
+    req(r_selected_genes_enrichment())
+    print(r_selected_genes_enrichment())
+    # browser()
+    fgsea_gene_stats_w_symbol %>%
+      filter(
+        ensembl_gene_id %in% r_selected_genes_enrichment()
+      ) %>%
+      # cluster_df(comparison_unique, gene_symbol, log2FoldChange) %>%
+      mutate(
+        across(
+          comparison_unique,
+          \(x) factor(
+            x,
+            levels = levels(
+              isolate(
+                if (input$tabs_gene_set_enrichment == "fgsea")
+                  r_fgsea_clustered()$comparison_unique
+                else
+                  r_topgo_clustered()$comparison_unique
+              )
+            )
+          )
+        )
+      ) %>%
+      cluster_df(gene_name, comparison_unique, log2FoldChange)
+  })
+  r_selected_genes_heatmap <- reactive({
+    plot_range <- find_scale_range(r_selected_genes_clustered()$log2FoldChange, 0.05)
+    ggplot(
+      r_selected_genes_clustered(),
+      aes(
+        comparison_unique,
+        gene_name,
+        fill = log2FoldChange
+      )
+    ) +
+      geom_tile() +
+      geom_text(
+        aes(label = padj_text),
+        data = ~.x %>%
+          mutate(
+            padj_text = cut(
+              padj,
+              breaks = c(0, 0.001, 0.01, 0.05, 1),
+              labels = c("***", "**", "*", "")
+            )
+          ),
+        size = 2
+      ) +
+      scale_fill_distiller(
+        palette = "RdBu", type = "div", limits = plot_range, na.value = "gray50",
+        oob = scales::squish
+      ) +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        # aspect.ratio = 10
+      ) +
+      # coord_equal() +
+      labs(x = NULL, y = NULL) +
+      ggforce::facet_row(~comparison_type, scales = "free_x", space = "free", drop = TRUE)
+  })
+  library(ggbeeswarm)
+  r_selected_genes_beeswarm <- reactive({
+    ggplot(
+      r_selected_genes_clustered() %>%
+        mutate(across(comparison_unique, fct_rev)),
+      aes(
+        log2FoldChange,
+        comparison_unique
+      )
+    ) + 
+      geom_quasirandom(
+        orientation = "y"
+      ) +
+      ggforce::facet_col(~comparison_type, scales = "free_y", space = "free", drop = TRUE)
+  })
+  r_selected_genes_enrichment <- reactiveVal()
+  observe({
+    new_fgsea_pathway <- event_data("plotly_click", source = "plotly_fgsea")$customdata
+    # browser()
+    req(new_fgsea_pathway)
+    new_gene_set <- msigdbr_of_interest %>%
+      filter(gs_name == new_fgsea_pathway) %>%
+      pull(ensembl_gene)
+    if (length(new_gene_set) > 0)
+      r_selected_genes_enrichment(new_gene_set)
+  })
+  observe({
+    click_data <- event_data("plotly_click", source = "plotly_topgo")
+    req(click_data)
+    # browser()
+    # For some reason customdata doesn't come through! Have to use x, y coordinates
+    # directly
+    new_topgo_pathway <- isolate({
+      filter(
+        r_topgo_clustered(),
+        term == levels(r_topgo_clustered()$term)[click_data$y]
+      ) %>%
+        chuck("GO.ID", 1)
+    })
+    print(new_topgo_pathway)
+    req(new_topgo_pathway)
+    new_gene_set <- topgo_bp_genes[[new_topgo_pathway]]
+    if (length(new_gene_set) > 0)
+      r_selected_genes_enrichment(new_gene_set)
+  })
   output$plot_out_volcano <- renderPlotly(
     volcano_plots_combined
   )
   output$plot_out_linear <- renderPlotly(
     linear_res_plots_combined_plotly
+  )
+  output$plot_out_fgsea <- renderPlotly(
+    r_fgsea_plot()
+  )
+  output$plot_out_topgo <- renderPlotly(
+    r_topgo_plot()
+  )
+  output$plot_out_gene_set_heatmap <- renderPlotly(
+    r_selected_genes_heatmap()
+  )
+  output$plot_out_gene_set_beeswarm <- renderPlot(
+    r_selected_genes_beeswarm()
   )
   r_selected_gene <- reactiveVal()
   observe({
@@ -370,9 +734,8 @@ server <- function(input, output, session) {
       new_gene <- input$hovered_gene
       # Leave reactive unchanged if current selection is invalid
       if(!is.null(new_gene))
-      r_selected_gene(new_gene)
-    }),
-    input$plot_gene
+        r_selected_gene(new_gene)
+    }), input$plot_gene
   )
   r_brushed_genes <- reactive({
     data <- event_data("plotly_selected", source = "plot_out_volcano")
