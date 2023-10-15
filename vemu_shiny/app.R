@@ -91,7 +91,7 @@ fgsea_gene_stats_w_symbol <- fread(file.path(PATH_PREFIX, "deseq_res_all.csv.gz"
   as_tibble() %>%
   mutate(
     gene_name = if_else(
-      is.na(hgnc_symbol),
+      is.na(hgnc_symbol) | hgnc_symbol == "",
       ensembl_gene_id,
       hgnc_symbol
     )
@@ -130,7 +130,11 @@ vemu_treated_vs_untreated_long <- vemu_treated_vs_untreated %>%
 gene_meta <- vemu_treated_vs_untreated$de_res[[1]] %>%
   distinct(ensembl_gene_id, hgnc_symbol) %>%
   mutate(
-    gene_name = coalesce(hgnc_symbol, ensembl_gene_id)
+    gene_name = if_else(
+      is.na(hgnc_symbol) | hgnc_symbol == "",
+      ensembl_gene_id,
+      hgnc_symbol
+    )
   ) %>%
   select(ensembl_gene_id, gene_name)
 
@@ -598,7 +602,7 @@ server <- function(input, output, session) {
   })
   r_selected_genes_clustered <- reactive({
     req(r_selected_genes_enrichment())
-    print(r_selected_genes_enrichment())
+    # print(r_selected_genes_enrichment())
     # browser()
     fgsea_gene_stats_w_symbol %>%
       filter(
@@ -697,7 +701,7 @@ server <- function(input, output, session) {
       ) %>%
         chuck("GO.ID", 1)
     })
-    print(new_topgo_pathway)
+    # print(new_topgo_pathway)
     req(new_topgo_pathway)
     new_gene_set <- topgo_bp_genes[[new_topgo_pathway]]
     if (length(new_gene_set) > 0)
