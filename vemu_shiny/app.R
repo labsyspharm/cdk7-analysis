@@ -1,15 +1,16 @@
 library(shiny)
 library(plotly)
 library(tidyverse)
-library(here)
 library(qs)
 library(ggbeeswarm)
 library(data.table)
-library(InteractiveComplexHeatmap)
+# For reading gz in data.table
+requireNamespace("R.utils")
+# library(InteractiveComplexHeatmap)
 
 theme_set(theme_minimal())
 
-PATH_PREFIX = "vemu"
+PATH_PREFIX = "vemu_shiny/data"
 
 cluster_mat <- function(mat) {
   d <- dist(mat)
@@ -23,6 +24,17 @@ find_scale_range <- function(x, percentile = 0.05) {
     abs() %>%
     max()
   c(-abs_max, abs_max)
+}
+
+add_gene_name <- function(data, symbol_col) {
+  data %>%
+    mutate(
+      gene_name = if_else(
+        is.na({{symbol_col}}) | {{symbol_col}} == "",
+        ensembl_gene_id,
+        {{symbol_col}}
+      )
+    )
 }
 
 cluster_df <- function(df, x, y, z) {
@@ -89,13 +101,7 @@ top_go_top_res_directional <- topgo_res %>%
 
 fgsea_gene_stats_w_symbol <- fread(file.path(PATH_PREFIX, "deseq_res_all.csv.gz")) %>%
   as_tibble() %>%
-  mutate(
-    gene_name = if_else(
-      is.na(hgnc_symbol) | hgnc_symbol == "",
-      ensembl_gene_id,
-      hgnc_symbol
-    )
-  )
+  add_gene_name(hgnc_symbol)
 
 vemu_treated_vs_untreated <- qread(
   file.path(PATH_PREFIX, "deseq_res_vemu_treated_vs_untreated.qs")
@@ -125,17 +131,12 @@ vemu_treated_vs_untreated_long <- vemu_treated_vs_untreated %>%
       concentration_fbs
     )
   ) %>%
-  unnest(de_res)
+  unnest(de_res) %>%
+  add_gene_name(hgnc_symbol)
 
 gene_meta <- vemu_treated_vs_untreated$de_res[[1]] %>%
   distinct(ensembl_gene_id, hgnc_symbol) %>%
-  mutate(
-    gene_name = if_else(
-      is.na(hgnc_symbol) | hgnc_symbol == "",
-      ensembl_gene_id,
-      hgnc_symbol
-    )
-  ) %>%
+  add_gene_name(hgnc_symbol) %>%
   select(ensembl_gene_id, gene_name)
 
 ensembl_gene_id_2_gene_name <- with(
@@ -175,23 +176,23 @@ vemu_linear_res_long <- vemu_linear_res %>%
   )
 
 normalized_counts <- fread(
-  here("vemu_shiny", "data", "normalized_counts.csv.gz")
+  file.path(PATH_PREFIX, "normalized_counts.csv.gz")
 ) %>%
   as_tibble()
 
 vst_counts <- fread(
-  here("vemu_shiny", "data", "counts_vst.csv.gz")
+  file.path(PATH_PREFIX, "counts_vst.csv.gz")
 ) %>%
   as_tibble()
 
 de_meta_vemu <- fread(
-  here("vemu_shiny", "data", "de_meta_vemu.csv")
+  file.path(PATH_PREFIX, "de_meta_vemu.csv")
 ) %>%
   as_tibble()
 
-filter_by_gene <- function(data, gene_symbol) {
+filter_by_gene <- function(data, gene_symbol, symbol_col = gene_name) {
   filtered <- data %>%
-    filter(hgnc_symbol == gene_symbol)
+    filter({{symbol_col}} == gene_symbol)
   if (nrow(filtered) == 0)
     # Try gene id instead
     filtered <- data %>%
@@ -232,7 +233,7 @@ plot_expression_single_gene_vemu <- function(gene_symbol, counts = c("normalized
     vst = vst_counts,
     normalized = normalized_counts
   )
-  df <- filter_by_gene(counts_table, gene_symbol)
+  df <- filter_by_gene(counts_table, gene_symbol, hgnc_symbol)
   p <- df %>%
     pivot_longer(
       -c(ensembl_gene_id, hgnc_symbol), names_to = "well", values_to = "normalized_count"
