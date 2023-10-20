@@ -78,7 +78,7 @@ topgo_bp_genes <- qread(file.path(PATH_PREFIX, "topgo_bp_genes.qs"))
 top_go_top_res_directional <- topgo_res %>%
   transmute(
     comparison_type, comparison, comparison_unique, direction,
-    term = term_unique, GO.ID,
+    term = term_unique, GO.ID, term_long = Term,
     p = as.numeric(str_replace(fisher, "< ", "")),
     significant = p < 0.05
   ) %>%
@@ -612,7 +612,7 @@ server <- function(input, output, session) {
         fill = signed_p,
         customdata = GO.ID,
         text = paste0(
-          "<b>", term, "<br>", comparison_unique, "</b><br>",
+          "<b>", term_long, " ", GO.ID, "<br>", comparison_unique, "</b><br>",
           "p up ", signif(p_up, 3), " p down ", signif(p_down, 3), "<br>",
           "p signed ", signif(signed_p, 3)
         )
