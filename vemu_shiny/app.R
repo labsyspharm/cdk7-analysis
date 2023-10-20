@@ -103,6 +103,17 @@ fgsea_gene_stats_w_symbol <- fread(file.path(PATH_PREFIX, "deseq_res_all.csv.gz"
   as_tibble() %>%
   add_gene_name(hgnc_symbol)
 
+DEFAULT_CONDITION_ORDER <- c(
+  "A375_vs_mean_0%", "A375_vs_mean_1%", "A375_vs_mean_5%", "A375_vs_mean_10%",
+  "COLO858_vs_mean_0%", "COLO858_vs_mean_1%", "COLO858_vs_mean_5%", "COLO858_vs_mean_10%",
+  "WM989_vs_mean_0%", "WM989_vs_mean_1%", "WM989_vs_mean_5%", "WM989_vs_mean_10%",
+  "concentration_A375", "concentration_WM989",
+  "concentration_fbs_A375", "concentration_fbs_WM989",
+  "concentration_fbs.concentration_A375", "concentration_fbs.concentration_WM989",
+  "apoptosis_events", "cell_area_increase", "cell_elongation",
+  "cell_migration", "cell_proliferation"
+)
+
 vemu_treated_vs_untreated <- qread(
   file.path(PATH_PREFIX, "deseq_res_vemu_treated_vs_untreated.qs")
 ) %>%
@@ -316,8 +327,8 @@ ui <- fluidPage(
       fluidRow(
         flowLayout(
           sliderInput(
-            "n_significant_per_comparison",
-            "N top pathways per comparison",
+            "n_significant_per_condition",
+            "N top pathways per condition",
             min = 1, max = 100, value = 10
           ),
           checkboxInput(
@@ -514,7 +525,7 @@ server <- function(input, output, session) {
       group_by(comparison, comparison_unique) %>%
       filter(padj < 0.05) %>%
       arrange(pval) %>%
-      slice_head(n = input$n_significant_per_comparison) %>%
+      slice_head(n = input$n_significant_per_condition) %>%
       ungroup() %>%
       pull(pathway) %>%
       unique()
@@ -528,7 +539,7 @@ server <- function(input, output, session) {
     else
       mutate(
         res,
-        across(comparison_unique, \(x) factor(x, levels = str_sort(unique(x), numeric = TRUE)))
+        across(comparison_unique, \(x) factor(x, levels = DEFAULT_CONDITION_ORDER))
       )
     res
   })
@@ -571,7 +582,7 @@ server <- function(input, output, session) {
       group_by(comparison, comparison_unique) %>%
       filter(abs(signed_p) > -log10(0.05)) %>%
       arrange(desc(abs(signed_p))) %>%
-      slice_head(n = input$n_significant_per_comparison) %>%
+      slice_head(n = input$n_significant_per_condition) %>%
       ungroup() %>%
       pull(term) %>%
       unique()
@@ -585,7 +596,7 @@ server <- function(input, output, session) {
     else
       mutate(
         res,
-        across(comparison_unique, \(x) factor(x, levels = str_sort(unique(x), numeric = TRUE)))
+        across(comparison_unique, \(x) factor(x, levels = DEFAULT_CONDITION_ORDER))
       )
     res
   })
