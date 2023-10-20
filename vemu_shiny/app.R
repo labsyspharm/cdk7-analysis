@@ -314,10 +314,17 @@ ui <- fluidPage(
     tabPanel(
       "Gene set enrichment",
       fluidRow(
-        sliderInput(
-          "n_significant_per_term",
-          "Number of pathways to show per comparison",
-          min = 1, max = 100, value = 10
+        flowLayout(
+          sliderInput(
+            "n_significant_per_comparison",
+            "N top pathways per comparison",
+            min = 1, max = 100, value = 10
+          ),
+          checkboxInput(
+            "cluster_x",
+            "Cluster x axis",
+            value = FALSE
+          )
         )
       ),
       fluidRow(
@@ -507,16 +514,23 @@ server <- function(input, output, session) {
       group_by(comparison, comparison_unique) %>%
       filter(padj < 0.05) %>%
       arrange(pval) %>%
-      slice_head(n = input$n_significant_per_term) %>%
+      slice_head(n = input$n_significant_per_comparison) %>%
       ungroup() %>%
       pull(pathway) %>%
       unique()
   })
   r_fgsea_clustered <- reactive({
-    fgsea_res %>%
+    res <- fgsea_res %>%
       filter(pathway %in% r_fgsea_top_pathways()) %>%
-      cluster_df(comparison_unique, pathway, NES) %>%
       cluster_df(pathway, comparison_unique, NES)
+    res <- if (input$cluster_x)
+      cluster_df(res, comparison_unique, pathway, NES)
+    else
+      mutate(
+        res,
+        across(comparison_unique, \(x) factor(x, levels = str_sort(unique(x), numeric = TRUE)))
+      )
+    res
   })
   r_fgsea_plot <- reactive({
     p <- ggplot(
@@ -557,16 +571,23 @@ server <- function(input, output, session) {
       group_by(comparison, comparison_unique) %>%
       filter(abs(signed_p) > -log10(0.05)) %>%
       arrange(desc(abs(signed_p))) %>%
-      slice_head(n = input$n_significant_per_term) %>%
+      slice_head(n = input$n_significant_per_comparison) %>%
       ungroup() %>%
       pull(term) %>%
       unique()
   })
   r_topgo_clustered <- reactive({
-    top_go_top_res_directional %>%
+    res <- top_go_top_res_directional %>%
       filter(term %in% r_topgo_top_pathways()) %>%
-      cluster_df(comparison_unique, term, signed_p) %>%
       cluster_df(term, comparison_unique, signed_p)
+    res <- if (input$cluster_x)
+      cluster_df(res, comparison_unique, term, signed_p)
+    else
+      mutate(
+        res,
+        across(comparison_unique, \(x) factor(x, levels = str_sort(unique(x), numeric = TRUE)))
+      )
+    res
   })
   r_topgo_plot <- reactive({
     plot_range <- find_scale_range(r_topgo_clustered()$signed_p, 0.05)
