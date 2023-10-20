@@ -10,7 +10,7 @@ requireNamespace("R.utils")
 
 theme_set(theme_minimal())
 
-PATH_PREFIX = "vemu_shiny/data"
+PATH_PREFIX = "data"
 
 cluster_mat <- function(mat) {
   d <- dist(mat)
@@ -651,12 +651,13 @@ server <- function(input, output, session) {
   })
   r_selected_genes_heatmap <- reactive({
     plot_range <- find_scale_range(r_selected_genes_clustered()$log2FoldChange, 0.05)
-    ggplot(
+    p <- ggplot(
       r_selected_genes_clustered(),
       aes(
         comparison_unique,
         gene_name,
-        fill = log2FoldChange
+        fill = log2FoldChange,
+        customdata = ensembl_gene_id
       )
     ) +
       geom_tile() +
@@ -683,6 +684,8 @@ server <- function(input, output, session) {
       # coord_equal() +
       labs(x = NULL, y = NULL) +
       ggforce::facet_row(~comparison_type, scales = "free_x", space = "free", drop = TRUE)
+    ggplotly(p, source = "plotly_selected_gene_set") %>%
+      event_register("plotly_click")
   })
   library(ggbeeswarm)
   r_selected_genes_beeswarm <- reactive({
@@ -752,6 +755,13 @@ server <- function(input, output, session) {
     r_selected_gene(
       ensembl_gene_id_2_gene_name[
         event_data("plotly_click", source = "plot_out_volcano")$customdata
+      ]
+    )
+  })
+  observe({
+    r_selected_gene(
+      ensembl_gene_id_2_gene_name[
+        event_data("plotly_click", source = "plotly_selected_gene_set")$customdata
       ]
     )
   })
