@@ -25,7 +25,6 @@ syn_analysis <- "syn51221227"
 Reading count and metadata tables generated in `qc.Rmd`.
 
 ```{r}
-
 ensembl_gtf_file <- "Homo_sapiens.GRCh38.109.gtf.gz"
 if (!file.exists(ensembl_gtf_file)) {
   download.file(
@@ -211,8 +210,6 @@ counts_raw <- files_all %>%
 
 ```
 
-
-
 ```{r}
 counts_all <- counts_raw %>%
   select(experiment, plate_id, counts) %>%
@@ -291,6 +288,7 @@ counts_corrected <- counts_mat_corrected %>%
     values_to = "count"
   )
 ```
+
 
 ```{r}
 meta_deseq <- meta_kept %>%
@@ -436,7 +434,7 @@ deseq_input <- meta_kept %>%
         )
     )
   )
-  
+
 library(furrr)
 plan(multicore, workers = 6)
 
@@ -541,6 +539,23 @@ deseq_res_lrt <- deseq_fit_lrt %>%
   ungroup()
 ```
 
+Upload DGE results to Synapse
+
+```{r}
+syn_analysis <- synMkdir("syn52226362", "analysis")
+
+synStoreMany(
+  c(
+    "deseq/cdk7_deseq_res_long.csv",
+    "deseq/cdk7_deseq_res_lrt_long.csv"
+  ),
+  syn_analysis,
+  forceVersion = FALSE
+)
+
+```
+
+
 Checking goodness of fit of the log-linear model using advice
 from https://support.bioconductor.org/p/117448
 
@@ -610,6 +625,12 @@ p <- deseq_res_long %>%
     ) +
     facet_wrap(~cell_line, scale = "free")
 
+ggsave(
+  file.path("plots_cdk7", "ykl_lfc_padj.pdf"),
+  p,
+  width = 10,
+  height = 8
+)
 ```
 
 
@@ -769,14 +790,23 @@ by the PCA plots, only use the 2019_08 experiment here. That way
 we also only have 24h time point instead of 24h and 48h.
 
 
-```{r}
+```{r read_gr_metrics}
+gr_raw <- syn("syn52242760") %>%
+  read_csv() %>%
+  mutate(neglog_GR50 = -log10(GR50))
 
 baseline_meta <- meta_kept %>%
   filter(
     agent == "control",
-    experiment == "cdk_467_2019_08"
+    experiment == "cdk_467_2019_08",
+    cell_line %in% gr_raw$cell_line
   )
 
+baseline_cell_overlap <- unique(baseline_meta$cell_line)
+```
+
+
+```{r}
 de_baseline <- DESeqDataSetFromMatrix(
   counts_mat[, baseline_meta$sample_id],
   colData = column_to_rownames(baseline_meta, "sample_id"),
@@ -795,7 +825,7 @@ de_baseline_res <- resultsNames(de_baseline) %>%
     ~{
       n <- length(resultsNames(de_baseline))
       contrast_vec <- rep(
-        -1/(n - 1),
+        -1/n,
         n
       ) %>%
         set_names(resultsNames(de_baseline))
@@ -838,6 +868,7 @@ p <- de_baseline_res %>%
   ) +
   ggrastr::rasterize(geom_point(shape = 16, alpha = 0.3), dev = "ragg", dpi = 200) +
   facet_wrap(~cell_line)
+
 ggsave(
   file.path("plots_cdk7", "baseline_lfc_padj.pdf"),
   p,
@@ -848,7 +879,6 @@ ggsave(
 
 
 ```{r}
-
 de_baseline_n_sig <- de_baseline_res %>%
   group_by(cell_line) %>%
   summarize(
@@ -889,67 +919,64 @@ baseline_lfc_mat <- de_baseline_res %>%
   column_to_rownames("ensembl_gene_id") %>%
   as.matrix()
 
-gr_raw <- syn("syn52242760") %>%
-  read_csv() %>%
-  mutate(neglog_GR50 = -log10(GR50))
 
-setdiff(gr_raw$cell_line, colnames(baseline_lfc_mat))
-setdiff(colnames(baseline_lfc_mat), gr_raw$cell_line)
-cell_line_overlap <- intersect(colnames(baseline_lfc_mat), gr_raw$cell_line)
+gr_raw %>%
+  filter(cell_line %in% baseline_meta$cell_line) %>%
+  View()
 
 gr_mats <- gr_raw %>%
   select(cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
   column_to_rownames("cell_line") %>%
   as.matrix() %>%
   t() %>% {
-    .[, cell_line_overlap]
+    .[, baseline_meta$cell_line]
   }
 
 baseline_lfc_mat_overlap <- baseline_lfc_mat[
-  de_baseline_selected_genes, cell_line_overlap
+  de_baseline_selected_genes, baseline_meta$cell_line
 ]
 
-baseline_lfc_cor <- psych::corr.test(
-  t(baseline_lfc_mat_overlap),
-  t(gr_mats),
-  adjust = "fdr",
-  ci = FALSE
+compute_correlation <- function(gr_mat, lfc_mat) {
+  raw_cor <- psych::corr.test(
+    t(lfc_mat),
+    t(gr_mat),
+    adjust = "fdr",
+    ci = FALSE
+  )
+  cor_df <- raw_cor[c("r", "p", "p.adj")] %>%
+    imap(
+      ~as_tibble(.x, rownames = "ensembl_gene_id") %>%
+        pivot_longer(
+          cols = -ensembl_gene_id,
+          names_to = "gr_metric",
+          values_to = .y
+        )
+    ) %>%
+    purrr::reduce(
+      left_join,
+      by = c("ensembl_gene_id", "gr_metric")
+    ) %>%
+    left_join(
+      ensembl_gtf %>%
+        select(ensembl_gene_id, hgnc_symbol, gene_name),
+      by = "ensembl_gene_id"
+    ) %>%
+    group_by(gr_metric) %>%
+    mutate(
+      p.adj = p.adjust(
+        p, method = "BH"
+      )
+    ) %>%
+    ungroup()
+  cor_df
+}
+
+baseline_lfc_cor_df <- compute_correlation(
+  gr_mats,
+  baseline_lfc_mat_overlap
 )
 
-baseline_lfc_cor_df <- baseline_lfc_cor[c("r", "p", "p.adj")] %>%
-  imap(
-    ~as_tibble(.x, rownames = "ensembl_gene_id") %>%
-      pivot_longer(
-        cols = -ensembl_gene_id,
-        names_to = "gr_metric",
-        values_to = .y
-      )
-  ) %>%
-  purrr::reduce(
-    left_join,
-    by = c("ensembl_gene_id", "gr_metric")
-  ) %>%
-  left_join(
-    ensembl_gtf %>%
-      select(ensembl_gene_id, hgnc_symbol, gene_name),
-    by = "ensembl_gene_id"
-  ) %>%
-  inner_join(
-    de_baseline_res %>%
-      group_by(ensembl_gene_id) %>%
-      summarize(lfc_var = var(log2FoldChange), .groups = "drop"),
-    by = "ensembl_gene_id"
-  ) %>%
-  group_by(gr_metric) %>%
-  mutate(
-    p.adj = p.adjust(
-      p, method = "BH"
-    )
-  ) %>%
-  ungroup()
-
 p <- baseline_lfc_cor_df %>%
-  select(-lfc_var) %>%
   pivot_longer(
     cols = -c(ensembl_gene_id, hgnc_symbol, gene_name, gr_metric),
     names_to = "cor_metric",
@@ -1003,7 +1030,7 @@ p <- baseline_lfc_cor_df %>%
     facet_wrap(~gene_name, scales = "free")
 
 p <- baseline_lfc_cor_df %>%
-  filter(gr_metric %in% c("GR50", "neglog_GR50")) %>%
+  filter(gr_metric %in% c("neglog_GR50", "GRmax")) %>%
   filter(
     ensembl_gene_id %in% {
       group_by(., gr_metric) %>%
@@ -1043,7 +1070,7 @@ p <- baseline_lfc_cor_df %>%
                 x = if (g == "GR50") Inf else -Inf, y = Inf
               )
           ) +
-          facet_wrap(~gene_name, scales = "free") + 
+          facet_wrap(~gene_name, scales = "free") +
           scale_x_continuous(
             trans = switch(
               g,
@@ -1130,32 +1157,10 @@ ykl_gr_mat <- gr_raw %>%
   as.matrix() %>%
   t()
 
-ykl_gr_cor <- psych::corr.test(
-  t(ykl_lfc_mat),
-  t(ykl_gr_mat),
-  adjust = "fdr",
-  ci = FALSE
+ykl_gr_cor_df <- compute_correlation(
+  ykl_gr_mat,
+  ykl_lfc_mat
 )
-
-
-ykl_gr_cor_df <- ykl_gr_cor[c("r", "p", "p.adj")] %>%
-  imap(
-    ~as_tibble(.x, rownames = "ensembl_gene_id") %>%
-      pivot_longer(
-        cols = -ensembl_gene_id,
-        names_to = "gr_metric",
-        values_to = .y
-      )
-  ) %>%
-  purrr::reduce(
-    left_join,
-    by = c("ensembl_gene_id", "gr_metric")
-  ) %>%
-  left_join(
-    ensembl_gtf %>%
-      select(ensembl_gene_id, hgnc_symbol, gene_name),
-    by = "ensembl_gene_id"
-  )
 
 p <- ykl_gr_cor_df %>%
   pivot_longer(
@@ -1187,7 +1192,7 @@ ykl_gr_cor_sig <- ykl_gr_cor_df %>%
         pull(ensembl_gene_id)
     }
   )
-  
+
 
 ykl_gr_cor_sig_lfc <- ykl_gr_cor_sig %>%
   inner_join(
@@ -1229,7 +1234,7 @@ p <- ykl_gr_cor_sig_lfc %>%
                 x = if (g == "GR50") Inf else -Inf, y = Inf
               )
           ) +
-          facet_wrap(~gene_name, scales = "free") + 
+          facet_wrap(~gene_name, scales = "free") +
           scale_x_continuous(
             trans = switch(
               g,
@@ -1255,7 +1260,7 @@ ggsave(
   width = 16,
   height = 8
 )
- 
+
 ```
 
 ```{r}
@@ -1331,7 +1336,7 @@ p <- best_model_coef_lfc %>%
                 x = if (g == "GR50") Inf else -Inf, y = Inf
               )
           ) +
-          facet_wrap(~gene_name, scales = "free") + 
+          facet_wrap(~gene_name, scales = "free") +
           scale_x_continuous(
             trans = switch(
               g,
@@ -1357,6 +1362,69 @@ ggsave(
   width = 8,
   height = 8
 )
- 
 
 ```
+
+
+```{r}
+model_res_table <- list(
+  baseline = baseline_lfc_cor_df %>%
+    select(
+      ensembl_gene_id, hgnc_symbol,
+      gr_metric, r, p, p.adj
+    ),
+  ykl = ykl_gr_cor_df %>%
+    select(
+      ensembl_gene_id, hgnc_symbol,
+      gr_metric, r, p, p.adj
+    ),
+  ykl_elastic_net = best_model_coef %>%
+    transmute(
+      ensembl_gene_id, hgnc_symbol,
+      gr_metric = "neglog_GR50",
+      coef
+    )
+) %>%
+  purrr::reduce2(
+    .y = names(.),
+    .init = tibble(ensembl_gene_id = character(), hgnc_symbol = character(), gr_metric = character()),
+    \(df1, df2, prefix) {
+      full_join(
+        df1,
+        rename_with(df2, ~paste0(prefix, "_", .x), -c(ensembl_gene_id, hgnc_symbol, gr_metric)),
+        by = c("ensembl_gene_id", "hgnc_symbol", "gr_metric")
+      )
+    }
+  ) %>%
+  replace_na(list(ykl_elastic_net_coef = 0)) %>%
+  group_by(gr_metric) %>%
+  mutate(
+    rank_ykl_elastic_net = rank(-abs(ykl_elastic_net_coef)),
+    rank_ykl = rank(ykl_p),
+    rank_baseline = rank(baseline_p),
+    rank_average = (rank_ykl_elastic_net + rank_ykl) / 3
+  ) %>%
+  ungroup() %>%
+  mutate(
+    ensembl_gene_id = factor(
+      ensembl_gene_id,
+      levels = filter(., gr_metric %in% c("neglog_GR50")) %>%
+        group_by(ensembl_gene_id) %>%
+        summarize(
+          rank_average = mean(rank_average),
+          .groups = "drop"
+        ) %>%
+        arrange(rank_average) %>%
+        pull(ensembl_gene_id)
+    )
+  ) %>%
+  arrange(ensembl_gene_id) %>%
+  filter(gr_metric %in% c("neglog_GR50", "GR50"))
+
+xlsx::write.xlsx(
+  model_res_table,
+  file.path("plots_cdk7", "gr_correlation_table.xlsx")
+)
+
+```
+

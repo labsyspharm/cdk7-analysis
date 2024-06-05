@@ -788,7 +788,7 @@ de_results_vemu_treated_vs_untreated <- de_comps_vemu %>%
 
 qsave(
   de_results_vemu_treated_vs_untreated,
-  "deseq/deseq_res_vemu_treated_vs_untreated.qs"
+  "vemu/deseq_res_vemu_treated_vs_untreated.qs"
 )
 
 
@@ -1352,11 +1352,33 @@ qsave(
   "deseq/deseq_res_cell_line_effect_vs_mean.qs"
 )
 # de_vemu_res_cell_line_at_baseline <- qread("deseq/deseq_res_cell_line_effect_vs_mean.qs")
+# Old was using cell_line*concentration_fbs
+# de_vemu_res_cell_line_at_baseline_old <- qread("deseq/deseq_res_cell_line_effect_vs_mean_old.qs")
 
  de_vemu_res_cell_line_at_baseline_long <- de_vemu_res_cell_line_at_baseline %>%
   select(-any_of("de"), -starts_with("n_de"), -contrast) %>%
   unnest(res)
 
+x <- de_vemu_res_cell_line_at_baseline_old %>%
+  select(-c(contrast)) %>%
+  unnest(res) %>%
+  mutate(across(contrast_name, \(x) str_replace(x, "cell_line_", ""))) %>%
+  inner_join(
+    de_vemu_res_cell_line_at_baseline_long,
+    by = join_by(contrast_name, ensembl_gene_id, hgnc_symbol),
+    suffix = c("_old", "_new")
+  )
+
+p <- x %>%
+  ggplot(
+    aes(
+      log2FoldChange_old,
+      log2FoldChange_new
+    )
+  ) +
+    geom_point(shape = 16, alpha = 0.5) +
+    facet_grid(concentration_fbs~contrast_name) +
+    coord_equal()
 ```
 
 Plot cell line effects vs each other
@@ -1953,6 +1975,11 @@ msigdbr_of_interest <- all_msigdbr %>%
     )
   )
 
+fwrite(
+  msigdbr_of_interest,
+  "vemu/msigdbr_of_interest.csv.gz"
+)
+
 msigdbr_of_interest_gs <- msigdbr_of_interest %>%
   group_by(gs_name) %>%
   summarize(
@@ -2003,7 +2030,10 @@ fgsea_gene_stats <- bind_rows(
       padj,
       signed_p = -sign(log2FoldChange) * log10(pvalue)
     )
-)
+) %>%
+  mutate(
+    comparison_unique = if_else(is.na(concentration_fbs), comparison, paste0(comparison, "_", concentration_fbs, "%"))
+  )
 
 library(powerjoin)
 fgsea_gene_stats_w_symbol <- fgsea_gene_stats %>%
@@ -2035,7 +2065,7 @@ synStoreMany(
 ```{r}
 
 fgsea_gene_stats_grouped <- fgsea_gene_stats %>%
-  group_by(comparison_type, comparison) %>%
+  group_by(concentration_fbs, comparison_type, comparison, comparison_unique) %>%
   summarize(
     gene_stats = set_names(
       signed_p, ensembl_gene_id
@@ -2094,9 +2124,9 @@ cluster_df <- function(df, x, y, z) {
 }
 
 fgsea_res_mat <- fgsea_res %>%
-  transmute(comparison, pathway, signed_padj = -sign(NES)*log10(padj)) %>%
+  transmute(comparison_unique, pathway, signed_padj = -sign(NES)*log10(padj)) %>%
   pivot_wider(
-    names_from = comparison,
+    names_from = comparison_unique,
     values_from = signed_padj
   ) %>%
   column_to_rownames("pathway") %>%
@@ -2119,7 +2149,7 @@ fgsea_res_gct <- new(
     as.data.frame(),
   cdesc = fgsea_gene_stats %>%
     distinct(
-      id = comparison,
+      id = comparison_unique,
       comparison_type
     ) %>%
     dplyr::slice(match(colnames(fgsea_res_mat), id)) %>%
@@ -2143,7 +2173,7 @@ topgo_gene_stats <- fgsea_gene_stats %>%
     signed_p = -sign(log2FoldChange) * log10(pvalue),
     across(signed_p, ~replace_na(.x, 0))
   ) %>%
-  group_by(comparison, comparison_type) %>%
+  group_by(concentration_fbs, comparison, comparison_type, comparison_unique) %>%
   summarize(
     gene_stats = set_names(
       signed_p, ensembl_gene_id
@@ -2164,12 +2194,24 @@ topgo_bp_object <- new(
   ID = "ensembl",
   mapping = "org.Hs.eg.db"
 )
+qsave(
+  topgo_bp_object,
+  "vemu/topgo_bp_object.qs"
+)
+
+topgo_bp_genes <- topgo_bp_object@graph@nodes %>%
+  set_names() %>%
+  map(\(x) genesInTerm(topgo_bp_object, x))
+qsave(
+  topgo_bp_genes,
+  "vemu/topgo_bp_genes.qs"
+)
 
 topgo_direction_funs <- tribble(
   ~direction, ~fun,
-  "up", function(x) x > -log10(0.05),
-  "down", function(x) x < log10(0.05),
-  "all", function(x) abs(x) > -log10(0.05)
+  "up", \(x) x > -log10(0.05),
+  "down", \(x) x < log10(0.05),
+  "all", \(x) abs(x) > -log10(0.05)
 )
 
 topgo_res_raw <- topgo_gene_stats %>%
@@ -2208,13 +2250,14 @@ topgo_res <- topgo_res_raw %>%
       list()
   ) %>%
   ungroup() %>%
-  dplyr::select(-res, -fun) %>%
+  dplyr::select(-c(res, fun, gene_stats)) %>%
   unnest(res_table) %>%
   mutate(
     term_unique = paste(
       Term, GO.ID, sep = "_"
     )
   )
+
 qsave(
   topgo_res,
   "vemu/topgo_res.qs"
@@ -2232,7 +2275,7 @@ fgsea_res_top_pathways <- fgsea_res %>%
         pull(gs_name)
     }
   ) %>%
-  group_by(comparison) %>%
+  group_by(comparison, comparison_unique) %>%
   filter(padj < 0.05) %>%
   arrange(pval) %>%
   slice_head(n = 10) %>%
@@ -2242,13 +2285,13 @@ fgsea_res_top_pathways <- fgsea_res %>%
 
 fgsea_res_top_clustered <- fgsea_res %>%
   filter(pathway %in% fgsea_res_top_pathways) %>%
-  cluster_df(comparison, pathway, NES) %>%
-  cluster_df(pathway, comparison, NES)
+  cluster_df(comparison_unique, pathway, NES) %>%
+  cluster_df(pathway, comparison_unique, NES)
 
 p <- fgsea_res_top_clustered %>%
   ggplot(
     aes(
-      comparison,
+      comparison_unique,
       pathway,
       fill = NES
     )
@@ -2278,7 +2321,7 @@ ggsave(
 p <- fgsea_res_top_clustered %>%
   ggplot(
     aes(
-      comparison,
+      comparison_unique,
       pathway,
       fill = NES
     )
@@ -2322,7 +2365,7 @@ fgsea_res_top_only_cell_clustered <- fgsea_res %>%
               pull(gs_name)
           }
         ) %>%
-        group_by(comparison) %>%
+        group_by(comparison_unique) %>%
         filter(padj < 0.05) %>%
         arrange(pval) %>%
         slice_head(n = 10) %>%
@@ -2331,14 +2374,14 @@ fgsea_res_top_only_cell_clustered <- fgsea_res %>%
         unique()
     }
   ) %>%
-  cluster_df(comparison, pathway, NES) %>%
-  cluster_df(pathway, comparison, NES)
+  cluster_df(comparison_unique, pathway, NES) %>%
+  cluster_df(pathway, comparison_unique, NES)
 
 
 p <- fgsea_res_top_only_cell_clustered %>%
   ggplot(
     aes(
-      comparison,
+      comparison_unique,
       pathway,
       fill = NES
     )
@@ -2391,9 +2434,9 @@ Topgo Heatmap
 top_go_top_clustered <- topgo_res %>%
   transmute(
     enrichment_method = "topgo",
-    comparison_type, comparison, direction,
+    comparison_type, comparison, comparison_unique, direction,
     term = term_unique,
-    signed_p = -log10(as.numeric(fisher))
+    signed_p = -log10(as.numeric(str_replace(fisher, "< ", "")))
   ) %>%
   group_by(direction) %>%
   summarize(
@@ -2402,10 +2445,10 @@ top_go_top_clustered <- topgo_res %>%
       term %in% {
         mutate(cur_data(), significant = abs(signed_p) > -log10(0.05)) %>%
           # Remove terms that are significant for >50% of comparisons
-          group_by(term) %>%
-          filter(!((sum(significant) / n()) > 0.5)) %>%
-          ungroup() %>%
-          group_by(comparison) %>%
+          # group_by(term) %>%
+          # filter(!((sum(significant) / n()) > 0.5)) %>%
+          # ungroup() %>%
+          group_by(comparison_unique) %>%
           filter(significant) %>%
           arrange(desc(abs(signed_p))) %>%
           slice_head(n = 10) %>%
@@ -2414,8 +2457,8 @@ top_go_top_clustered <- topgo_res %>%
           unique()
       }
     ) %>%
-    cluster_df(comparison, term, signed_p) %>%
-    cluster_df(term, comparison, signed_p) %>%
+    cluster_df(comparison_unique, term, signed_p) %>%
+    cluster_df(term, comparison_unique, signed_p) %>%
     list()
   )
 
@@ -2425,7 +2468,7 @@ top_go_top_clustered_ps <- top_go_top_clustered %>%
     p = list(ggplot(
       data,
       aes(
-        comparison,
+        comparison_unique,
         term,
         fill = signed_p
       )
@@ -2455,9 +2498,9 @@ top_go_top_clustered_ps <- top_go_top_clustered %>%
 top_go_top_res_directional <- topgo_res %>%
   transmute(
     enrichment_method = "topgo",
-    comparison_type, comparison, direction,
+    comparison_type, comparison, comparison_unique, direction,
     term = term_unique,
-    p = as.numeric(fisher),
+    p = as.numeric(str_replace(fisher, "< ", "")),
     significant = p < 0.05
   ) %>%
   pivot_wider(
@@ -2466,7 +2509,11 @@ top_go_top_res_directional <- topgo_res %>%
   ) %>%
   mutate(
     signed_p = case_when(
-      significant_up & significant_down ~ NA_real_,
+      significant_up & significant_down ~ case_when(
+        p_up < .1 * p_down ~ -log10(p_up),
+        p_down < .1 * p_up ~ log10(p_down),
+        TRUE ~ NA_real_
+      ),
       significant_up ~ -log10(p_up),
       significant_down ~ log10(p_down),
       TRUE ~ .5 * (-log10(p_up) -log10(p_down))
@@ -2478,10 +2525,10 @@ top_go_top_clustered_directional <- top_go_top_res_directional %>%
     term %in% {
       mutate(., significant = abs(signed_p) > -log10(0.05)) %>%
         # Remove terms that are significant for >50% of comparisons
-        group_by(term) %>%
-        filter(!((sum(significant, na.rm = TRUE) / n()) > 0.5)) %>%
-        ungroup() %>%
-        group_by(comparison) %>%
+        # group_by(term) %>%
+        # filter(!((sum(significant, na.rm = TRUE) / n()) > 0.5)) %>%
+        # ungroup() %>%
+        group_by(comparison_unique) %>%
         filter(significant) %>%
         arrange(desc(abs(signed_p))) %>%
         slice_head(n = 10) %>%
@@ -2490,8 +2537,8 @@ top_go_top_clustered_directional <- top_go_top_res_directional %>%
         unique()
       }
     ) %>%
-    cluster_df(comparison, term, signed_p) %>%
-    cluster_df(term, comparison, signed_p)
+    cluster_df(comparison_unique, term, signed_p) %>%
+    cluster_df(term, comparison_unique, signed_p)
 
 library(gt)
 top_go_top_clustered_directional_gt <- top_go_top_clustered_directional %>%
@@ -2537,7 +2584,7 @@ openxlsx::write.xlsx(
 p <- ggplot(
   top_go_top_clustered_directional,
   aes(
-    comparison,
+    comparison_unique,
     term,
     fill = signed_p
   )
@@ -2581,7 +2628,7 @@ top_go_top_clustered_directional_cells_only <- top_go_top_res_directional %>%
         # group_by(term) %>%
         # filter(!((sum(significant, na.rm = TRUE) / n()) > 0.5)) %>%
         # ungroup() %>%
-        group_by(comparison) %>%
+        group_by(comparison_unique) %>%
         filter(significant) %>%
         arrange(desc(abs(signed_p))) %>%
         slice_head(n = 10) %>%
@@ -2590,13 +2637,13 @@ top_go_top_clustered_directional_cells_only <- top_go_top_res_directional %>%
         unique()
       }
     ) %>%
-    cluster_df(comparison, term, signed_p) %>%
-    cluster_df(term, comparison, signed_p)
+    cluster_df(comparison_unique, term, signed_p) %>%
+    cluster_df(term, comparison_unique, signed_p)
 
 p <- ggplot(
   top_go_top_clustered_directional_cells_only,
   aes(
-    comparison,
+    comparison_unique,
     term,
     fill = signed_p
   )
