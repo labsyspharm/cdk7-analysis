@@ -147,7 +147,8 @@ meta_new <- syn("syn51181405") %>%
 
 meta_all <- bind_rows(meta_old, meta_new) %>%
   mutate(
-    sample_id = paste(experiment, plate_id, well, sep = "_")
+    sample_id = paste(experiment, plate_id, well, sep = "_"),
+    batch = paste(experiment, batch_id)
   )
 ```
 
@@ -268,6 +269,28 @@ counts_kept <- counts_all %>%
     by = c("experiment", "plate_id", "well")
   )
 ```
+
+Visualize experimental design
+```{r}
+meta_kept %>%
+  mutate(
+    batch = paste(experiment, batch_id)
+  ) %>%
+  dplyr::count(
+    experiment, batch, cell_line, agent, time, agent_conc
+  ) %>%
+  ggplot(
+    aes(
+      agent,
+      fct_inseq(as.character(agent_conc)),
+      fill = batch
+    )
+  ) +
+  geom_tile() +
+  facet_grid(cell_line ~ time)
+
+```
+
 
 ```{r}
 counts_mat <- counts_kept %>%
@@ -410,6 +433,27 @@ p <- ggplot(
 
 Much improved batch effect
 
+```{r}
+extract_deseq_result <- function(de, contrast, name, res_args = list(), shrink_args = list()) {
+  if (missing(contrast)) {
+    res <- rlang::exec(results, de, name = name, !!!res_args)
+  } else {
+    res <- rlang::exec(results, de, contrast = contrast, !!!res_args)
+  }
+  shrunken <- rlang::exec(lfcShrink, de, res = res, type = "ashr", !!!shrink_args)
+  shrunken %>%
+    as_tibble(rownames = "gene_id") %>%
+    left_join(
+      res %>%
+        as_tibble(rownames = "gene_id") %>%
+        select(gene_id, log2FoldChange, lfcSE),
+      by = "gene_id", suffix = c("", "_MLE")
+    )
+}
+```
+
+No batch correction necessary here. Only 4 conditions where that would even
+be possible. Otherwise each condition is unique to a batch.
 
 ```{r}
 deseq_input <- meta_kept %>%
@@ -421,6 +465,12 @@ deseq_input <- meta_kept %>%
       group_nest(experiment, plate_id, batch_id, cell_line, time, .key = "control"),
     by = c("experiment", "plate_id", "batch_id", "cell_line", "time")
   ) %>%
+  # mutate(
+  #   control = map2(
+  #     control, treated,
+  #     ~filter(.x, batch %in% .y$batch)
+  #   )
+  # ) %>%
   filter(
     map_int(treated, nrow) > 1,
     map_int(control, nrow) > 1
@@ -433,10 +483,8 @@ deseq_input <- meta_kept %>%
           log_agent_conc = log10(agent_conc + 1)
         )
     )
+    # batch_correct = map_lgl(meta_deseq, \(x) n_distinct(x$batch) > 1)
   )
-
-library(furrr)
-plan(multicore, workers = 6)
 
 deseq_fit <- deseq_input %>%
   mutate(
@@ -447,11 +495,8 @@ deseq_fit <- deseq_input %>%
           counts_mat[, m$sample_id],
           colData = column_to_rownames(m, "sample_id"),
           design = ~log_agent_conc
-        ) %>%
-          DESeq(
-            parallel = TRUE,
-            BPPARAM = BiocParallel::MulticoreParam(workers = 4)
-          )
+          # design = if (bc) {~log_agent_conc + batch} else {~log_agent_conc}
+        )
       }
     )
   )
@@ -466,18 +511,12 @@ deseq_res <- deseq_fit %>%
   rowwise() %>%
   mutate(
     res = {
-      r <- results(deseq, name = "log_agent_conc")
-      left_join(
-        as.data.frame(r) %>%
-          as_tibble(rownames = "ensembl_gene_id"),
-        lfcShrink(
-          deseq, coef = "log_agent_conc", res = r, type = "ashr"
-        ) %>%
-          as_tibble(rownames = "ensembl_gene_id") %>%
-          select(ensembl_gene_id, log2FoldChange),
-        by = "ensembl_gene_id",
-        suffix = c("_MLE", "")
+      extract_deseq_result(
+        deseq, name = "log_agent_conc"
       ) %>%
+        dplyr::rename(
+          ensembl_gene_id = gene_id
+        ) %>%
         left_join(
           ensembl_gtf %>%
             select(ensembl_gene_id, hgnc_symbol),
@@ -488,6 +527,12 @@ deseq_res <- deseq_fit %>%
   ) %>%
   ungroup()
 
+qsave(
+  deseq_res %>%
+    select(-deseq),
+  file.path("deseq", "cdk7_deseq_res2.qs")
+)
+# deseq_res <- qread("deseq/cdk7_deseq_res2.qs")
 ```
 
 ```{r}
@@ -506,9 +551,7 @@ deseq_fit_lrt <- deseq_input %>%
     ) %>%
       DESeq(
         test = "LRT",
-        reduced = ~1,
-        parallel = TRUE,
-        BPPARAM = BiocParallel::MulticoreParam(workers = 4)
+        reduced = ~1
       ) %>%
       list()
   ) %>%
@@ -518,8 +561,7 @@ qsave(
   deseq_fit_lrt,
   file.path("deseq", "cdk7_deseq_res_lrt_raw2.qs")
 )
-
-deseq_fit_lrt <- qread("deseq/cdk7_deseq_res_lrt_raw2.qs")
+# deseq_fit_lrt <- qread("deseq/cdk7_deseq_res_lrt_raw2.qs")
 
 deseq_res_lrt <- deseq_fit_lrt %>%
   rowwise() %>%
@@ -539,6 +581,65 @@ deseq_res_lrt <- deseq_fit_lrt %>%
   ungroup()
 ```
 
+```{r}
+deseq_res_lrt_long <- deseq_res_lrt %>%
+  select(experiment, plate_id, batch_id, agent, cell_line, time, res) %>%
+  unnest(res)
+
+deseq_res_long <- deseq_res %>%
+  select(experiment, plate_id, batch_id, agent, cell_line, time, res) %>%
+  unnest(res)
+
+write_csv(
+  deseq_res_long,
+  file.path("deseq", "cdk7_deseq_res_long.csv")
+)
+# deseq_res_long <- read_csv(
+#   file.path("deseq", "cdk7_deseq_res_long.csv")
+# )
+
+write_csv(
+  deseq_res_lrt_long,
+  file.path("deseq", "cdk7_deseq_res_lrt_long.csv")
+)
+# deseq_res_lrt_long <- read_csv(
+#   file.path("deseq", "cdk7_deseq_res_lrt_long.csv")
+# )
+```
+
+
+Combined
+
+```{r}
+deseq_res_combined <- deseq_res_long %>%
+  powerjoin::power_inner_join(
+    deseq_res_lrt_long %>%
+    select(
+      experiment, plate_id, batch_id,
+      agent, cell_line, time,
+      ensembl_gene_id,
+      pvalue_lrt = pvalue,
+      padj_lrt = padj
+    ),
+    by = c(
+      "experiment", "plate_id", "batch_id",
+      "agent", "cell_line", "time",
+      "ensembl_gene_id"
+    ),
+    check = powerjoin::check_specs(
+      duplicate_keys_left = "warn",
+      duplicate_keys_right = "warn",
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn"
+    )
+  )
+
+write_csv(
+  deseq_res_combined,
+  file.path("deseq", "cdk7_deseq_res_combined_long.csv")
+)
+```
+
 Upload DGE results to Synapse
 
 ```{r}
@@ -547,7 +648,8 @@ syn_analysis <- synMkdir("syn52226362", "analysis")
 synStoreMany(
   c(
     "deseq/cdk7_deseq_res_long.csv",
-    "deseq/cdk7_deseq_res_lrt_long.csv"
+    "deseq/cdk7_deseq_res_lrt_long.csv",
+    file.path("deseq", "cdk7_deseq_res_combined_long.csv")
   ),
   syn_analysis,
   forceVersion = FALSE
@@ -578,33 +680,6 @@ counts_corrected %>%
   ) +
     geom_point() +
     facet_wrap(~ensembl_gene_id, scales = "free_y")
-```
-
-```{r}
-deseq_res_lrt_long <- deseq_res_lrt %>%
-  select(experiment, plate_id, batch_id, agent, cell_line, time, res) %>%
-  unnest(res)
-
-
-deseq_res_long <- deseq_res %>%
-  select(experiment, plate_id, batch_id, agent, cell_line, time, res) %>%
-  unnest(res)
-
-write_csv(
-  deseq_res_long,
-  file.path("deseq", "cdk7_deseq_res_long.csv")
-)
-# deseq_res_long <- read_csv(
-#   file.path("deseq", "cdk7_deseq_res_long.csv")
-# )
-
-write_csv(
-  deseq_res_lrt_long,
-  file.path("deseq", "cdk7_deseq_res_lrt_long.csv")
-)
-# deseq_res_lrt_long <- read_csv(
-#   file.path("deseq", "cdk7_deseq_res_lrt_long.csv")
-# )
 ```
 
 Apeglm leads to some weird artifacts where the log2FoldChange is not shrunk but
@@ -670,7 +745,7 @@ deseq_n_res_lin_vs_lrt <- deseq_res_long %>%
       )
   )
 
-deseq_n_res_lin_vs_lrt %>%
+p <- deseq_n_res_lin_vs_lrt %>%
   ggplot(
     aes(n_sig_lin, n_sig_lrt, color = cell_line)
   ) +
@@ -696,6 +771,12 @@ deseq_n_res_lin_vs_lrt %>%
         c(0, x)
       }
     )
+ggsave(
+  file.path("plots_cdk7", "n_sig_lin_vs_lrt.pdf"),
+  p,
+  width = 10,
+  height = 8
+)
 
 deseq_n_res_lin_vs_lrt %>% filter(n_sig_lrt > 10*n_sig_lin)
 
@@ -782,13 +863,7 @@ p <- ggplot(
   geom_point()
 ```
 
-Comparing gene expression of each cell line compared to the grand
-mean of all cell lines at baseline (DMSO)
-
-Because there are big batch effects between cell lines (evidenced)
-by the PCA plots, only use the 2019_08 experiment here. That way
-we also only have 24h time point instead of 24h and 48h.
-
+## Baseline
 
 ```{r read_gr_metrics}
 gr_raw <- syn("syn52242760") %>%
@@ -862,568 +937,259 @@ write_csv(
 ```
 
 ```{r}
-p <- de_baseline_res %>%
-  ggplot(
-    aes(log2FoldChange, -log10(padj))
-  ) +
-  ggrastr::rasterize(geom_point(shape = 16, alpha = 0.3), dev = "ragg", dpi = 200) +
-  facet_wrap(~cell_line)
-
-ggsave(
-  file.path("plots_cdk7", "baseline_lfc_padj.pdf"),
-  p,
-  width = 10,
-  height = 8
-)
-```
-
-
-```{r}
-de_baseline_n_sig <- de_baseline_res %>%
-  group_by(cell_line) %>%
-  summarize(
-    n_sig = sum(padj < 0.05, na.rm = TRUE),
-    .groups = "drop"
-  )
-
-p <- de_baseline_n_sig %>%
-  ggplot(
-    aes(cell_line, n_sig)
-  ) +
-    geom_col() +
-    coord_flip() +
-    labs(x = NULL, y = "Number of significant genes")
-
-ggsave(
-  file.path("plots_cdk7", "baseline_n_sig.pdf"),
-  p,
-  width = 6,
-  height = 4
+synStoreMany(
+  c(
+    file.path("deseq", "cdk7_deseq_baseline_res.csv")
+  ),
+  syn_analysis,
+  forceVersion = FALSE
 )
 
-de_baseline_selected_genes <- de_baseline_res %>%
-  group_by(ensembl_gene_id) %>%
-  filter(any(padj < 0.05)) %>%
-  ungroup() %>%
-  pull(ensembl_gene_id) %>%
-  unique()
 ```
 
-Correlate GR50 vs log2FC of each cell line compared to the grand
-mean. Hopefully we're able to identify some genes that are correlated
+## Deep RNA-seq baseline
 
 ```{r}
-baseline_lfc_mat <- de_baseline_res %>%
-  select(cell_line, ensembl_gene_id, log2FoldChange) %>%
-  pivot_wider(names_from = cell_line, values_from = log2FoldChange, values_fill = 0) %>%
-  column_to_rownames("ensembl_gene_id") %>%
-  as.matrix()
+deep_counts <- syn("syn60529544") %>%
+  read_csv()
 
+deep_meta <- syn("syn60529546") %>%
+  readxl::read_excel() %>%
+  mutate(
+    sample_id = paste0("S", Sample)
+  ) %>%
+  dplyr::rename(cell_line = `Cell line`)
 
-gr_raw %>%
-  filter(cell_line %in% baseline_meta$cell_line) %>%
-  View()
-
-gr_mats <- gr_raw %>%
-  select(cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
-  column_to_rownames("cell_line") %>%
-  as.matrix() %>%
-  t() %>% {
-    .[, baseline_meta$cell_line]
-  }
-
-baseline_lfc_mat_overlap <- baseline_lfc_mat[
-  de_baseline_selected_genes, baseline_meta$cell_line
-]
-
-compute_correlation <- function(gr_mat, lfc_mat) {
-  raw_cor <- psych::corr.test(
-    t(lfc_mat),
-    t(gr_mat),
-    adjust = "fdr",
-    ci = FALSE
+# Used Ensembl gene annotation version 92
+ensembl_gtf_file_old <- "Homo_sapiens.GRCh38.92.gtf.gz"
+if (!file.exists(ensembl_gtf_file_old)) {
+  download.file(
+    "ftp://ftp.ensembl.org/pub/release-92/gtf/homo_sapiens/Homo_sapiens.GRCh38.92.gtf.gz",
+    ensembl_gtf_file_old, method = "curl"
   )
-  cor_df <- raw_cor[c("r", "p", "p.adj")] %>%
-    imap(
-      ~as_tibble(.x, rownames = "ensembl_gene_id") %>%
-        pivot_longer(
-          cols = -ensembl_gene_id,
-          names_to = "gr_metric",
-          values_to = .y
-        )
-    ) %>%
-    purrr::reduce(
-      left_join,
-      by = c("ensembl_gene_id", "gr_metric")
-    ) %>%
-    left_join(
-      ensembl_gtf %>%
-        select(ensembl_gene_id, hgnc_symbol, gene_name),
-      by = "ensembl_gene_id"
-    ) %>%
-    group_by(gr_metric) %>%
-    mutate(
-      p.adj = p.adjust(
-        p, method = "BH"
-      )
-    ) %>%
-    ungroup()
-  cor_df
 }
 
-baseline_lfc_cor_df <- compute_correlation(
-  gr_mats,
-  baseline_lfc_mat_overlap
-)
-
-p <- baseline_lfc_cor_df %>%
-  pivot_longer(
-    cols = -c(ensembl_gene_id, hgnc_symbol, gene_name, gr_metric),
-    names_to = "cor_metric",
-    values_to = "value"
+ensembl_gtf_old <- rtracklayer::readGFF(
+  ensembl_gtf_file_old
+) %>%
+  distinct(
+    ensembl_gene_id = gene_id,
+    hgnc_symbol = gene_name,
+    gene_biotype
   ) %>%
-  ggplot(aes(value, color = cor_metric)) +
-    stat_ecdf(geom = "step") +
-    facet_wrap(~gr_metric)
-
-dir.create("plots_cdk7")
-ggsave(
-  file.path("plots_cdk7", "baseline_lfc_cor_ecdf.pdf"),
-  p,
-  width = 10,
-  height = 8
-)
-
-p <- baseline_lfc_cor_df %>%
-  select(-lfc_var) %>%
-  pivot_longer(
-    cols = -c(ensembl_gene_id, hgnc_symbol, gene_name, gr_metric),
-    names_to = "cor_metric",
-    values_to = "value"
-  ) %>%
-  ggplot(aes(value, color = cor_metric)) +
-    geom_freqpoly() +
-    facet_wrap(~gr_metric)
-
-baseline_lfc_cor_sig <- baseline_lfc_cor_df %>%
-  group_by(gr_metric) %>%
-  arrange(p) %>%
-  slice_head(n = 10) %>%
-  ungroup()
-  # filter(p.adj < 0.1) %>%
-  # arrange(p.adj)
-
-p <- baseline_lfc_cor_df %>%
-  inner_join(
-    de_baseline_res
-  ) %>%
-  inner_join(
-    gr_raw %>%
-      select(cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
-      pivot_longer(-cell_line, names_to = "gr_metric", values_to = "gr_value"),
-  ) %>%
-  ggplot(
-    aes(gr_value, log2FoldChange, color = gr_metric)
-  ) +
-    geom_point() +
-    geom_smooth(method = "lm") +
-    facet_wrap(~gene_name, scales = "free")
-
-p <- baseline_lfc_cor_df %>%
-  filter(gr_metric %in% c("neglog_GR50", "GRmax")) %>%
-  filter(
-    ensembl_gene_id %in% {
-      group_by(., gr_metric) %>%
-        arrange(p) %>%
-        slice_head(n = 10) %>%
-        pull(ensembl_gene_id)
-    }
-  ) %>%
-  inner_join(
-    de_baseline_res
-  ) %>%
-  inner_join(
-    gr_raw %>%
-      select(cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
-      pivot_longer(-cell_line, names_to = "gr_metric", values_to = "gr_value"),
-  ) %>%
-  group_nest(gr_metric) %>%
+  drop_na(ensembl_gene_id) %>%
   mutate(
-    p = map2(
-      data, gr_metric,
-      function(df, g) {
-        ggplot(
-          df %>%
-            arrange(p) %>%
-            mutate(across(gene_name, fct_inorder)),
-          aes(gr_value, log2FoldChange)
-        ) +
-          geom_point() +
-          geom_smooth(method = "lm") +
-          geom_text(
-            aes(x = x, y = y, label = p),
-            hjust = 0, vjust = 1,
-            nudge_x = 0.1, nudge_y = -0.1,
-            data = \(df) distinct(df, gene_name, p) %>%
-              mutate(
-                across(p, \(x) signif(x, digits = 2)),
-                x = if (g == "GR50") Inf else -Inf, y = Inf
-              )
-          ) +
-          facet_wrap(~gene_name, scales = "free") +
-          scale_x_continuous(
-            trans = switch(
-              g,
-              neglog_GR50 = "identity",
-              GR50 = c("reverse"),
-              "identity"
-            )
-          ) +
-          labs(
-            x = g,
-            y = "log2FoldChange cell line vs grand mean",
-            title = g
-          )
-      }
-    )
+    gene_name = coalesce(hgnc_symbol, ensembl_gene_id)
   )
 
-ps <- patchwork::wrap_plots(p$p)
-
-ggsave(
-  file.path("plots_cdk7", "baseline_lfc_cor_most_sig.pdf"),
-  ps,
-  width = 16,
-  height = 8
-)
-
-p <- baseline_lfc_cor_df %>%
-  ggplot(
-    aes(cor, color = metric)
-  ) +
-    stat_ecdf(geom = "step")
-
-baseline_lfc_cor_highest <- baseline_lfc_cor_df %>%
-  arrange(cor) %>%
-  group_by(metric) %>%
-  dplyr::slice(
-    1:10, (n() - 9):n()
-  ) %>%
-  ungroup() %>%
-  left_join(
-    ensembl_gtf %>%
-      select(ensembl_gene_id, hgnc_symbol),
-    by = "ensembl_gene_id"
-  )
 ```
 
+Can't do DESeq2 because no replicates. Use edgeR with estimated dispersion of .4
+instead. .4 recommended in manual for human samples.
+
 ```{r}
-ykl_cell_lines_to_keep <- intersect(
-  deseq_res_long %>%
-    filter(agent == "YKL-5-124", experiment == "cdk_467_2019_08") %>%
-    pull(cell_line),
-  gr_raw$cell_line
-)
-
-ykl_genes_to_keep <- deseq_res_long %>%
-  filter(
-    agent == "YKL-5-124",
-    experiment == "cdk_467_2019_08",
-    cell_line %in% ykl_cell_lines_to_keep
+deep_counts_mat <- deep_counts %>%
+  semi_join(
+    ensembl_gtf_old %>%
+      filter(gene_biotype == "protein_coding"),
+    by = c("gene" = "ensembl_gene_id")
   ) %>%
-  group_by(ensembl_gene_id) %>%
-  filter(any(padj < 0.05)) %>%
-  ungroup() %>%
-  pull(ensembl_gene_id) %>%
-  unique()
-
-ykl_lfc_mat <- deseq_res_long %>%
-  filter(
-    agent == "YKL-5-124",
-    experiment == "cdk_467_2019_08",
-    cell_line %in% ykl_cell_lines_to_keep,
-    ensembl_gene_id %in% ykl_genes_to_keep
+  mutate(
+    across(
+      -gene,
+      as.integer
+    )
   ) %>%
-  select(ensembl_gene_id, cell_line, log2FoldChange) %>%
-  replace_na(list(log2FoldChange = 0)) %>%
-  pivot_wider(names_from = cell_line, values_from = log2FoldChange, values_fill = 0) %>%
-  column_to_rownames("ensembl_gene_id") %>%
+  column_to_rownames("gene") %>%
   as.matrix()
 
-ykl_gr_mat <- gr_raw %>%
-  filter(cell_line %in% ykl_cell_lines_to_keep) %>%
-  select(cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
-  column_to_rownames("cell_line") %>%
-  as.matrix() %>%
-  t()
+deep_size_factors <- estimateSizeFactorsForMatrix(deep_counts_mat)
+deep_counts_mat_corrected <- t(t(deep_counts_mat) / deep_size_factors)
 
-ykl_gr_cor_df <- compute_correlation(
-  ykl_gr_mat,
-  ykl_lfc_mat
-)
 
-p <- ykl_gr_cor_df %>%
+deep_counts_corrected <- deep_counts_mat_corrected %>%
+  as_tibble(rownames = "ensembl_gene_id") %>%
   pivot_longer(
-    cols = c(r, p, p.adj),
-    names_to = "cor_metric",
-    values_to = "value"
-  ) %>%
-  ggplot(aes(value, color = cor_metric)) +
-    stat_ecdf(geom = "step") +
-    facet_wrap(~gr_metric)
-
-ggsave(
-  file.path("plots_cdk7", "ykl_gr_cor_ecdf.pdf"),
-  p,
-  width = 10,
-  height = 8
-)
-
-```
-
-```{r}
-ykl_gr_cor_sig <- ykl_gr_cor_df %>%
-  filter(gr_metric %in% c("GR50", "neglog_GR50")) %>%
-  filter(
-    ensembl_gene_id %in% {
-      group_by(., gr_metric) %>%
-        arrange(p) %>%
-        slice_head(n = 10) %>%
-        pull(ensembl_gene_id)
-    }
+    cols = -ensembl_gene_id,
+    names_to = "sample_id",
+    values_to = "count"
   )
 
-
-ykl_gr_cor_sig_lfc <- ykl_gr_cor_sig %>%
-  inner_join(
-    ykl_lfc_mat %>%
-      as_tibble(rownames = "ensembl_gene_id") %>%
-      pivot_longer(
-        cols = -ensembl_gene_id,
-        names_to = "cell_line",
-        values_to = "log2FoldChange"
-      )
-  ) %>%
-  inner_join(
-    gr_raw %>%
-      select(cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
-      pivot_longer(-cell_line, names_to = "gr_metric", values_to = "gr_value"),
+deep_counts_varstab <- varianceStabilizingTransformation(deep_counts_mat) %>%
+  as_tibble(rownames = "ensembl_gene_id") %>%
+  pivot_longer(
+    cols = -ensembl_gene_id,
+    names_to = "sample_id",
+    values_to = "count"
   )
 
-p <- ykl_gr_cor_sig_lfc %>%
-  group_nest(gr_metric) %>%
-  mutate(
-    p = map2(
-      data, gr_metric,
-      function(df, g) {
-        ggplot(
-          df %>%
-            arrange(p) %>%
-            mutate(across(gene_name, fct_inorder)),
-          aes(gr_value, log2FoldChange)
-        ) +
-          geom_point() +
-          geom_smooth(method = "lm") +
-          geom_text(
-            aes(x = x, y = y, label = p),
-            hjust = 0, vjust = 1,
-            nudge_x = 0.1, nudge_y = -0.1,
-            data = \(df) distinct(df, gene_name, p) %>%
-              mutate(
-                across(p, \(x) signif(x, digits = 2)),
-                x = if (g == "GR50") Inf else -Inf, y = Inf
-              )
-          ) +
-          facet_wrap(~gene_name, scales = "free") +
-          scale_x_continuous(
-            trans = switch(
-              g,
-              neglog_GR50 = "identity",
-              GR50 = c("reverse"),
-              "identity"
-            )
-          ) +
-          labs(
-            x = g,
-            y = "log2FoldChange YKL-5-124 vs DMSO",
-            title = g
-          )
-      }
-    )
-  )
-
-ps <- patchwork::wrap_plots(p$p)
-
-ggsave(
-  file.path("plots_cdk7", "ykl_gr_cor_most_sig.pdf"),
-  ps,
-  width = 16,
-  height = 8
-)
-
-```
-
-```{r}
-cv_model <- glmnet::cv.glmnet(
-  t(ykl_lfc_mat), ykl_gr_mat["neglog_GR50",],
-  alpha = 0.5,
-  # nfolds = ncol(ykl_lfc_mat),
-  foldid = 1:ncol(ykl_lfc_mat)
-)
-
-best_model <- glmnet::glmnet(
-  t(ykl_lfc_mat), ykl_gr_mat["neglog_GR50",],
-  alpha = 0.5, lambda = cv_model$lambda.min
-)
-
-sparse_mat_to_df <- function(x) {
-  y <- summary(as(x, "dgTMatrix"))
-  y$row = rownames(x)[y$i]
-  y$col = colnames(x)[y$j]
-  y
-}
-
-best_model_coef <- sparse_mat_to_df(coef(best_model)) %>%
-  dplyr::rename(
-    ensembl_gene_id = row,
-    coef = x
-  ) %>%
+deep_all_counts_long <- bind_rows(
+  raw = deep_counts %>%
+    dplyr::rename(ensembl_gene_id = gene) %>%
+    semi_join(
+      ensembl_gtf_old %>%
+        filter(gene_biotype == "protein_coding"),
+      by = c("ensembl_gene_id")
+    ) %>%
+    pivot_longer(
+      cols = -ensembl_gene_id,
+      names_to = "sample_id",
+      values_to = "count"
+    ),
+  normalized = deep_counts_corrected,
+  varstab = deep_counts_varstab,
+  .id = "type"
+) %>%
   left_join(
-    ensembl_gtf %>%
+    ensembl_gtf_old %>%
       select(ensembl_gene_id, hgnc_symbol, gene_name),
     by = "ensembl_gene_id"
   ) %>%
-  as_tibble()
-
-best_model_coef_lfc <- best_model_coef %>%
-  mutate(gr_metric = "neglog_GR50") %>%
-  inner_join(
-    ykl_lfc_mat %>%
-      as_tibble(rownames = "ensembl_gene_id") %>%
-      pivot_longer(
-        cols = -ensembl_gene_id,
-        names_to = "cell_line",
-        values_to = "log2FoldChange"
-      )
-  ) %>%
-  inner_join(
-    gr_raw %>%
-      select(cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
-      pivot_longer(-cell_line, names_to = "gr_metric", values_to = "gr_value"),
+  left_join(
+    deep_meta %>%
+      select(sample_id, cell_line),
+    by = "sample_id"
   )
 
-p <- best_model_coef_lfc %>%
-  group_nest(gr_metric) %>%
+write_csv(
+  deep_all_counts_long,
+  file.path("deseq", "deep_baseline_counts_long.csv.gz")
+)
+
+# deep_deseq <- DESeqDataSetFromMatrix(
+#   deep_counts_mat[, deep_meta$sample_id],
+#   deep_meta %>%
+#     column_to_rownames("sample_id"),
+#   design = ~0 + cell_line
+# ) %>%
+#   DESeq()
+
+library(edgeR)
+deep_dge_list <- DGEList(
+  counts = deep_counts_mat[, deep_meta$sample_id],
+  # genes = tibble(ensembl_gene_id = rownames(deep_counts_mat)),
+  samples = deep_meta %>%
+    select(cell_line)
+) %>%
+  normLibSizes()
+
+deep_design_sum <- contr.sum(
+  factor(deep_meta$cell_line)
+) %>%
+  magrittr::set_rownames(deep_meta$sample_id)
+
+deep_glm_sum <- glmFit(
+  deep_dge_list, deep_design_sum,
+  dispersion = .4
+)
+
+test_res <- glmLRT(
+  deep_glm_sum,
+  coef = 6,
+) %>%
+  topTags(n = Inf) %>%
+  as.data.frame() %>%
+  as_tibble()
+
+test_res %>%
+  mutate(up_down = if_else(logFC > 0, "up", "down")) %>%
+  filter(FDR < 0.05) %>%
+  dplyr::count(up_down)
+
+
+library(contrast)
+
+contrast(
+
+)
+
+deep_design <- model.matrix(~0 + cell_line, data = deep_meta) %>%
+  magrittr::set_rownames(deep_meta$sample_id)
+
+deep_glm <- glmFit(
+  deep_dge_list, deep_design,
+  dispersion = .4
+)
+
+test_res <- glmLRT(
+  deep_glm,
+  contrast = {
+    n <- ncol(deep_design)
+    print(n)
+    contrast_vec <- rep(
+      1 / (n - 1),
+      n
+    )
+    contrast_vec[2] <- -1
+    # contrast_vec <- rep(0, n)
+    # # contrast_vec[3] <- -1
+    # contrast_vec[c(1, 2)] <- -(1 - 1/n)
+    # contrast_vec[4] <- 1
+    contrast_vec
+  }
+) %>%
+  topTags(n = Inf) %>%
+  as.data.frame() %>%
+  as_tibble()
+
+test_res %>%
+  mutate(up_down = if_else(logFC > 0, "up", "down")) %>%
+  filter(FDR < 0.05) %>%
+  dplyr::count(up_down)
+
+deep_results <- deep_meta %>%
+  distinct(cell_line) %>%
   mutate(
-    p = map2(
-      data, gr_metric,
-      function(df, g) {
-        ggplot(
-          df %>%
-            arrange(coef) %>%
-            mutate(across(gene_name, fct_inorder)),
-          aes(gr_value, log2FoldChange)
-        ) +
-          geom_point() +
-          geom_smooth(method = "lm") +
-          geom_text(
-            aes(x = x, y = y, label = coef),
-            hjust = 0, vjust = 1,
-            nudge_x = 0.1, nudge_y = -0.1,
-            data = \(df) distinct(df, gene_name, coef) %>%
-              mutate(
-                across(coef, \(x) signif(x, digits = 2)),
-                x = if (g == "GR50") Inf else -Inf, y = Inf
-              )
-          ) +
-          facet_wrap(~gene_name, scales = "free") +
-          scale_x_continuous(
-            trans = switch(
-              g,
-              neglog_GR50 = "identity",
-              GR50 = c("reverse"),
-              "identity"
-            )
-          ) +
-          labs(
-            x = g,
-            y = "log2FoldChange YKL-5-124 vs DMSO",
-            title = g
-          )
+    res = map(
+      cell_line,
+      \(x) {
+        n <- ncol(deep_design)
+        contrast_vec <- rep(
+          -1 / n,
+          n
+        )
+        contrast_vec[match(paste0("cell_line", x), colnames(deep_design))] <- 1
+        glmLRT(
+          deep_glm,
+          contrast = contrast_vec
+        ) %>%
+          topTags(n = Inf) %>%
+          as.data.frame() %>%
+          as_tibble()
       }
     )
   )
 
-ps <- patchwork::wrap_plots(p$p)
+deep_results_long <- deep_results %>%
+  select(cell_line, res) %>%
+  unnest(res)
 
-ggsave(
-  file.path("plots_cdk7", "ykl_gr_lasso_most_sig.pdf"),
-  ps,
-  width = 8,
-  height = 8
+write_csv(
+  deep_results_long,
+  file.path("deseq", "deep_baseline_edger_res.csv.gz")
 )
+```
+
+
+
+```{r}
+p <- deep_results_long %>%
+  ggplot(
+    aes(logFC, -log10(FDR))
+  ) +
+    ggrastr::rasterize(geom_point(), dev = "ragg", dpi = 200) +
+    facet_wrap(~cell_line)
 
 ```
 
 
 ```{r}
-model_res_table <- list(
-  baseline = baseline_lfc_cor_df %>%
-    select(
-      ensembl_gene_id, hgnc_symbol,
-      gr_metric, r, p, p.adj
-    ),
-  ykl = ykl_gr_cor_df %>%
-    select(
-      ensembl_gene_id, hgnc_symbol,
-      gr_metric, r, p, p.adj
-    ),
-  ykl_elastic_net = best_model_coef %>%
-    transmute(
-      ensembl_gene_id, hgnc_symbol,
-      gr_metric = "neglog_GR50",
-      coef
-    )
-) %>%
-  purrr::reduce2(
-    .y = names(.),
-    .init = tibble(ensembl_gene_id = character(), hgnc_symbol = character(), gr_metric = character()),
-    \(df1, df2, prefix) {
-      full_join(
-        df1,
-        rename_with(df2, ~paste0(prefix, "_", .x), -c(ensembl_gene_id, hgnc_symbol, gr_metric)),
-        by = c("ensembl_gene_id", "hgnc_symbol", "gr_metric")
-      )
-    }
-  ) %>%
-  replace_na(list(ykl_elastic_net_coef = 0)) %>%
-  group_by(gr_metric) %>%
-  mutate(
-    rank_ykl_elastic_net = rank(-abs(ykl_elastic_net_coef)),
-    rank_ykl = rank(ykl_p),
-    rank_baseline = rank(baseline_p),
-    rank_average = (rank_ykl_elastic_net + rank_ykl) / 3
-  ) %>%
-  ungroup() %>%
-  mutate(
-    ensembl_gene_id = factor(
-      ensembl_gene_id,
-      levels = filter(., gr_metric %in% c("neglog_GR50")) %>%
-        group_by(ensembl_gene_id) %>%
-        summarize(
-          rank_average = mean(rank_average),
-          .groups = "drop"
-        ) %>%
-        arrange(rank_average) %>%
-        pull(ensembl_gene_id)
-    )
-  ) %>%
-  arrange(ensembl_gene_id) %>%
-  filter(gr_metric %in% c("neglog_GR50", "GR50"))
-
-xlsx::write.xlsx(
-  model_res_table,
-  file.path("plots_cdk7", "gr_correlation_table.xlsx")
+synStoreMany(
+  c(
+    file.path("deseq", "deep_baseline_counts_long.csv.gz")
+  ),
+  parentId = "syn59470136",
+  forceVersion = FALSE
 )
 
 ```
