@@ -392,6 +392,7 @@ gr_mats_ordered <- gr_mats[, deep_baseline_cell_line_overlap]
 baseline_deep_varstab_cor_df <- compute_correlation(
   gr_mats_ordered,
   baseline_deep_varstab_mat,
+  # log10(baseline_deep_varstab_mat + .5 * min(baseline_deep_varstab_mat[baseline_deep_varstab_mat > 0])),
   method = "pearson"
 ) %>%
   left_join(
@@ -439,7 +440,7 @@ baseline_deep_varstab_cor_df_top_10_data <- baseline_deep_varstab_cor_df %>%
   ungroup() %>%
   left_join(
     counts_baseline %>%
-      filter(type == "varstab", cell_line %in% deep_baseline_cell_line_overlap),
+      filter(type == "normalized", cell_line %in% deep_baseline_cell_line_overlap),
     by = c("ensembl_gene_id", "hgnc_symbol", "gene_name")
   ) %>%
   powerjoin::power_left_join(
@@ -457,7 +458,8 @@ ps <- baseline_deep_varstab_cor_df_top_10_data %>%
   mutate(
     p = list(
       ggplot(
-        data,
+        data %>%
+          mutate(count = count + .5 * min(count[count > 0])),
         aes(count, gr_value, color = cell_line)
       ) +
         geom_point() +
@@ -468,6 +470,7 @@ ps <- baseline_deep_varstab_cor_df_top_10_data %>%
           x = "Variance stabilized count",
           title = gr_metric
         ) +
+        scale_x_log10() +
         theme_linedraw()
     )
   )
@@ -554,10 +557,140 @@ fgsea_res_p_long <- fgsea_res_raw %>%
     }
   )
 
+ps <- fgsea_res_p_long %>%
+  filter(padj < .1) %>%
+  group_nest(
+    gr_metric
+  ) %>%
+  rowwise() %>%
+  mutate(
+    p = list(
+      ggplot(
+        data %>%
+          arrange(NES) %>%
+          mutate(
+            pathway = fct_inorder(pathway)
+          ),
+        aes(NES, pathway, fill = p_cut)
+      ) +
+        geom_col() +
+        geom_text(
+          aes(
+            x = x_pos,
+            y = pathway,
+            label = pathway,
+            hjust = hjust
+          ),
+          data = \(x) mutate(
+            x,
+            x_pos = if_else(NES > 0, -.1, .1),
+            hjust = if_else(NES > 0, 1, 0)
+          ),
+          inherit.aes = FALSE
+        ) +
+        scale_fill_viridis_d(direction = -1) +
+        labs(
+          x = "Normalized Enrichment Score",
+          y = NULL,
+          title = gr_metric
+        ) +
+        theme(
+          axis.text.y = element_blank()
+        )
+    )
+  )
 
+pwalk(
+  ps,
+  \(gr_metric, p, ...) {
+    ggsave(
+      file.path("plots_cdk7", paste0("fgsea_bars_", gr_metric, ".pdf")),
+      p, width = 8, height = 12
+    )
+  }
+)
 ```
 
+```{r}
 
+library(seriation)
+cluster_df <- function(df, row_var, col_var, value_var, values_fill = 0) {
+  # browser()
+  mat <- df %>%
+    select({{row_var}}, {{col_var}}, {{value_var}}) %>%
+    pivot_wider(names_from = {{col_var}}, values_from = {{value_var}}, values_fill = values_fill) %>%
+    column_to_rownames(rlang::as_name(rlang::enquo(row_var)))
+  # browser()
+  if (rlang::is_bare_numeric(pull(df, {{value_var}}))) {
+    dist_rows <- dist(mat, method = "euclidian")
+    dist_cols <- dist(t(mat), method = "euclidian")
+  } else {
+    # browser()
+    dist_rows <- cluster::daisy(mat, metric = "gower")
+    dist_cols <- t(mat) %>%
+      as.data.frame() %>%
+      mutate(across(everything(), \(x) factor(x, levels = levels(pull(df, {{value_var}}))))) %>%
+      cluster::daisy(metric = "gower")
+  }
+  clust_rows <- hclust(dist_rows, method = "average") %>%
+      reorder(dist_rows, method = "olo")
+  clust_cols <- hclust(dist_cols, method = "average") %>%
+      reorder(dist_cols, method = "olo")
+  df %>%
+    mutate(
+      "{{row_var}}" := factor({{row_var}}, levels = clust_rows$labels[clust_rows$order]),
+      "{{col_var}}" := factor({{col_var}}, levels = clust_cols$labels[clust_cols$order])
+    )
+}
+
+better_contrast <- function(
+  colors1, colors2, threshold = 0
+) {
+  # browser()
+  farver::compare_colour(
+    farver::decode_colour(colors1),
+    farver::decode_colour(colors2),
+    from_space = "rgb",
+    method = "cie2000"
+  ) %>% {
+      .[, 1] < (1 + threshold) * .[, 2]
+    } %>%
+    if_else(colors2[2], colors2[1])
+}
+
+p <- fgsea_res_p_long %>%
+  filter(
+    gr_metric != "GR50",
+    str_starts(pathway, "REACTOME")
+  ) %>%
+  filter(
+    pathway %in% {
+      group_by(., pathway) %>%
+        summarize(n_sig = sum(padj < 0.01)) %>%
+        filter(n_sig > 0) %>%
+        pull(pathway)
+    }
+  ) %>%
+  cluster_df(
+    pathway, gr_metric, NES
+  ) %>%
+  ggplot(
+    aes(gr_metric, pathway, fill = NES)
+  ) +
+    geom_raster() +
+    geom_text(
+      aes(
+        label = p_cut,
+        color = after_scale(better_contrast(fill, c("white", "black"), 0))
+      ),
+      hjust = .5, vjust = .5
+    ) +
+    scico::scale_fill_scico(
+      palette = "vik", midpoint = 0
+    ) +
+    theme_minimal()
+
+```
 
 
 ```{r}
