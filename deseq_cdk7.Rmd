@@ -15,6 +15,7 @@ library(qs)
 library(DESeq2)
 library(synExtra)
 library(IHW)
+library(powerjoin)
 
 synapser::synLogin()
 syn <- synDownloader("~/data", .cache = TRUE)
@@ -1193,4 +1194,256 @@ synStoreMany(
 )
 
 ```
+
+
+## Trying to regress out effects of cell growth differences between cell lines
+
+YKL-5-124
+JWZ, JWZ-5-21 # degrader with YKL warhead
+LY3405105
+LDC4297
+CT7001
+SY5609, SY-5609
+
+```{r}
+gr_all <- syn("syn60582220") %>%
+  read_csv() %>%
+  mutate(
+    agent = recode(
+      agent, JWZ = "JWZ-5-21", SY5609 = "SY-5609"
+    ),
+    doubling_per_hour = (log2(cell_count) - log2(cell_count__time0)) / timepoint,
+    mult_per_hour = 2**doubling_per_hour
+  )
+
+gr_controls <- gr_all %>%
+  distinct(cell_line, cell_count__time0, cell_count__ctrl) %>%
+  mutate(
+    doubling_per_hour = (log2(cell_count__ctrl) - log2(cell_count__time0)) / 24,
+    mult_per_hour = 2**doubling_per_hour
+  )
+
+growth_data <- gr_all %>%
+  bind_rows(
+    gr_controls %>%
+      mutate(
+        agent = "control",
+        concentration = 0
+      )
+  ) %>%
+  group_by(
+    cell_line, agent, concentration
+  ) %>%
+  summarize(
+    doubling_per_hour = mean(doubling_per_hour),
+    mult_per_hour = 10**mean(log10(mult_per_hour)),
+    across(starts_with("cell_count"), mean),
+    .groups = "drop"
+  )
+
+meta_deseq_gr <- meta_deseq %>%
+  rownames_to_column("sample_id") %>%
+  power_inner_join(
+    growth_data %>%
+      dplyr::rename(agent_conc_gr = concentration),
+    by = join_by(cell_line, agent),
+    check = check_specs(
+      unmatched_keys_left = "warn"
+      # duplicate_keys_right = "warn"
+    )
+  ) %>%
+  group_by(
+    cell_line, agent, agent_conc
+  ) %>%
+  filter(abs(agent_conc - agent_conc_gr) == min(abs(agent_conc - agent_conc_gr))) %>%
+  ungroup() %>%
+  filter((agent_conc == agent_conc_gr) | (abs(log2(agent_conc) - log2(agent_conc_gr)) < log2(1.3)))
+
+```
+
+```{r}
+deseq_input_gr <- meta_deseq_gr %>%
+  filter(agent != "control") %>%
+  group_nest(experiment, time, .key = "treated") %>%
+  left_join(
+    meta_deseq_gr %>%
+      filter(agent == "control") %>%
+      group_nest(experiment, time, .key = "control"),
+    by = c("experiment", "time")
+  ) %>%
+  # mutate(
+  #   control = map2(
+  #     control, treated,
+  #     ~filter(.x, batch %in% .y$batch)
+  #   )
+  # ) %>%
+  filter(
+    map_int(treated, nrow) > 1,
+    map_int(control, nrow) > 1
+  ) %>%
+  mutate(
+    meta_deseq = map2(
+      treated, control,
+      ~bind_rows(.x, .y) %>%
+        mutate(
+          log_agent_conc = log10(agent_conc + 1)
+        )
+    ),
+    meta_deseq_ready = map(
+      meta_deseq,
+      \(x) mutate(
+          x,
+          agent = if_else(
+            agent == "control",
+            setdiff(agent, "control")[1],
+            agent
+          ) %>%
+            factor()
+        )
+    )
+    # batch_correct = map_lgl(meta_deseq, \(x) n_distinct(x$batch) > 1)
+  )
+
+make_mm <- function(f, data) {
+  mm <- model.matrix(f, data = data)
+  # REmove all zero columns
+  mm[, colSums(mm) > 0]
+}
+
+deseq_fit_gr <- deseq_input_gr %>%
+  mutate(
+    deseq = map(
+      meta_deseq,
+      \(m) {
+        DESeqDataSetFromMatrix(
+          counts_mat[, m$sample_id],
+          colData = column_to_rownames(m, "sample_id"),
+          design = ~1,
+          # design = if (bc) {~log_agent_conc + batch} else {~log_agent_conc}
+        )
+      }
+    ),
+    mm = map2(
+      deseq, meta_deseq_ready,
+      \(d, m) {
+        make_mm(
+          if (n_distinct(m$agent) > 2)
+            ~0 + log_agent_conc:agent:cell_line + cell_line + doubling_per_hour
+          else
+            ~0 + log_agent_conc:cell_line + cell_line + doubling_per_hour,
+          m
+        )
+      }
+    )
+  )
+
+deseq_fit_gr <- deseq_fit_gr %>%
+  dplyr::slice(2) %>%
+  mutate(
+    deseq = map2(
+      deseq, mm,
+      \(d, mm) {
+        d <- DESeq(
+          d,
+          test = "Wald",
+          full = mm
+        )
+      }
+    )
+  )
+
+qsave(
+  deseq_fit_gr,
+  file.path("deseq", "cdk7_deseq_gr_res_raw.qs")
+)
+# deseq_fit_gr <- qread("deseq/cdk7_deseq_gr_res_raw.qs")
+
+deseq_res_gr <- deseq_fit_gr %>%
+  rowwise() %>%
+  mutate(
+    res = {
+      res_names <- resultsNames(deseq)
+      contrast_vec <- rep_len(0, length(res_names))
+      map(
+        set_names(res_names),
+        \(x) {
+          message("Extracting ", x)
+          contrast_vec_ <- contrast_vec
+          contrast_vec_[match(x, res_names)] <- 1
+          # browser()
+          extract_deseq_result(
+            deseq, contrast = contrast_vec_
+          )
+        }
+      ) %>%
+        bind_rows(.id = "covariate") %>%
+        dplyr::rename(
+          ensembl_gene_id = gene_id
+        ) %>%
+        left_join(
+          ensembl_gtf %>%
+            select(ensembl_gene_id, hgnc_symbol),
+          by = "ensembl_gene_id"
+        ) %>%
+        list()
+    }
+  ) %>%
+  ungroup()
+
+qsave(
+  deseq_res_gr %>%
+    select(-deseq),
+  file.path("deseq", "cdk7_deseq_gr_res.qs")
+)
+# deseq_res_gr <- qread("deseq/cdk7_deseq_gr_res.qs")
+```
+
+```{r}
+deseq_res_gr_long <- deseq_res_gr %>%
+  mutate(
+    res = map(
+      res,
+      \(x) filter(
+        x,
+        str_starts(covariate, fixed("log_agent_conc"))
+      ) %>%
+        separate_wider_regex(
+          covariate,
+          patterns = c(
+            "log_agent_conc(?:\\.agent)?", agent = ".*", "\\.cell_line", cell_line = ".+"
+          ),
+          cols_remove = FALSE
+        )
+    )
+  ) %>%
+  select(experiment, time, res) %>%
+  unnest(res) %>%
+  mutate(
+    agent = if_else(agent == "", "JWZ-5-21", agent)
+  )
+
+write_csv(
+  deseq_res_gr_long,
+  file.path("deseq", "cdk7_deseq_gr_res_long.csv.gz")
+)
+```
+
+
+```{r}
+deseq_res_gr_and_normal <- power_inner_join(
+  deseq_res_long,
+  deseq_res_gr_long,
+  by = c(
+    "experiment", "time", "cell_line", "agent", "ensembl_gene_id", "hgnc_symbol"
+  ),
+  suffix = c("_normal", "_gr"),
+  check = check_specs(
+    duplicate_keys_left = "warn",
+    duplicate_keys_right = "warn",
+    unmatched_keys_left = "warn",
+    unmatched_keys_right = "warn"
+  )
+)
+```
+
 
