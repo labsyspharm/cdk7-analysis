@@ -275,7 +275,7 @@ Visualize experimental design
 ```{r}
 meta_kept %>%
   mutate(
-    batch = paste(experiment, batch_id)
+    batch = paste(experiment, batch_id, sep = "_")
   ) %>%
   dplyr::count(
     experiment, batch, cell_line, agent, time, agent_conc
@@ -459,19 +459,19 @@ be possible. Otherwise each condition is unique to a batch.
 ```{r}
 deseq_input <- meta_kept %>%
   filter(agent != "control") %>%
-  group_nest(experiment, plate_id, batch_id, agent, cell_line, time, .key = "treated") %>%
+  group_nest(experiment, agent, cell_line, time, .key = "treated") %>%
   left_join(
     meta_kept %>%
       filter(agent == "control") %>%
-      group_nest(experiment, plate_id, batch_id, cell_line, time, .key = "control"),
-    by = c("experiment", "plate_id", "batch_id", "cell_line", "time")
+      group_nest(experiment, cell_line, time, .key = "control"),
+    by = c("experiment", "cell_line", "time")
   ) %>%
-  # mutate(
-  #   control = map2(
-  #     control, treated,
-  #     ~filter(.x, batch %in% .y$batch)
-  #   )
-  # ) %>%
+  mutate(
+    control = map2(
+      control, treated,
+      \(x, y) filter(x, batch %in% y$batch)
+    )
+  ) %>%
   filter(
     map_int(treated, nrow) > 1,
     map_int(control, nrow) > 1
@@ -483,21 +483,22 @@ deseq_input <- meta_kept %>%
         mutate(
           log_agent_conc = log10(agent_conc + 1)
         )
-    )
-    # batch_correct = map_lgl(meta_deseq, \(x) n_distinct(x$batch) > 1)
+    ),
+    batch_correct = map_lgl(meta_deseq, \(x) n_distinct(x$batch) > 1)
   )
 
 deseq_fit <- deseq_input %>%
   mutate(
-    deseq = map(
-      meta_deseq,
-      \(m) {
+    deseq = map2(
+      meta_deseq, batch_correct,
+      \(m, bc) {
         DESeqDataSetFromMatrix(
           counts_mat[, m$sample_id],
           colData = column_to_rownames(m, "sample_id"),
-          design = ~log_agent_conc
-          # design = if (bc) {~log_agent_conc + batch} else {~log_agent_conc}
-        )
+          # design = ~log_agent_conc
+          design = if (bc) {~log_agent_conc + batch} else {~log_agent_conc}
+        ) %>%
+          DESeq(test = "Wald")
       }
     )
   )
@@ -548,11 +549,11 @@ deseq_fit_lrt <- deseq_input %>%
     deseq = DESeqDataSetFromMatrix(
       counts_mat[, meta_deseq$sample_id],
       colData = column_to_rownames(meta_deseq, "sample_id"),
-      design = ~agent_conc_fct
+      design = if (batch_correct) {~agent_conc_fct + batch} else {~agent_conc_fct}
     ) %>%
       DESeq(
         test = "LRT",
-        reduced = ~1
+        reduced = if (batch_correct) {~batch} else {~1}
       ) %>%
       list()
   ) %>%
@@ -584,11 +585,11 @@ deseq_res_lrt <- deseq_fit_lrt %>%
 
 ```{r}
 deseq_res_lrt_long <- deseq_res_lrt %>%
-  select(experiment, plate_id, batch_id, agent, cell_line, time, res) %>%
+  select(experiment, agent, cell_line, time, res) %>%
   unnest(res)
 
 deseq_res_long <- deseq_res %>%
-  select(experiment, plate_id, batch_id, agent, cell_line, time, res) %>%
+  select(experiment, agent, cell_line, time, res) %>%
   unnest(res)
 
 write_csv(
@@ -616,14 +617,14 @@ deseq_res_combined <- deseq_res_long %>%
   powerjoin::power_inner_join(
     deseq_res_lrt_long %>%
     select(
-      experiment, plate_id, batch_id,
+      experiment,
       agent, cell_line, time,
       ensembl_gene_id,
       pvalue_lrt = pvalue,
       padj_lrt = padj
     ),
     by = c(
-      "experiment", "plate_id", "batch_id",
+      "experiment",
       "agent", "cell_line", "time",
       "ensembl_gene_id"
     ),
@@ -1419,20 +1420,25 @@ deseq_res_gr_long <- deseq_res_gr %>%
   select(experiment, time, res) %>%
   unnest(res) %>%
   mutate(
-    agent = if_else(agent == "", "JWZ-5-21", agent)
+    # empty agent is YKL. Not in the formula because it's the only one
+    agent = if_else(agent == "", "YKL-5-124", agent) %>%
+    # Deseq replaces dashes with dots, reversing
+      str_replace_all(fixed("."), "-")
   )
 
 write_csv(
   deseq_res_gr_long,
   file.path("deseq", "cdk7_deseq_gr_res_long.csv.gz")
 )
+# deseq_res_gr_long <- read_csv(file.path("deseq", "cdk7_deseq_gr_res_long.csv.gz"))
 ```
 
 
 ```{r}
 deseq_res_gr_and_normal <- power_inner_join(
   deseq_res_long,
-  deseq_res_gr_long,
+  deseq_res_gr_long %>%
+    mutate(time = as.double(as.character(time))),
   by = c(
     "experiment", "time", "cell_line", "agent", "ensembl_gene_id", "hgnc_symbol"
   ),
@@ -1440,10 +1446,391 @@ deseq_res_gr_and_normal <- power_inner_join(
   check = check_specs(
     duplicate_keys_left = "warn",
     duplicate_keys_right = "warn",
-    unmatched_keys_left = "warn",
+    # unmatched_keys_left = "warn",
     unmatched_keys_right = "warn"
   )
 )
+
+write_csv(
+  deseq_res_gr_and_normal,
+  file.path("deseq", "cdk7_deseq_gr_and_normal_res_long.csv.gz")
+)
+# deseq_res_gr_and_normal <- read_csv(
+#   file.path("deseq", "cdk7_deseq_gr_and_normal_res_long.csv.gz")
+# )
+```
+
+```{r}
+synStoreMany(
+  c(
+    file.path("deseq", "cdk7_deseq_gr_and_normal_res_long.csv.gz"),
+    file.path("deseq", "cdk7_deseq_gr_res_long.csv.gz")
+  ),
+  parentId = "syn59470136",
+  forceVersion = FALSE
+)
+
+```
+
+
+```{r}
+p <- ggplot(
+  deseq_res_gr_and_normal,
+  aes(
+    log2FoldChange_normal, log2FoldChange_gr,
+    color = agent
+  )
+) +
+  geom_point(alpha = .5) +
+  geom_abline(slope = 1, intercept = 0) +
+  facet_wrap(~experiment + cell_line)
+
+
+
+p <- ggplot(
+  deseq_res_gr_and_normal %>%
+    filter(experiment == "cdk_467_2019_08"),
+  aes(
+    log2FoldChange_normal, log2FoldChange_gr,
+    color = agent
+  )
+) +
+  geom_point(alpha = .5) +
+  geom_abline(slope = 1, intercept = 0) +
+  facet_wrap(~experiment + cell_line)
+
+ggsave(
+  file.path("plots_cdk7", "deseq_log2fc_ykl_gr_corrected_vs_normal.pdf"),
+  p,
+  width = 10,
+  height = 8
+)
+```
+
+### Baseline DGE
+
+```{r}
+baseline_meta_gr <- baseline_meta %>%
+  power_inner_join(
+    growth_data %>%
+      filter(agent == "control") %>%
+      select(-agent),
+    by = c("cell_line"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+de_baseline_dge_gr <- DESeqDataSetFromMatrix(
+  counts_mat[, baseline_meta_gr$sample_id],
+  colData = column_to_rownames(baseline_meta_gr, "sample_id"),
+  design = ~1 + doubling_per_hour
+) %>%
+  DESeq()
+
+de_baseline_dge_gr_res <- de_baseline_dge_gr %>%
+  extract_deseq_result(name = "doubling_per_hour") %>%
+  dplyr::rename(ensembl_gene_id = gene_id) %>%
+  power_left_join(
+    ensembl_gtf %>%
+      select(ensembl_gene_id, hgnc_symbol),
+    by = "ensembl_gene_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+
+write_csv(
+  de_baseline_dge_gr_res,
+  file.path("deseq", "cdk7_dge_deseq_baseline_res_gr.csv")
+)
+```
+
+
+Plot some genes to spot check
+
+```{r}
+dge_gr_res_spot_check <- withr::with_seed(
+  42,
+  de_baseline_dge_gr_res %>%
+    filter(padj < 0.05) %>%
+    slice_sample(n = 20)
+) %>%
+  power_inner_join(
+    power_inner_join(
+      counts_corrected,
+      baseline_meta_gr,
+      by = "sample_id",
+      check = check_specs(
+        duplicate_keys_right = "warn"
+      )
+    ),
+    by = "ensembl_gene_id",
+    check = check_specs(
+      unmatched_keys_left = "warn"
+    )
+  )
+
+p <- dge_gr_res_spot_check %>%
+  ggplot(
+    aes(
+      doubling_per_hour, count,
+      color = cell_line
+    )
+  ) +
+    geom_point() +
+    # geom_text(
+    #   aes(label = reason_included),
+    #   x = -Inf, y = Inf, color = "black",
+    #   hjust = 0, vjust = 1,
+    #   data = \(x) distinct(x, hgnc_symbol, reason_included)
+    # ) +
+    scale_y_continuous(transform = scales::pseudo_log_trans()) +
+    facet_wrap(~hgnc_symbol, scales = "free_y") +
+    theme_linedraw()
+
+ggsave(
+  file.path("plots_cdk7", "dge_gr_res_spot_check.pdf"),
+  p,
+  width = 14,
+  height = 10
+)
+```
+
+
+### Deep RNA-seq
+
+```{r}
+deep_meta_gr <- deep_meta %>%
+  mutate(
+    cell_line = recode(
+      cell_line,
+      `SNU-8` = "SNU8",
+      `OVCA-R4` = "OVCAR4",
+      `JHOM-1` = "JHOM1",
+      `JHOS-2` = "JHOS2",
+      `OAW-28` = "OAW28"
+    )
+  ) %>%
+  power_inner_join(
+    growth_data %>%
+      filter(agent == "control"),
+    by = c("cell_line"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  mutate(
+    doubling_per_hour_scaled = scale(doubling_per_hour)[, 1]
+  )
+
+deep_dge_gr <- DESeqDataSetFromMatrix(
+  deep_counts_mat[, deep_meta_gr$sample_id],
+  colData = column_to_rownames(deep_meta_gr, "sample_id"),
+  design = ~1 + doubling_per_hour
+) %>%
+  DESeq()
+
+deep_dge_gr_res <- deep_dge_gr %>%
+  extract_deseq_result(name = "doubling_per_hour") %>%
+  dplyr::rename(ensembl_gene_id = gene_id) %>%
+  power_left_join(
+    ensembl_gtf_old %>%
+      select(ensembl_gene_id, hgnc_symbol),
+    by = "ensembl_gene_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+
+deep_dge_gr2 <- DESeqDataSetFromMatrix(
+  deep_counts_mat[, deep_meta_gr$sample_id],
+  colData = column_to_rownames(deep_meta_gr, "sample_id"),
+  design = ~1 + doubling_per_hour_scaled
+) %>%
+  DESeq()
+
+deep_dge_gr_res2 <- deep_dge_gr2 %>%
+  extract_deseq_result(name = "doubling_per_hour_scaled") %>%
+  dplyr::rename(ensembl_gene_id = gene_id) %>%
+  power_left_join(
+    ensembl_gtf_old %>%
+      select(ensembl_gene_id, hgnc_symbol),
+    by = "ensembl_gene_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+deep_dge_gr_res_both <- deep_dge_gr_res2 %>%
+  inner_join(
+    deep_dge_gr_res,
+    by = c("ensembl_gene_id", "hgnc_symbol"),
+    suffix = c("_scaled", "_normal"),
+  )
+
+p <- deep_dge_gr_res_both %>%
+  ggplot(
+    aes(log2FoldChange_normal, log2FoldChange_scaled)
+  ) +
+    geom_point() +
+    geom_abline(slope = 1, intercept = 0)
+
+p <- deep_dge_gr_res_both %>%
+  ggplot(
+    aes(-sign(log2FoldChange_normal) * log10(padj_normal), -sign(log2FoldChange_scaled) * log10(padj_scaled))
+  ) +
+    geom_point() +
+    geom_abline(slope = 1, intercept = 0)
+    # coord_equal()
+
+ggsave(
+  file.path("plots_cdk7", "deep_de_genes_scaled_vs_normal.pdf"),
+  p,
+  width = 10,
+  height = 8
+)
+
+write_csv(
+  deep_dge_gr_res_both,
+  file.path("deseq", "cdk7_deep_baseline_res_gr.csv")
+)
+# deep_dge_gr_res_both <- read_csv(file.path("deseq", "cdk7_deep_baseline_res_gr.csv"))
+```
+
+
+```{r}
+synStoreMany(
+  c(
+    file.path("deseq", "cdk7_deseq_baseline_res.csv"),
+    file.path("deseq", "cdk7_deep_baseline_res_gr.csv")
+  ),
+  syn_analysis,
+  forceVersion = FALSE
+)
+
+```
+
+
+Plot some genes to spot check
+
+```{r}
+deep_gr_res_spot_check <- withr::with_seed(
+  42,
+  deep_dge_gr_res_both %>%
+    mutate(
+      reason_included = imap(
+        list(
+          top_padj_scaled = order(padj_scaled)[1:10],
+          top_padj_normal = order(padj_normal)[1:10],
+          random_padj_scaled = which(padj_scaled < 0.05) %>%
+            sample(10),
+          random_padj_normal = which(padj_normal < 0.05) %>%
+            sample(10)
+        ),
+        \(x, y) {
+          z <- rep_len("", nrow(deep_dge_gr_res_both))
+          z[x] <- y
+          z
+        }
+      ) %>%
+        {
+          lift_dl(paste, sep = "")(.)
+        }
+    )
+) %>%
+  filter(reason_included != "") %>%
+  power_inner_join(
+    power_inner_join(
+      deep_counts_corrected,
+      deep_meta_gr,
+      by = "sample_id",
+      check = check_specs(
+        duplicate_keys_right = "warn"
+      )
+    ),
+    by = "ensembl_gene_id",
+    check = check_specs(
+      unmatched_keys_left = "warn"
+    )
+  )
+
+p <- deep_gr_res_spot_check %>%
+  ggplot(
+    aes(
+      doubling_per_hour, count,
+      color = cell_line
+    )
+  ) +
+    geom_point() +
+    # geom_text(
+    #   aes(label = reason_included),
+    #   x = -Inf, y = Inf, color = "black",
+    #   hjust = 0, vjust = 1,
+    #   data = \(x) distinct(x, hgnc_symbol, reason_included)
+    # ) +
+    scale_y_log10() +
+    facet_wrap(~reason_included + hgnc_symbol, scales = "free_y")
+
+ggsave(
+  file.path("plots_cdk7", "deep_gr_res_spot_check.pdf"),
+  p,
+  width = 14,
+  height = 10
+)
+```
+
+unscaled version much much better than scaled. Weird artifacts in the scaled version.
+
+Comparing DGE vs deep
+
+```{r}
+de_baseline_dge_vs_deep <- deep_dge_gr_res_both %>%
+  inner_join(
+    de_baseline_dge_gr_res,
+    by = c("ensembl_gene_id", "hgnc_symbol"),
+    suffix = c("_deep", "_baseline")
+  )
+
+p <- de_baseline_dge_vs_deep %>%
+  ggplot(
+    aes(log2FoldChange_normal, log2FoldChange)
+  ) +
+    geom_point(alpha = 0.5) +
+    geom_abline(slope = 1, intercept = 0) +
+    coord_equal() +
+    labs(
+      x = "Deep",
+      y = "DGE"
+    )
+
+ggsave(
+  file.path("plots_cdk7", "doubling_time_deep_vs_baseline_unscaled.pdf"),
+  p,
+  width = 5,
+  height = 5
+)
+
+cor.test(
+  de_baseline_dge_vs_deep$log2FoldChange_normal,
+  de_baseline_dge_vs_deep$log2FoldChange
+)
+```
+
+Poor correlation
+
+### Correcting counts
+
+```{r}
+
+
 ```
 
 

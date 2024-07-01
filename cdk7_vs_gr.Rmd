@@ -12,6 +12,7 @@ knitr::opts_chunk$set(echo = TRUE)
 library(tidyverse)
 library(data.table)
 library(qs)
+library(powerjoin)
 library(synExtra)
 
 synapser::synLogin()
@@ -24,6 +25,12 @@ syn_analysis <- synMkdir("syn52226362", "analysis")
 ```{r}
 deseq_res_combined <- synPluck(
   syn_analysis, "cdk7_deseq_res_combined_long.csv"
+) %>%
+  syn() %>%
+  read_csv()
+
+deseq_res_gr <- synPluck(
+  syn_analysis, "cdk7_deseq_gr_and_normal_res_long.csv.gz"
 ) %>%
   syn() %>%
   read_csv()
@@ -64,7 +71,7 @@ gr_raw <- syn("syn52242760") %>%
 
 
 ```{r}
-p <- de_baseline_res %>%
+p <- deseq_res_baseline %>%
   ggplot(
     aes(log2FoldChange, -log10(padj))
   ) +
@@ -81,7 +88,7 @@ ggsave(
 
 
 ```{r}
-de_baseline_n_sig <- de_baseline_res %>%
+de_baseline_n_sig <- deseq_res_baseline %>%
   group_by(cell_line) %>%
   summarize(
     n_sig = sum(padj < 0.05, na.rm = TRUE),
@@ -103,12 +110,29 @@ ggsave(
   height = 4
 )
 
-de_baseline_selected_genes <- de_baseline_res %>%
+de_baseline_selected_genes <- deseq_res_baseline %>%
   group_by(ensembl_gene_id) %>%
   filter(any(padj < 0.05)) %>%
   ungroup() %>%
   pull(ensembl_gene_id) %>%
   unique()
+```
+
+```{r}
+better_contrast <- function(
+  colors1, colors2, threshold = 0
+) {
+  # browser()
+  farver::compare_colour(
+    farver::decode_colour(colors1),
+    farver::decode_colour(colors2),
+    from_space = "rgb",
+    method = "cie2000"
+  ) %>% {
+      .[, 1] < (1 + threshold) * .[, 2]
+    } %>%
+    if_else(colors2[2], colors2[1])
+}
 ```
 
 Correlate GR50 vs log2FC of each cell line compared to the grand
@@ -555,7 +579,33 @@ fgsea_res_p_long <- fgsea_res_raw %>%
         filter(n_sig > 0) %>%
         pull(pathway)
     }
+  ) %>%
+  mutate(
+    size_leading_edge = map_int(
+      leadingEdge, length
+    )
+  ) %>%
+  select(
+    gr_metric, pathway,
+    pval, padj, ES, NES, size_leading_edge, size,
+    leadingEdge
   )
+
+
+better_contrast <- function(
+  colors1, colors2, threshold = 0
+) {
+  # browser()
+  farver::compare_colour(
+    farver::decode_colour(colors1),
+    farver::decode_colour(colors2),
+    from_space = "rgb",
+    method = "cie2000"
+  ) %>% {
+      .[, 1] < (1 + threshold) * .[, 2]
+    } %>%
+    if_else(colors2[2], colors2[1])
+}
 
 ps <- fgsea_res_p_long %>%
   filter(padj < .1) %>%
@@ -604,7 +654,7 @@ pwalk(
   ps,
   \(gr_metric, p, ...) {
     ggsave(
-      file.path("plots_cdk7", paste0("fgsea_bars_", gr_metric, ".pdf")),
+      file.path("plots_cdk7", paste0("fgsea_bars_baseline_deep_", gr_metric, ".pdf")),
       p, width = 8, height = 12
     )
   }
@@ -643,19 +693,374 @@ cluster_df <- function(df, row_var, col_var, value_var, values_fill = 0) {
     )
 }
 
-better_contrast <- function(
-  colors1, colors2, threshold = 0
-) {
+p <- fgsea_res_p_long %>%
+  filter(
+    gr_metric != "GR50",
+    str_starts(pathway, "REACTOME")
+  ) %>%
+  filter(
+    pathway %in% {
+      group_by(., pathway) %>%
+        summarize(n_sig = sum(padj < 0.01)) %>%
+        filter(n_sig > 0) %>%
+        pull(pathway)
+    }
+  ) %>%
+  cluster_df(
+    pathway, gr_metric, NES
+  ) %>%
+  ggplot(
+    aes(gr_metric, pathway, fill = NES)
+  ) +
+    geom_raster() +
+    geom_text(
+      aes(
+        label = p_cut,
+        color = after_scale(better_contrast(fill, c("white", "black"), 0))
+      ),
+      hjust = .5, vjust = .5
+    ) +
+    scico::scale_fill_scico(
+      palette = "vik", midpoint = 0
+    ) +
+    theme_minimal()
+
+```
+
+## Correlation YKL differential expression with GR metrics
+
+Both GR corrected and uncorrected
+
+```{r}
+ykl_cell_lines_to_keep <- intersect(
+  deseq_res_gr %>%
+    filter(agent == "YKL-5-124", experiment == "cdk_467_2019_08") %>%
+    pull(cell_line),
+  gr_raw$cell_line
+)
+
+deseq_res_gr_long <- deseq_res_gr %>%
+  filter(
+    agent == "YKL-5-124",
+    experiment == "cdk_467_2019_08",
+    cell_line %in% ykl_cell_lines_to_keep
+  ) %>%
+  select(
+    cell_line, ensembl_gene_id, hgnc_symbol,
+    ends_with(c("_normal", "_gr"))
+  ) %>%
+  pivot_longer(
+    cols = c(ends_with(c("_normal", "_gr"))),
+    names_pattern = "(.*)_(normal|gr)",
+    names_to = c("metric", "gr_correction")
+  ) |>
+  pivot_wider(
+    names_from = metric, values_from = value
+  )
+
+ykl_lfc_mat <- deseq_res_gr_long %>%
+  group_nest(gr_correction) %>%
+  rowwise() %>%
+  mutate(
+    genes_to_keep = data %>%
+      filter(
+        cell_line %in% ykl_cell_lines_to_keep
+      ) %>%
+      group_by(ensembl_gene_id) %>%
+      filter(any(padj < 0.05)) %>%
+      ungroup() %>%
+      pull(ensembl_gene_id) %>%
+      unique() %>%
+      list(),
+    mat = data %>%
+      filter(ensembl_gene_id %in% genes_to_keep) %>%
+      select(ensembl_gene_id, cell_line, log2FoldChange) %>%
+      pivot_wider(names_from = cell_line, values_from = log2FoldChange, values_fill = 0) %>%
+      column_to_rownames("ensembl_gene_id") %>%
+      as.matrix() %>%
+      list()
+  ) %>%
+  ungroup()
+
+
+ykl_gr_mat <- gr_raw %>%
+  filter(cell_line %in% ykl_cell_lines_to_keep) %>%
+  select(cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
+  column_to_rownames("cell_line") %>%
+  as.matrix() %>%
+  t()
+
+ykl_gr_cor_df <- ykl_lfc_mat %>%
+  rowwise() %>%
+  mutate(
+    cor = compute_correlation(
+      ykl_gr_mat,
+      mat
+    ) %>%
+    list()
+  ) %>%
+  ungroup()
+
+ykl_gr_cor_df_long <- ykl_gr_cor_df %>%
+  select(gr_correction, cor) %>%
+  unnest(cor)
+
+p <- ykl_gr_cor_df_long %>%
+  pivot_longer(
+    cols = c(r, p, p.adj),
+    names_to = "cor_metric",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(value, color = cor_metric)) +
+    stat_ecdf(geom = "step") +
+    facet_grid(gr_correction ~ gr_metric)
+
+ggsave(
+  file.path("plots_cdk7", "ykl_gr_cor_ecdf.pdf"),
+  p,
+  width = 10,
+  height = 8
+)
+
+```
+
+
+```{r}
+ykl_gr_cor_sig <- ykl_gr_cor_df_long %>%
+  filter(gr_metric %in% c("GR50", "neglog_GR50")) %>%
+  group_by(gr_correction) %>%
+  filter(
+    ensembl_gene_id %in% {
+      group_by(cur_data(), gr_metric) %>%
+        arrange(p) %>%
+        slice_head(n = 10) %>%
+        pull(ensembl_gene_id)
+    }
+  ) %>%
+  ungroup()
+
+
+ykl_gr_cor_sig_lfc <- ykl_gr_cor_sig %>%
+  power_inner_join(
+    ykl_lfc_mat %>%
+      select(gr_correction, data) %>%
+      unnest(data) %>%
+      select(gr_correction, cell_line, ensembl_gene_id, hgnc_symbol, log2FoldChange),
+    by = c("gr_correction", "ensembl_gene_id"),
+    check = check_specs(
+      unmatched_keys_left = "warn"
+    )
+  ) %>%
+  power_inner_join(
+    gr_raw %>%
+      select(cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
+      pivot_longer(-cell_line, names_to = "gr_metric", values_to = "gr_value"),
+    by = c("cell_line", "gr_metric")
+  )
+
+p <- ykl_gr_cor_sig_lfc %>%
+  group_nest(gr_correction, gr_metric) %>%
+  mutate(
+    p = pmap(
+      list(data, gr_metric, gr_correction),
+      function(df, g, gc) {
+        ggplot(
+          df %>%
+            arrange(p) %>%
+            mutate(across(hgnc_symbol, fct_inorder)),
+          aes(gr_value, log2FoldChange)
+        ) +
+          geom_point() +
+          geom_smooth(method = "lm") +
+          geom_text(
+            aes(x = x, y = y, label = p),
+            hjust = 0, vjust = 1,
+            nudge_x = 0.1, nudge_y = -0.1,
+            data = \(df) distinct(df, hgnc_symbol, p) %>%
+              mutate(
+                across(p, \(x) signif(x, digits = 2)),
+                x = if (g == "GR50") Inf else -Inf, y = Inf
+              )
+          ) +
+          facet_wrap(~hgnc_symbol, scales = "free") +
+          scale_x_continuous(
+            trans = switch(
+              g,
+              neglog_GR50 = "identity",
+              GR50 = c("reverse"),
+              "identity"
+            )
+          ) +
+          labs(
+            x = g,
+            y = "log2FoldChange YKL-5-124 vs DMSO",
+            title = paste("GR correction:", gc, "Metric:", g)
+          )
+      }
+    )
+  )
+
+ps <- patchwork::wrap_plots(p$p, ncol = 2)
+ps <- gridExtra::arrangeGrob(grobs = p$p)
+
+
+ggsave(
+  file.path("plots_cdk7", "ykl_gr_cor_most_sig.pdf"),
+  ps,
+  width = 16,
+  height = 16
+)
+
+```
+
+
+```{r}
+selected_des <- ykl_gr_cor_df_long %>%
+  drop_na(r) %>%
+  group_nest(gr_metric, gr_correction) %>%
+  mutate(
+    de = map(
+      data,
+      \(x) set_names(x$r, x$ensembl_gene_id)
+    ),
+    de_p = map(
+      data,
+      \(x) set_names(-sign(x$r) * log10(x$p), x$ensembl_gene_id)
+    )
+  )
+
+fgsea_res_raw <- selected_des %>%
+  mutate(
+    res = map(
+      de,
+      \(x) fgseaMultilevel(
+        selected_gene_sets_gr$gs,
+        x
+      )
+    ),
+    res_p = map(
+      de_p,
+      \(x) fgseaMultilevel(
+        selected_gene_sets_gr$gs,
+        x
+      )
+    )
+  )
+
+fgsea_res_p_long <- fgsea_res_raw %>%
+  select(gr_metric, gr_correction, res_p) %>%
+  unnest(res_p) %>%
+  mutate(
+    signed_p = -sign(NES) * log10(padj),
+    p_cut = cut(padj, breaks = c(-Inf, 0.01, 0.05, Inf), labels = c("**", "*", ""))
+  ) %>%
+  filter(
+    pathway %in% {
+      group_by(., pathway) %>%
+        summarize(n_sig = sum(padj < 0.05)) %>%
+        filter(n_sig > 0) %>%
+        pull(pathway)
+    }
+  ) %>%
+  mutate(
+    size_leading_edge = map_int(
+      leadingEdge, length
+    )
+  ) %>%
+  select(
+    gr_metric, gr_correction, pathway,
+    pval, padj, p_cut, ES, NES, size_leading_edge, size,
+    leadingEdge
+  )
+
+ps <- fgsea_res_p_long %>%
+  filter(padj < .1) %>%
+  group_nest(
+    gr_metric
+  ) %>%
+  rowwise() %>%
+  mutate(
+    p = list(
+      ggplot(
+        data %>%
+          group_by(pathway) %>%
+          mutate(avg_NES = mean(NES)) %>%
+          ungroup() %>%
+          arrange(avg_NES) %>%
+          mutate(
+            pathway = fct_inorder(pathway)
+          ),
+        aes(NES, pathway, fill = p_cut, color = gr_correction)
+      ) +
+        geom_col(aes(group = gr_correction), position = position_dodge()) +
+        geom_text(
+          aes(
+            x = x_pos,
+            y = pathway,
+            label = pathway,
+            hjust = hjust
+          ),
+          data = \(x) mutate(
+            x,
+            x_pos = if_else(NES > 0, -.1, .1),
+            hjust = if_else(NES > 0, 1, 0)
+          ) %>%
+            distinct(pathway, x_pos, hjust),
+          inherit.aes = FALSE
+        ) +
+        scale_fill_viridis_d(direction = -1) +
+        labs(
+          x = "Normalized Enrichment Score",
+          y = NULL,
+          title = gr_metric
+        ) +
+        theme(
+          axis.text.y = element_blank()
+        )
+    )
+  )
+
+pwalk(
+  ps,
+  \(gr_metric, p, ...) {
+    ggsave(
+      file.path("plots_cdk7", paste0("fgsea_bars_gr_ykl_cor_", gr_metric, ".pdf")),
+      p, width = 8, height = 12
+    )
+  }
+)
+```
+
+```{r}
+
+library(seriation)
+cluster_df <- function(df, row_var, col_var, value_var, values_fill = 0) {
   # browser()
-  farver::compare_colour(
-    farver::decode_colour(colors1),
-    farver::decode_colour(colors2),
-    from_space = "rgb",
-    method = "cie2000"
-  ) %>% {
-      .[, 1] < (1 + threshold) * .[, 2]
-    } %>%
-    if_else(colors2[2], colors2[1])
+  mat <- df %>%
+    select({{row_var}}, {{col_var}}, {{value_var}}) %>%
+    pivot_wider(names_from = {{col_var}}, values_from = {{value_var}}, values_fill = values_fill) %>%
+    column_to_rownames(rlang::as_name(rlang::enquo(row_var)))
+  # browser()
+  if (rlang::is_bare_numeric(pull(df, {{value_var}}))) {
+    dist_rows <- dist(mat, method = "euclidian")
+    dist_cols <- dist(t(mat), method = "euclidian")
+  } else {
+    # browser()
+    dist_rows <- cluster::daisy(mat, metric = "gower")
+    dist_cols <- t(mat) %>%
+      as.data.frame() %>%
+      mutate(across(everything(), \(x) factor(x, levels = levels(pull(df, {{value_var}}))))) %>%
+      cluster::daisy(metric = "gower")
+  }
+  clust_rows <- hclust(dist_rows, method = "average") %>%
+      reorder(dist_rows, method = "olo")
+  clust_cols <- hclust(dist_cols, method = "average") %>%
+      reorder(dist_cols, method = "olo")
+  df %>%
+    mutate(
+      "{{row_var}}" := factor({{row_var}}, levels = clust_rows$labels[clust_rows$order]),
+      "{{col_var}}" := factor({{col_var}}, levels = clust_cols$labels[clust_cols$order])
+    )
 }
 
 p <- fgsea_res_p_long %>%
@@ -692,152 +1097,113 @@ p <- fgsea_res_p_long %>%
 
 ```
 
+## FGSEA for raw YKL DGE results
+
 
 ```{r}
-ykl_cell_lines_to_keep <- intersect(
-  deseq_res_long %>%
-    filter(agent == "YKL-5-124", experiment == "cdk_467_2019_08") %>%
-    pull(cell_line),
-  gr_raw$cell_line
-)
-
-ykl_genes_to_keep <- deseq_res_long %>%
-  filter(
-    agent == "YKL-5-124",
-    experiment == "cdk_467_2019_08",
-    cell_line %in% ykl_cell_lines_to_keep
-  ) %>%
-  group_by(ensembl_gene_id) %>%
-  filter(any(padj < 0.05)) %>%
-  ungroup() %>%
-  pull(ensembl_gene_id) %>%
-  unique()
-
-ykl_lfc_mat <- deseq_res_long %>%
-  filter(
-    agent == "YKL-5-124",
-    experiment == "cdk_467_2019_08",
-    cell_line %in% ykl_cell_lines_to_keep,
-    ensembl_gene_id %in% ykl_genes_to_keep
-  ) %>%
-  select(ensembl_gene_id, cell_line, log2FoldChange) %>%
-  replace_na(list(log2FoldChange = 0)) %>%
-  pivot_wider(names_from = cell_line, values_from = log2FoldChange, values_fill = 0) %>%
-  column_to_rownames("ensembl_gene_id") %>%
-  as.matrix()
-
-ykl_gr_mat <- gr_raw %>%
-  filter(cell_line %in% ykl_cell_lines_to_keep) %>%
-  select(cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
-  column_to_rownames("cell_line") %>%
-  as.matrix() %>%
-  t()
-
-ykl_gr_cor_df <- compute_correlation(
-  ykl_gr_mat,
-  ykl_lfc_mat
-)
-
-p <- ykl_gr_cor_df %>%
-  pivot_longer(
-    cols = c(r, p, p.adj),
-    names_to = "cor_metric",
-    values_to = "value"
-  ) %>%
-  ggplot(aes(value, color = cor_metric)) +
-    stat_ecdf(geom = "step") +
-    facet_wrap(~gr_metric)
-
-ggsave(
-  file.path("plots_cdk7", "ykl_gr_cor_ecdf.pdf"),
-  p,
-  width = 10,
-  height = 8
-)
-
-```
-
-```{r}
-ykl_gr_cor_sig <- ykl_gr_cor_df %>%
-  filter(gr_metric %in% c("GR50", "neglog_GR50")) %>%
-  filter(
-    ensembl_gene_id %in% {
-      group_by(., gr_metric) %>%
-        arrange(p) %>%
-        slice_head(n = 10) %>%
-        pull(ensembl_gene_id)
-    }
-  )
-
-
-ykl_gr_cor_sig_lfc <- ykl_gr_cor_sig %>%
-  inner_join(
-    ykl_lfc_mat %>%
-      as_tibble(rownames = "ensembl_gene_id") %>%
-      pivot_longer(
-        cols = -ensembl_gene_id,
-        names_to = "cell_line",
-        values_to = "log2FoldChange"
-      )
-  ) %>%
-  inner_join(
-    gr_raw %>%
-      select(cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
-      pivot_longer(-cell_line, names_to = "gr_metric", values_to = "gr_value"),
-  )
-
-p <- ykl_gr_cor_sig_lfc %>%
-  group_nest(gr_metric) %>%
+selected_des <- ykl_lfc_mat %>%
+  select(gr_correction, data) %>%
+  unnest(data) %>%
+  drop_na(pvalue) %>%
+  group_nest(gr_correction, cell_line) %>%
   mutate(
-    p = map2(
-      data, gr_metric,
-      function(df, g) {
-        ggplot(
-          df %>%
-            arrange(p) %>%
-            mutate(across(gene_name, fct_inorder)),
-          aes(gr_value, log2FoldChange)
-        ) +
-          geom_point() +
-          geom_smooth(method = "lm") +
-          geom_text(
-            aes(x = x, y = y, label = p),
-            hjust = 0, vjust = 1,
-            nudge_x = 0.1, nudge_y = -0.1,
-            data = \(df) distinct(df, gene_name, p) %>%
-              mutate(
-                across(p, \(x) signif(x, digits = 2)),
-                x = if (g == "GR50") Inf else -Inf, y = Inf
-              )
-          ) +
-          facet_wrap(~gene_name, scales = "free") +
-          scale_x_continuous(
-            trans = switch(
-              g,
-              neglog_GR50 = "identity",
-              GR50 = c("reverse"),
-              "identity"
-            )
-          ) +
-          labs(
-            x = g,
-            y = "log2FoldChange YKL-5-124 vs DMSO",
-            title = g
-          )
-      }
+    de = map(
+      data,
+      \(x) set_names(x$log2FoldChange, x$ensembl_gene_id)
+    ),
+    de_p = map(
+      data,
+      \(x) set_names(-sign(x$log2FoldChange_MLE) * log10(x$pvalue), x$ensembl_gene_id)
     )
   )
 
-ps <- patchwork::wrap_plots(p$p)
+fgsea_res_raw <- selected_des %>%
+  mutate(
+    res = map(
+      de,
+      \(x) fgseaMultilevel(
+        selected_gene_sets_gr$gs,
+        x
+      )
+    ),
+    res_p = map(
+      de_p,
+      \(x) fgseaMultilevel(
+        selected_gene_sets_gr$gs,
+        x
+      )
+    )
+  )
 
-ggsave(
-  file.path("plots_cdk7", "ykl_gr_cor_most_sig.pdf"),
-  ps,
-  width = 16,
-  height = 8
-)
+fgsea_res_p_long <- fgsea_res_raw %>%
+  select(cell_line, gr_correction, res_p) %>%
+  unnest(res_p) %>%
+  mutate(
+    signed_p = -sign(NES) * log10(padj),
+    p_cut = cut(padj, breaks = c(-Inf, 0.01, 0.05, Inf), labels = c("**", "*", ""))
+  ) %>%
+  filter(
+    pathway %in% {
+      group_by(., pathway) %>%
+        summarize(n_sig = sum(padj < 0.05)) %>%
+        filter(n_sig > 0) %>%
+        pull(pathway)
+    }
+  ) %>%
+  mutate(
+    size_leading_edge = map_int(
+      leadingEdge, length
+    )
+  ) %>%
+  select(
+    cell_line, gr_correction, pathway,
+    pval, padj, p_cut, ES, NES, size_leading_edge, size,
+    leadingEdge
+  )
 
 ```
+
+### Correlate FGSEA result with GR metrics
+
+```{r}
+ykl_fgsea_res_mats <- fgsea_res_p_long %>%
+  mutate(
+    signed_p = -sign(NES) * log10(pval)
+  ) %>%
+  select(cell_line, gr_correction, pathway, signed_p, NES) %>%
+  pivot_longer(c(signed_p, NES), names_to = "metric", values_to = "value") %>%
+  pivot_wider(names_from = cell_line, values_from = value) %>%
+  group_nest(gr_correction, metric, .key = "mat") %>%
+  mutate(
+    mat = map(
+      mat,
+      \(x) column_to_rownames(x, "pathway") %>%
+        as.matrix()
+    )
+  )
+
+ykl_fgsea_res_gr_cor <- ykl_fgsea_res_mats %>%
+  mutate(
+    cor = map(
+      mat,
+      \(x) compute_correlation(
+        ykl_gr_mat,
+        x[, colnames(ykl_gr_mat)]
+      ) %>%
+        arrange(p)
+    )
+  )
+
+ykl_fgsea_res_gr_cor_long <- ykl_fgsea_res_gr_cor %>%
+  select(gr_correction, metric, cor) %>%
+  unnest(cor)
+
+write_csv(
+  ykl_fgsea_res_gr_cor_long,
+  file.path("data", "ykl_fgsea_res_gr_cor_long.csv.gz")
+)
+```
+
 
 ```{r}
 cv_model <- glmnet::cv.glmnet(
