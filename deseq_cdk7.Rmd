@@ -441,7 +441,10 @@ extract_deseq_result <- function(de, contrast, name, res_args = list(), shrink_a
   } else {
     res <- rlang::exec(results, de, contrast = contrast, !!!res_args)
   }
-  shrunken <- rlang::exec(lfcShrink, de, res = res, type = "ashr", !!!shrink_args)
+  if (!"type" %in% names(shrink_args)) {
+    shrink_args$type <- "ashr"
+  }
+  shrunken <- rlang::exec(lfcShrink, de, res = res, !!!shrink_args)
   shrunken %>%
     as_tibble(rownames = "gene_id") %>%
     left_join(
@@ -1785,6 +1788,32 @@ ggsave(
   width = 14,
   height = 10
 )
+
+
+p <- deep_gr_res_spot_check %>%
+  filter(reason_included == "random_padj_normal") %>%
+  ggplot(
+    aes(
+      doubling_per_hour, count,
+      color = cell_line
+    )
+  ) +
+    geom_point() +
+    # geom_text(
+    #   aes(label = reason_included),
+    #   x = -Inf, y = Inf, color = "black",
+    #   hjust = 0, vjust = 1,
+    #   data = \(x) distinct(x, hgnc_symbol, reason_included)
+    # ) +
+    scale_y_continuous(trans = scales::transform_pseudo_log()) +
+    facet_wrap(~hgnc_symbol, scales = "free_y")
+
+ggsave(
+  file.path("plots_cdk7", "deep_gr_res_spot_check_random_normal.pdf"),
+  p,
+  width = 7,
+  height = 5
+)
 ```
 
 unscaled version much much better than scaled. Weird artifacts in the scaled version.
@@ -1826,11 +1855,245 @@ cor.test(
 
 Poor correlation
 
-### Correcting counts
+## Correcting counts
 
 ```{r}
+de_baseline_dge_gr_res %>%
+  ggplot(
+    aes(
+      log2FoldChange_MLE, log2FoldChange
+    )
+  ) +
+  geom_point(alpha = .5)
 
+deseq_res_long_post_gr_meta <- deseq_res_long %>%
+  distinct(experiment, agent, cell_line, time) %>%
+  inner_join(
+    meta_deseq_gr
+  )
+
+deseq_input_gr_just_doubling <- meta_deseq_gr %>%
+  group_nest(experiment, .key = "meta") %>%
+  mutate(
+    counts = map(
+      meta,
+      \(x) counts_mat[, x$sample_id]
+    )
+    # batch_correct = map_lgl(meta_deseq, \(x) n_distinct(x$batch) > 1)
+  )
+
+
+deseq_fit_gr_just_doubling <- deseq_input_gr_just_doubling %>%
+  mutate(
+    deseq = map2(
+      meta, counts,
+      \(m, x) {
+        DESeqDataSetFromMatrix(
+          x,
+          colData = column_to_rownames(m, "sample_id"),
+          design = ~doubling_per_hour,
+          # design = if (bc) {~log_agent_conc + batch} else {~log_agent_conc}
+        ) %>%
+          DESeq()
+      }
+    )
+  )
+
+
+deseq_res_gr_just_doubling <- deseq_fit_gr_just_doubling %>%
+  rowwise() %>%
+  mutate(
+    res = extract_deseq_result(deseq, name = "doubling_per_hour") %>%
+      dplyr::rename(ensembl_gene_id = gene_id) %>%
+      left_join(
+        ensembl_gtf %>%
+          select(ensembl_gene_id, hgnc_symbol),
+        by = "ensembl_gene_id"
+      ) %>%
+      list(),
+    res_int = extract_deseq_result(deseq, name = "Intercept") %>%
+      dplyr::rename(ensembl_gene_id = gene_id) %>%
+      left_join(
+        ensembl_gtf %>%
+          select(ensembl_gene_id, hgnc_symbol),
+        by = "ensembl_gene_id"
+      ) %>%
+      list(),
+    cor_terms = list(
+      res$log2FoldChange %*% t(meta$doubling_per_hour)
+    ),
+    counts_cor = list(
+      exp(log(counts(
+        deseq, normalized = TRUE
+      )) - cor_terms)
+    )
+  ) %>%
+  ungroup()
+
+qsave(
+  deseq_res_gr_just_doubling %>%
+    select(-deseq),
+  file.path("deseq", "cdk7_deseq_gr_res_just_doubling.qs")
+)
+# deseq_res_gr <- qread("deseq/cdk7_deseq_gr_res.qs")
+
+dge_gr_res_all_spot_check <- withr::with_seed(
+  42,
+  deseq_res_gr_just_doubling$res[[1]] %>%
+    filter(padj < 0.05) %>%
+    slice_sample(n = 20)
+) %>%
+  power_inner_join(
+    power_inner_join(
+      counts_corrected,
+      baseline_meta_gr,
+      by = "sample_id",
+      check = check_specs(
+        duplicate_keys_right = "warn"
+      )
+    ),
+    by = "ensembl_gene_id",
+    check = check_specs(
+      unmatched_keys_left = "warn"
+    )
+  )
+
+p <- dge_gr_res_spot_check %>%
+  ggplot(
+    aes(
+      doubling_per_hour, count,
+      color = cell_line
+    )
+  ) +
+    geom_point() +
+    # geom_text(
+    #   aes(label = reason_included),
+    #   x = -Inf, y = Inf, color = "black",
+    #   hjust = 0, vjust = 1,
+    #   data = \(x) distinct(x, hgnc_symbol, reason_included)
+    # ) +
+    scale_y_continuous(transform = scales::pseudo_log_trans()) +
+    facet_wrap(~hgnc_symbol, scales = "free_y") +
+    theme_linedraw()
+
+ggsave(
+  file.path("plots_cdk7", "dge_gr_res_spot_check.pdf"),
+  p,
+  width = 14,
+  height = 10
+)
 
 ```
 
+### Running Deseq on corrected counts
+
+```{r}
+deseq_res_gr_just_doubling_count_mat_cor <- rlang::exec(
+  cbind,
+  !!!deseq_res_gr_just_doubling$counts_cor
+) %>%
+  round()
+
+
+deseq_input <- meta_deseq_gr %>%
+  filter(agent != "control") %>%
+  group_nest(experiment, agent, cell_line, time, .key = "treated") %>%
+  left_join(
+    meta_deseq_gr %>%
+      filter(agent == "control") %>%
+      group_nest(experiment, cell_line, time, .key = "control"),
+    by = c("experiment", "cell_line", "time")
+  ) %>%
+  mutate(
+    control = map2(
+      control, treated,
+      \(x, y) filter(x, batch %in% y$batch)
+    )
+  ) %>%
+  filter(
+    map_int(treated, nrow) > 1,
+    map_int(control, nrow) > 1
+  ) %>%
+  mutate(
+    meta_deseq = map2(
+      treated, control,
+      ~bind_rows(.x, .y) %>%
+        mutate(
+          log_agent_conc = log10(agent_conc + 1)
+        )
+    ),
+    batch_correct = map_lgl(meta_deseq, \(x) n_distinct(x$batch) > 1)
+  )
+
+deseq_fit <- deseq_input %>%
+  mutate(
+    deseq = map2(
+      meta_deseq, batch_correct,
+      \(m, bc) {
+        DESeqDataSetFromMatrix(
+          deseq_res_gr_just_doubling_count_mat_cor[, m$sample_id],
+          colData = column_to_rownames(m, "sample_id"),
+          # design = ~log_agent_conc
+          design = if (bc) {~log_agent_conc + batch} else {~log_agent_conc}
+        ) %>%
+          DESeq(test = "Wald")
+      }
+    )
+  )
+
+qsave(
+  deseq_fit,
+  file.path("deseq", "cdk7_deseq_res_raw_counts_gr_corrected.qs")
+)
+# deseq_fit <- qread("deseq/cdk7_deseq_res_raw2.qs")
+
+deseq_res <- deseq_fit %>%
+  rowwise() %>%
+  mutate(
+    res = {
+      extract_deseq_result(
+        deseq, name = "log_agent_conc"
+      ) %>%
+        dplyr::rename(
+          ensembl_gene_id = gene_id
+        ) %>%
+        left_join(
+          ensembl_gtf %>%
+            select(ensembl_gene_id, hgnc_symbol),
+          by = "ensembl_gene_id"
+        ) %>%
+        list()
+    }
+  ) %>%
+  ungroup()
+
+qsave(
+  deseq_res %>%
+    select(-deseq),
+  file.path("deseq", "cdk7_deseq_res_counts_gr_corrected.qs")
+)
+# deseq_res <- qread("deseq/cdk7_deseq_res2.qs")
+
+
+deseq_res_long <- deseq_res %>%
+  select(experiment, agent, cell_line, time, res) %>%
+  unnest(res)
+
+write_csv(
+  deseq_res_long,
+  file.path("deseq", "cdk7_deseq_res_counts_gr_corrected_long.csv")
+)
+```
+
+
+```{r}
+synStoreMany(
+  c(
+    file.path("deseq", "cdk7_deseq_res_counts_gr_corrected_long.csv")
+  ),
+  parentId = "syn59470136",
+  forceVersion = FALSE
+)
+
+```
 
