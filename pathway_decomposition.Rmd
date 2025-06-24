@@ -1,0 +1,591 @@
+---
+title: "CDK7 pathway decomposition"
+author: "Clemens Hug"
+date: "2025-06-17"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(data.table)
+library(qs)
+library(synExtra)
+library(powerjoin)
+library(decoupleR)
+library(here)
+
+synapser::synLogin()
+syn <- synDownloader("~/data", .cache = TRUE)
+
+syn_analysis <- "syn51221227"
+
+plot_dir <- here("plots", "pathway_decomposition")
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+
+```{r}
+ensembl_gtf <- rtracklayer::import("Homo_sapiens.GRCh38.109.gtf.gz") %>%
+  as_tibble()
+
+deep_baseline_counts_long <- syn("syn60530854") %>%
+  read_csv() %>%
+  mutate(
+    cell_line = str_replace_all(cell_line, fixed("-"), "")
+  )
+
+gr_raw <- syn("syn52242760") %>%
+  read_csv() %>%
+  mutate(neglog_GR50 = -log10(GR50))
+
+deseq_dge_baseline_res <- syn("syn60527359") %>%
+  read_csv() %>%
+  mutate(
+    across(cell_line, \(x) str_replace_all(x, fixed("-"), ""))
+  )
+```
+
+```{r}
+gr_long <- gr_raw %>%
+  mutate(
+    cell_line = str_replace_all(cell_line, fixed("-"), "")
+  ) %>%
+  select(cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
+  pivot_longer(
+    cols = -cell_line,
+    names_to = "gr_metric",
+    values_to = "gr_value"
+  )
+
+gr_mats <- gr_raw %>%
+  mutate(
+    cell_line = str_replace_all(cell_line, fixed("-"), "")
+  ) %>%
+  select(cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
+  column_to_rownames("cell_line") %>%
+  as.matrix() %>%
+  t()
+```
+
+deep_baseline_counts_long %>% distinct(cell_line) %>% arrange(cell_line) %>% pull(cell_line)
+c("59M", "CAOV-3", "COV318", "COV504", "ES-2", "EVSA-T", "FCI-P2p",
+"FNE1", "FNE2", "FUOV1", "JHOM-1", "JHOS-2", "JHOS-4", "Kuramochi",
+"OAW-28", "OCE1", "OCE2", "OCI-P2a", "OCI-P5x", "OCI-P8p", "OCI-U1a",
+"ONCODG1", "OV-90", "OVCA-R4", "OVKATE", "OVSAHO", "RMUGS", "SNU-119",
+"SNU-8", "TYK-NU")
+
+gr_long %>% distinct(cell_line) %>% arrange(cell_line) %>% pull(cell_line) %>% dput()
+c("59M", "CAOV3", "COV318", "COV362", "COV504", "ES2", "FCIP2p",
+"FNE1", "FUOV1", "JHOM1", "JHOS2", "Kuramochi", "OAW28", "OCE1",
+"OCE2", "OCIP5x", "OCIU1a", "ONCODG1", "OV90", "OVCAR3", "OVCAR4",
+"OVCAR8", "OVKATE", "OVSAHO", "RMUGS", "SKOV3", "SNU119", "SNU8",
+"TYKNU")
+
+
+```{r}
+intersect(
+  deep_baseline_counts_long$cell_line,
+  colnames(gr_mats)
+)
+setdiff(
+  colnames(gr_mats),
+  deep_baseline_counts_long$cell_line
+)
+
+```
+
+Only 4 cell lines are missing in the counts data, but present in the GR data
+"COV362" "OVCAR3" "OVCAR8" "SKOV3"
+
+```{r}
+deep_baseline_counts_long %>%
+  distinct(ensembl_gene_id, hgnc_symbol) %>%
+  count(hgnc_symbol) %>%
+  count(n)
+
+deep_baseline_counts_long %>%
+  distinct(ensembl_gene_id, hgnc_symbol) %>%
+  group_by(hgnc_symbol) %>%
+  filter(n() > 1) %>%
+  arrange(hgnc_symbol)
+
+varstab_mat <- deep_baseline_counts_long %>%
+  filter(
+    type == "varstab",
+    hgnc_symbol %in% {
+      deep_baseline_counts_long %>%
+        distinct(ensembl_gene_id, hgnc_symbol) %>%
+        group_by(hgnc_symbol) %>%
+        filter(n() == 1) %>%
+        pull(hgnc_symbol)
+    }
+  ) %>%
+  select(hgnc_symbol, cell_line, count) %>%
+  pivot_wider(names_from = cell_line, values_from = count) %>%
+  column_to_rownames("hgnc_symbol") %>%
+  as.matrix()
+```
+
+
+```{r}
+library(progeny)
+
+progeny_res_perm <- progeny(
+  varstab_mat,
+  organism = "Human",
+  scale = TRUE,
+  verbose = TRUE,
+  perm = 1000,
+  get_nulldist = TRUE,
+  z_scores = TRUE # Needs to be true, otherwise some useless normalized value is returned
+)
+
+progeny_res_perm_long <- progeny_res_perm[[1]] %>%
+  magrittr::set_colnames(colnames(varstab_mat)) %>%
+  as_tibble(rownames = "pathway") %>%
+  pivot_longer(-pathway, names_to = "cell_line", values_to = "activity") %>%
+  mutate(
+    pathway = recode(pathway, `JAK.STAT` = "JAK-STAT")
+  )
+
+progeny_res_norm <- progeny(
+  varstab_mat,
+  organism = "Human",
+  scale = FALSE,
+  verbose = TRUE
+)
+
+progeny_res_norm_long <- progeny_res_norm %>%
+  as_tibble(rownames = "cell_line") %>%
+  pivot_longer(-cell_line, names_to = "pathway", values_to = "activity")
+```
+
+Perm version seems preferable, represents the pathway activity relative to 1000
+random gene sets. The normal version is some sort of coefficient from a model.
+
+```{r}
+decoup_progeny_net <- get_progeny(organism = "human", top = 100)
+
+
+decoup_progeny_ulm_res <- run_ulm(
+  varstab_mat,
+  decoup_progeny_net
+)
+```
+
+
+```{r}
+power_inner_join(
+  progeny_res_norm_long,
+  decoup_progeny_ulm_res,
+  by = c("cell_line" = "condition", "pathway" = "source"),
+  check = check_specs(
+    unmatched_keys_left = "warn",
+    unmatched_keys_right = "warn",
+    duplicate_keys_left = "warn",
+    duplicate_keys_right = "warn"
+  )
+) %>%
+  ggplot(
+    aes(
+      activity, score
+    )
+  ) +
+  geom_point() +
+  facet_wrap(~cell_line)
+
+
+power_inner_join(
+  progeny_res_perm_long,
+  decoup_progeny_ulm_res,
+    # mutate(
+    #   across(c(source, condition), \(x) str_replace_all(x, "[^A-Za-z0-9]", ".")),
+    # ),
+  by = c("cell_line" = "condition", "pathway" = "source"),
+  check = check_specs(
+    unmatched_keys_left = "warn",
+    unmatched_keys_right = "warn",
+    duplicate_keys_left = "warn",
+    duplicate_keys_right = "warn"
+  )
+) %>%
+  ggplot(
+    aes(
+      activity, score
+    )
+  ) +
+  geom_point() +
+  facet_wrap(~cell_line)
+
+
+power_inner_join(
+  progeny_res_perm_long,
+  decoup_progeny_ulm_res,
+    # mutate(
+    #   across(c(source, condition), \(x) str_replace_all(x, "[^A-Za-z0-9]", ".")),
+    # ),
+  by = c("cell_line" = "condition", "pathway" = "source"),
+  check = check_specs(
+    unmatched_keys_left = "warn",
+    unmatched_keys_right = "warn",
+    duplicate_keys_left = "warn",
+    duplicate_keys_right = "warn"
+  )
+) %>%
+  ggplot(
+    aes(
+      activity, score
+    )
+  ) +
+  geom_point() +
+  facet_wrap(~pathway)
+```
+
+
+```{r}
+library(ComplexHeatmap)
+
+progeny_res_perm_hm <- progeny_res_perm_long %>%
+  pivot_wider(names_from = cell_line, values_from = activity) %>%
+  column_to_rownames("pathway") %>%
+  as.matrix()
+
+hm <- Heatmap(
+  progeny_res_perm_hm,
+  col = circlize::colorRamp2(
+    {
+      q1 <- quantile(progeny_res_perm_hm, 0.01, na.rm = TRUE)
+      q99 <- quantile(progeny_res_perm_hm, 0.99, na.rm = TRUE)
+      absmax <- max(abs(q1), abs(q99))
+      seq(-absmax, absmax, length.out = 11)
+    },
+    rev(RColorBrewer::brewer.pal(11, "RdBu"))
+  ),
+  name = "Activity",
+  cluster_columns = TRUE,
+  cluster_rows = TRUE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+)
+hm
+
+withr::with_pdf(
+  file.path(plot_dir, "progeny_perm_heatmap.pdf"),
+  {
+    draw(hm)
+  }, width = 10, height = 6
+)
+ ```
+
+## progeny vs GR values
+
+```{r}
+gr_vs_progeny_data <- power_inner_join(
+  progeny_res_perm_long,
+  gr_long,
+  by = c("cell_line"),
+  check = check_specs(
+    unmatched_keys_left = "info",
+    unmatched_keys_right = "info"
+  )
+)
+
+```
+
+
+```{r}
+gr_vs_progeny_lms <- gr_vs_progeny_data %>%
+  group_by(gr_metric, pathway) %>%
+  summarize(
+    lm_res = {
+      lm(
+        gr_value ~ activity,
+        data = cur_data()
+      ) %>%
+        broom::tidy() %>%
+        list()
+    },
+    .groups = "drop"
+  ) %>%
+  unnest(lm_res) %>%
+  filter(term == "activity") %>%
+  mutate(
+    padj = p.adjust(p.value, method = "fdr")
+  )
+
+
+
+p <- ggplot(gr_vs_progeny_data, aes(x = activity, y = gr_value)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  ggh4x::facet_grid2(
+    rows = vars(gr_metric),
+    cols = vars(pathway),
+    scales = "free",
+    independent = "all"
+  ) +
+  theme_bw()
+p
+```
+
+
+## glmnet
+
+```{r}
+gr_vs_progeny_glmnet_raw <- gr_vs_progeny_data %>%
+  group_by(gr_metric) %>%
+  summarize(
+    res = {
+      mat <- pivot_wider(
+        cur_data(),
+        names_from = pathway,
+        values_from = activity
+      ) %>%
+        column_to_rownames("cell_line") %>%
+        as.matrix()
+      # browser()
+      glmnet::cv.glmnet(
+        x = mat[, colnames(mat) != "gr_value"],
+        y = mat[, "gr_value"],
+        alpha = 0.5, # Elastic net mixing parameter
+        nfolds = 10,
+        standardize = TRUE,
+        intercept = TRUE,
+        family = "gaussian"
+      ) %>%
+        list()
+    },
+    .groups = "drop"
+  )
+```
+
+## fgsea DGE baseline
+
+```{r}
+library(fgsea)
+library(msigdbr)
+
+all_gene_sets <- msigdbr(species = "Homo sapiens")
+selected_gene_sets <- all_gene_sets %>%
+  filter(
+    gs_collection == "H" |
+      gs_subcollection == "CP:REACTOME"
+  )
+
+selected_gene_sets_fgsea <- selected_gene_sets %>%
+  group_nest(gs_collection, gs_subcollection, gs_name) %>%
+  mutate(
+    gs = map(
+      data,
+      \(x) unique(x$ensembl_gene)
+    ) %>%
+      set_names(gs_name)
+  )
+
+selected_des <- deseq_dge_baseline_res %>%
+  mutate(
+    signed_p = -sign(log2FoldChange_MLE) * log10(pvalue)
+  ) %>%
+  filter(is.finite(signed_p), is.finite(log2FoldChange)) %>%
+  group_nest(cell_line) %>%
+  mutate(
+    de = map(
+      data,
+      \(x) set_names(x$log2FoldChange, x$ensembl_gene_id)
+    ),
+    de_p = map(
+      data,
+      \(x) set_names(x$signed_p, x$ensembl_gene_id)
+    )
+  )
+
+fgsea_res_raw <- selected_des %>%
+  mutate(
+    res = map(
+      de,
+      \(x) fgseaMultilevel(
+        selected_gene_sets_fgsea$gs,
+        x
+      )
+    ),
+    res_p = map(
+      de_p,
+      \(x) fgseaMultilevel(
+        selected_gene_sets_fgsea$gs,
+        x
+      )
+    )
+  )
+
+fgsea_res_long <- fgsea_res_raw %>%
+  select(cell_line, res) %>%
+  unnest(res) %>%
+  mutate(
+    signed_p = -sign(NES) * log10(padj),
+    p_cut = cut(padj, breaks = c(-Inf, 0.01, 0.05, Inf), labels = c("**", "*", ""))
+  ) %>%
+  filter(
+    pathway %in% {
+      group_by(., pathway) %>%
+        summarize(n_sig = sum(padj < 0.05)) %>%
+        filter(n_sig > 0) %>%
+        pull(pathway)
+    }
+  ) %>%
+  mutate(
+    size_leading_edge = map_int(
+      leadingEdge, length
+    )
+  ) %>%
+  select(
+    cell_line, pathway,
+    pval, padj, p_cut, ES, NES, size_leading_edge, size,
+    leadingEdge
+  )
+
+fgsea_res_vs_gr <- power_inner_join(
+  fgsea_res_long,
+  gr_long,
+  by = c("cell_line"),
+  check = check_specs(
+    unmatched_keys_left = "info",
+    unmatched_keys_right = "info"
+  )
+)
+```
+
+## glmnet
+
+```{r}
+gr_vs_fgsea_glmnet_raw <- fgsea_res_vs_gr %>%
+  group_by(gr_metric) %>%
+  summarize(
+    res = {
+      mat <- pivot_wider(
+        pick(cell_line, pathway, NES, gr_value),
+        names_from = pathway,
+        values_from = NES
+      ) %>%
+        column_to_rownames("cell_line") %>%
+        as.matrix()
+      # browser()
+      glmnet::cv.glmnet(
+        x = mat[, colnames(mat) != "gr_value"],
+        y = mat[, "gr_value"],
+        alpha = 0.5, # Elastic net mixing parameter
+        nfolds = 10,
+        standardize = TRUE,
+        intercept = TRUE,
+        family = "gaussian"
+      ) %>%
+        list()
+    },
+    .groups = "drop"
+  )
+
+```
+
+
+## GSVA
+
+```{r}
+varstab_mat_ensembl <- deep_baseline_counts_long %>%
+  filter(
+    type == "varstab"
+  ) %>%
+  select(ensembl_gene_id, cell_line, count) %>%
+  pivot_wider(names_from = cell_line, values_from = count) %>%
+  column_to_rownames("ensembl_gene_id") %>%
+  as.matrix()
+
+library(GSVA)
+
+gsva_param <- gsvaParam(
+  varstab_mat_ensembl,
+  geneSets = selected_gene_sets_fgsea$gs
+)
+
+gsva_mat <- gsva(
+  gsva_param
+)
+
+gsva_res_long <- gsva_mat %>%
+  as_tibble(rownames = "pathway") %>%
+  pivot_longer(-pathway, names_to = "cell_line", values_to = "activity")
+
+gsva_res_vs_gr <- power_inner_join(
+  gsva_res_long,
+  gr_long,
+  by = c("cell_line"),
+  check = check_specs(
+    unmatched_keys_left = "info",
+    unmatched_keys_right = "info"
+  )
+)
+```
+
+
+## glmnet
+
+```{r}
+gr_vs_gsva_glmnet_raw <- gsva_res_vs_gr %>%
+  group_by(gr_metric) %>%
+  summarize(
+    res = {
+      mat <- pivot_wider(
+        pick(cell_line, pathway, activity, gr_value),
+        names_from = pathway,
+        values_from = activity
+      ) %>%
+        column_to_rownames("cell_line") %>%
+        as.matrix()
+      # browser()
+      glmnet::cv.glmnet(
+        x = mat[, colnames(mat) != "gr_value"],
+        y = mat[, "gr_value"],
+        alpha = 0.5, # Elastic net mixing parameter
+        nfolds = 10,
+        standardize = TRUE,
+        intercept = TRUE,
+        family = "gaussian"
+      ) %>%
+        list()
+    },
+    .groups = "drop"
+  )
+
+gr_vs_gsva_glmnet_coefs <- gr_vs_gsva_glmnet_raw %>%
+  mutate(
+    coefs = map(
+      res,
+      \(x) {
+        coef(x, s = "lambda.min") %>%
+          as.matrix() %>%
+          as_tibble(rownames = "pathway") %>%
+          filter(pathway != "(Intercept)", s0 > 0)
+      }
+    )
+  )
+
+p <- ggplot(
+  gsva_res_vs_gr %>%
+    filter(gr_metric == "neglog_GR50") %>%
+    power_inner_join(
+      gr_vs_gsva_glmnet_coefs$coefs[[4]],
+      by = "pathway",
+      check = check_specs(
+        unmatched_keys_right = "warn"
+      )
+    ),
+  aes(
+    x = activity, y = gr_value
+  )
+) +
+  geom_point() +
+  facet_wrap(~pathway, scales = "free")
+p
+```
+
