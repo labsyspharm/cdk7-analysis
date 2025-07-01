@@ -23,6 +23,39 @@ syn_analysis <- synMkdir("syn52226362", "analysis")
 
 
 ```{r}
+
+ensembl_gtf_file <- "Homo_sapiens.GRCh38.109.gtf.gz"
+if (!file.exists(ensembl_gtf_file)) {
+  download.file(
+    "ftp://ftp.ensembl.org/pub/release-109/gtf/homo_sapiens/Homo_sapiens.GRCh38.109.gtf.gz",
+    ensembl_gtf_file, method = "curl"
+  )
+}
+
+ensembl_gtf <- rtracklayer::readGFF(
+  ensembl_gtf_file
+) %>%
+  distinct(
+    ensembl_gene_id = gene_id,
+    hgnc_symbol = gene_name,
+    gene_biotype
+  ) %>%
+  drop_na(ensembl_gene_id) %>%
+  mutate(
+    gene_name = coalesce(hgnc_symbol, ensembl_gene_id)
+  )
+
+deep_meta <- syn("syn60529546") %>%
+  readxl::read_excel() %>%
+  mutate(
+    sample_id = paste0("S", Sample)
+  ) %>%
+  dplyr::rename(cell_line = `Cell line`) %>%
+  mutate(
+    cell_line = str_replace_all(cell_line, fixed("-"), "")
+  )
+
+
 deseq_res_combined <- synPluck(
   syn_analysis, "cdk7_deseq_res_combined_long.csv"
 ) %>%
@@ -41,18 +74,29 @@ deseq_res_baseline <- synPluck(
   syn() %>%
   read_csv()
 
-counts_baseline <- synPluck(
-  syn_analysis, "deep_baseline_counts_long.csv.gz"
+deseq_res_counts_gr_corrected <- synPluck(
+  syn_analysis, "cdk7_deseq_res_counts_gr_corrected_long.csv"
 ) %>%
   syn() %>%
+  read_csv()
+
+counts_baseline <- syn("syn60530854") %>%
   read_csv() %>%
   mutate(
     cell_line = str_replace_all(cell_line, fixed("-"), "")
   )
 
+deep_baseline_varstab_zscores <- syn("syn68500190") %>%
+  read_csv()
+
+deep_baseline_varstab_differences<- syn("syn68509714") %>%
+  read_csv()
+
+gr_raw <- syn("syn52242760") %>%
+  read_csv() %>%
+  mutate(neglog_GR50 = -log10(GR50))
+
 ```
-
-
 
 Comparing gene expression of each cell line compared to the grand
 mean of all cell lines at baseline (DMSO)
@@ -60,14 +104,6 @@ mean of all cell lines at baseline (DMSO)
 Because there are big batch effects between cell lines (evidenced)
 by the PCA plots, only use the 2019_08 experiment here. That way
 we also only have 24h time point instead of 24h and 48h.
-
-
-```{r read_gr_metrics}
-gr_raw <- syn("syn52242760") %>%
-  read_csv() %>%
-  mutate(neglog_GR50 = -log10(GR50))
-
-```
 
 
 ```{r}
@@ -135,11 +171,15 @@ better_contrast <- function(
 }
 ```
 
+## Correlation DGE baseline
+
 Correlate GR50 vs log2FC of each cell line compared to the grand
 mean. Hopefully we're able to identify some genes that are correlated
 
 ```{r}
-baseline_lfc_mat <- de_baseline_res %>%
+library(IHW)
+
+baseline_lfc_mat <- deseq_res_baseline %>%
   select(cell_line, ensembl_gene_id, log2FoldChange) %>%
   pivot_wider(names_from = cell_line, values_from = log2FoldChange, values_fill = 0) %>%
   column_to_rownames("ensembl_gene_id") %>%
@@ -163,6 +203,8 @@ baseline_lfc_mat_overlap <- baseline_lfc_mat[
 ]
 
 compute_correlation <- function(gr_mat, lfc_mat, ...) {
+  mean_expr <- rowMeans(lfc_mat, na.rm = TRUE) %>%
+    enframe(name = "ensembl_gene_id", value = "mean")
   raw_cor <- psych::corr.test(
     t(lfc_mat),
     t(gr_mat),
@@ -183,6 +225,15 @@ compute_correlation <- function(gr_mat, lfc_mat, ...) {
       left_join,
       by = c("ensembl_gene_id", "gr_metric")
     ) %>%
+    power_inner_join(
+      mean_expr,
+      by = "ensembl_gene_id",
+      check = check_specs(
+        unmatched_keys_right = "warn",
+        unmatched_keys_left = "warn",
+        duplicate_keys_right = "warn"
+      )
+    ) %>%
     # left_join(
     #   ensembl_gtf %>%
     #     select(ensembl_gene_id, hgnc_symbol, gene_name),
@@ -192,7 +243,13 @@ compute_correlation <- function(gr_mat, lfc_mat, ...) {
     mutate(
       p.adj = p.adjust(
         p, method = "BH"
-      )
+      ),
+      p.adj_ihw = ihw(
+        p,
+        mean,
+        alpha = 0.05
+      ) %>%
+        adj_pvalues()
     ) %>%
     ungroup()
   cor_df
@@ -389,7 +446,7 @@ deep_baseline_cell_line_overlap <- intersect(
 
 deep_baseline_eligible_genes <- counts_baseline %>%
   filter(
-    type == "raw",
+    type == "normalized",
     cell_line %in% deep_baseline_cell_line_overlap
   ) %>%
   group_by(ensembl_gene_id) %>%
@@ -397,7 +454,17 @@ deep_baseline_eligible_genes <- counts_baseline %>%
     n_above_10 = sum(count > 10), .groups = "drop"
   ) %>%
   filter(n_above_10 > 5) %>%
-  pull(ensembl_gene_id)
+  pull(ensembl_gene_id) %>%
+  unique()
+
+counts_baseline_ranks <- counts_baseline %>%
+  group_by(
+    type, ensembl_gene_id, hgnc_symbol, gene_name
+  ) %>%
+  mutate(
+    count_rank = rank(count)
+  ) %>%
+  ungroup()
 
 baseline_deep_varstab_mat <- counts_baseline %>%
   filter(
@@ -417,7 +484,7 @@ baseline_deep_varstab_cor_df <- compute_correlation(
   gr_mats_ordered,
   baseline_deep_varstab_mat,
   # log10(baseline_deep_varstab_mat + .5 * min(baseline_deep_varstab_mat[baseline_deep_varstab_mat > 0])),
-  method = "pearson"
+  method = "spearman"
 ) %>%
   left_join(
     counts_baseline %>%
@@ -460,11 +527,11 @@ p <- baseline_deep_varstab_cor_df %>%
 baseline_deep_varstab_cor_df_top_10_data <- baseline_deep_varstab_cor_df %>%
   arrange(p) %>%
   group_by(gr_metric) %>%
-  slice_head(n = 10) %>%
+  slice_head(n = 12) %>%
   ungroup() %>%
   left_join(
-    counts_baseline %>%
-      filter(type == "normalized", cell_line %in% deep_baseline_cell_line_overlap),
+    counts_baseline_ranks %>%
+      filter(type == "varstab", cell_line %in% deep_baseline_cell_line_overlap),
     by = c("ensembl_gene_id", "hgnc_symbol", "gene_name")
   ) %>%
   powerjoin::power_left_join(
@@ -483,19 +550,28 @@ ps <- baseline_deep_varstab_cor_df_top_10_data %>%
     p = list(
       ggplot(
         data %>%
-          mutate(count = count + .5 * min(count[count > 0])),
-        aes(count, gr_value, color = cell_line)
+          arrange(p) %>%
+          mutate(across(gene_name, fct_inorder)),
+        aes(count_rank, gr_value, color = cell_line)
       ) +
         geom_point() +
         geom_smooth(color = "black", method = "lm") +
+        geom_text(
+          aes(
+            label = paste0("r = ", signif(r, 2), " p = ", signif(p, 2))
+          ),
+          data = \(x) distinct(x, gene_name, r, p),
+          x = -Inf, y = Inf, hjust = 0, vjust = 1,
+          inherit.aes = FALSE
+        ) +
         facet_wrap(~gene_name, scales = "free") +
         labs(
           y = gr_metric,
-          x = "Variance stabilized count",
+          x = "Variance stabilized count rank",
           title = gr_metric
         ) +
-        scale_x_log10() +
-        theme_linedraw()
+        theme_bw() +
+        theme(strip.background = element_blank())
     )
   )
 
@@ -503,7 +579,48 @@ pwalk(
   ps,
   \(gr_metric, p, ...) {
     ggsave(
-      file.path("plots_cdk7", paste0("deep_baseline_vs_gr_top10_correlated_", gr_metric, ".pdf")),
+      file.path("plots_cdk7", paste0("deep_baseline_vs_gr_top10_spearman_correlated_ranks_", gr_metric, ".pdf")),
+      p, width = 12, height = 8
+    )
+  }
+)
+
+
+ps <- baseline_deep_varstab_cor_df_top_10_data %>%
+  group_nest(gr_metric) %>%
+  rowwise() %>%
+  mutate(
+    p = list(
+      ggplot(
+        data,
+        aes(count, gr_value, color = cell_line)
+      ) +
+        geom_point() +
+        geom_smooth(color = "black", method = "lm") +
+        geom_text(
+          aes(
+            label = paste0("r = ", signif(r, 2), " p = ", signif(p, 2))
+          ),
+          data = \(x) distinct(x, gene_name, r, p),
+          x = -Inf, y = Inf, hjust = 0, vjust = 1,
+          inherit.aes = FALSE
+        ) +
+        facet_wrap(~gene_name, scales = "free") +
+        labs(
+          y = gr_metric,
+          x = "Variance stabilized count",
+          title = gr_metric
+        ) +
+        theme_bw() +
+        theme(strip.background = element_blank())
+    )
+  )
+
+pwalk(
+  ps,
+  \(gr_metric, p, ...) {
+    ggsave(
+      file.path("plots_cdk7", paste0("deep_baseline_vs_gr_top10_spearman_correlated_", gr_metric, ".pdf")),
       p, width = 12, height = 8
     )
   }
@@ -518,19 +635,31 @@ library(msigdbr)
 all_gene_sets <- msigdbr(species = "Homo sapiens")
 selected_gene_sets <- all_gene_sets %>%
   filter(
-    gs_cat == "H" | (
-      gs_subcat == "CP:KEGG"
-    ) | gs_subcat == "CP:REACTOME"
+    gs_collection == "H" | (
+      gs_subcollection == "CP:KEGG"
+    ) | gs_subcollection == "CP:REACTOME"
+  ) %>%
+  separate_wider_delim(
+    gs_name,
+    delim = "_",
+    names = c("gs_db", "gs_name_short"),
+    too_many = "merge",
+    cols_remove = FALSE
+  ) %>%
+  mutate(
+    gs_name_db = paste(
+      str_sub(gs_db, end = 1), gs_name_short, sep = "_"
+    )
   )
 
 selected_gene_sets_gr <- selected_gene_sets %>%
-  group_nest(gs_cat, gs_subcat, gs_name) %>%
+  group_nest(gs_collection, gs_subcollection, gs_name, gs_name_db, gs_db) %>%
   mutate(
     gs = map(
       data,
       \(x) unique(x$ensembl_gene)
     ) %>%
-      set_names(gs_name)
+      set_names(gs_name_db)
   )
 
 selected_des <- baseline_deep_varstab_cor_df %>%
@@ -565,17 +694,19 @@ fgsea_res_raw <- selected_des %>%
     )
   )
 
-fgsea_res_p_long <- fgsea_res_raw %>%
-  select(gr_metric, res_p) %>%
-  unnest(res_p) %>%
+fgsea_res_long <- fgsea_res_raw %>%
+  select(gr_metric, res) %>%
+  unnest(res) %>%
   mutate(
     signed_p = -sign(NES) * log10(padj),
     p_cut = cut(padj, breaks = c(-Inf, 0.01, 0.05, Inf), labels = c("**", "*", ""))
-  ) %>%
+  )
+
+fgsea_res_long_selected <- fgsea_res_long %>%
   filter(
     pathway %in% {
       group_by(., pathway) %>%
-        summarize(n_sig = sum(padj < 0.05)) %>%
+        summarize(n_sig = sum(padj < 0.01)) %>%
         filter(n_sig > 0) %>%
         pull(pathway)
     }
@@ -587,7 +718,7 @@ fgsea_res_p_long <- fgsea_res_raw %>%
   ) %>%
   select(
     gr_metric, pathway,
-    pval, padj, ES, NES, size_leading_edge, size,
+    pval, padj, p_cut, ES, NES, size_leading_edge, size,
     leadingEdge
   )
 
@@ -607,8 +738,8 @@ better_contrast <- function(
     if_else(colors2[2], colors2[1])
 }
 
-ps <- fgsea_res_p_long %>%
-  filter(padj < .1) %>%
+ps <- fgsea_res_long_selected %>%
+  filter(padj < .05) %>%
   group_nest(
     gr_metric
   ) %>%
@@ -619,47 +750,98 @@ ps <- fgsea_res_p_long %>%
         data %>%
           arrange(NES) %>%
           mutate(
-            pathway = fct_inorder(pathway)
+            pathway = fct_inorder(str_trunc(pathway, 45))
+          ) %>%
+          mutate(
+            direction = if_else(NES > 0, "positive", "negative")
           ),
         aes(NES, pathway, fill = p_cut)
       ) +
         geom_col() +
-        geom_text(
-          aes(
-            x = x_pos,
-            y = pathway,
-            label = pathway,
-            hjust = hjust
-          ),
-          data = \(x) mutate(
-            x,
-            x_pos = if_else(NES > 0, -.1, .1),
-            hjust = if_else(NES > 0, 1, 0)
-          ),
-          inherit.aes = FALSE
-        ) +
+        facet_wrap(~direction, scales = "free") +
+        # geom_text(
+        #   aes(
+        #     x = x_pos,
+        #     y = pathway,
+        #     label = pathway,
+        #     hjust = hjust
+        #   ),
+        #   data = \(x) mutate(
+        #     x,
+        #     x_pos = if_else(NES > 0, -.1, .1),
+        #     hjust = if_else(NES > 0, 1, 0)
+        #   ),
+        #   inherit.aes = FALSE
+        # ) +
         scale_fill_viridis_d(direction = -1) +
         labs(
           x = "Normalized Enrichment Score",
           y = NULL,
-          title = gr_metric
-        ) +
-        theme(
-          axis.text.y = element_blank()
+          title = gr_metric,
+          fill = "P-value"
         )
     )
   )
 
 pwalk(
   ps,
-  \(gr_metric, p, ...) {
+  \(gr_metric, p, data, ...) {
     ggsave(
       file.path("plots_cdk7", paste0("fgsea_bars_baseline_deep_", gr_metric, ".pdf")),
-      p, width = 8, height = 12
+      p, width = 16, height = 10
     )
   }
 )
 ```
+
+
+```{r}
+library(indra.gsea)
+
+baseline_deep_varstab_cor_df_indra_input <- baseline_deep_varstab_cor_df %>%
+  mutate(
+    direction = if_else(r > 0, "positive", "negative")
+  ) %>%
+  arrange(p) %>%
+  filter(p < 0.05) %>%
+  group_by(
+    gr_metric, direction
+  ) %>%
+  slice_head(n = 100) %>%
+  ungroup()
+
+baseline_deep_varstab_cor_df_indra_res <- baseline_deep_varstab_cor_df_indra_input %>%
+  group_by(gr_metric, direction) %>%
+  summarize(
+    res = list(
+      indra_discrete_gsea(
+        hgnc_symbol
+      )
+    ),
+    .groups = "drop"
+  )
+baseline_deep_varstab_cor_df_indra_res$res[[5]]$`indra-downstream` %>%
+  select(name, mlq, p, q)
+baseline_deep_varstab_cor_df_indra_res$res[[5]]$`indra-upstream` %>%
+  select(name, mlq, p, q)
+
+baseline_deep_varstab_cor_df_indra_res$res[[6]]$`indra-downstream` %>%
+  select(name, mlq, p, q)
+baseline_deep_varstab_cor_df_indra_res$res[[6]]$`indra-upstream` %>%
+  select(name, mlq, p, q)
+
+baseline_deep_varstab_cor_df_indra_res$res[[7]]$`indra-downstream` %>%
+  select(name, mlq, p, q)
+baseline_deep_varstab_cor_df_indra_res$res[[7]]$`indra-upstream` %>%
+  select(name, mlq, p, q)
+
+baseline_deep_varstab_cor_df_indra_res$res[[8]]$`indra-downstream` %>%
+  select(name, mlq, p, q)
+baseline_deep_varstab_cor_df_indra_res$res[[8]]$`indra-upstream` %>%
+  select(name, mlq, p, q)
+```
+
+
 
 ```{r}
 
@@ -727,6 +909,157 @@ p <- fgsea_res_p_long %>%
 
 ```
 
+
+### Deep count z-scores vs GR
+
+```{r}
+
+deep_baseline_nonzero_genes <- counts_baseline %>%
+  filter(type == "normalized", count >= 10) %>%
+  count(ensembl_gene_id) %>%
+  filter(n >= 3)
+
+
+deep_baseline_zscores_vs_gr <- bind_rows(
+  varstab_differences = deep_baseline_varstab_differences,
+  zscores = deep_baseline_varstab_zscores,
+  varstab = counts_baseline %>%
+    filter(type == "varstab") %>%
+    select(ensembl_gene_id, sample_id, count) %>%
+    pivot_wider(
+      names_from = sample_id,
+      values_from = count,
+      values_fill = 0
+    ),
+  .id = "metric"
+) %>%
+  semi_join(
+    deep_baseline_nonzero_genes,
+    by = "ensembl_gene_id"
+  ) %>%
+  pivot_longer(
+    -c(metric, ensembl_gene_id),
+    names_to = "sample_id",
+    values_to = "z_score"
+  ) %>%
+  power_inner_join(
+    deep_meta %>%
+      select(sample_id, cell_line),
+    by = "sample_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  power_inner_join(
+    gr_long,
+    by = c("cell_line"),
+    check = check_specs(
+      unmatched_keys_left = "info",
+      unmatched_keys_right = "info"
+    )
+  )
+
+deep_zscores_vs_gr_glmnet_raw <- deep_baseline_zscores_vs_gr %>%
+  group_by(gr_metric, metric) %>%
+  summarize(
+    res = {
+      mat <- pivot_wider(
+        pick(cell_line, ensembl_gene_id, z_score, gr_value),
+        names_from = ensembl_gene_id,
+        values_from = z_score
+      ) %>%
+        column_to_rownames("cell_line") %>%
+        as.matrix()
+      # browser()
+      glmnet::cv.glmnet(
+        x = mat[, colnames(mat) != "gr_value"],
+        y = mat[, "gr_value"],
+        alpha = 0.5, # Elastic net mixing parameter
+        nfolds = 10,
+        standardize = TRUE,
+        intercept = TRUE,
+        family = "gaussian"
+      ) %>%
+        list()
+    },
+    .groups = "drop"
+  )
+
+deep_zscores_vs_gr_glmnet_coefs <- deep_zscores_vs_gr_glmnet_raw %>%
+  mutate(
+    res = map(
+      res,
+      \(x) {
+        coef(x, s = "lambda.min") %>%
+          as.matrix() %>%
+          as_tibble(rownames = "ensembl_gene_id") %>%
+          filter(ensembl_gene_id != "(Intercept)", s0 != 0)
+      }
+    )
+  ) %>%
+  unnest(res) %>%
+  power_inner_join(
+    ensembl_gtf %>%
+      distinct(ensembl_gene_id, gene_name),
+    by = "ensembl_gene_id",
+    check = check_specs(
+      duplicate_keys_right = "warn",
+      unmatched_keys_left = "warn"
+    )
+  )
+
+ps <- deep_baseline_zscores_vs_gr %>%
+  power_inner_join(
+    deep_zscores_vs_gr_glmnet_coefs,
+    by = c("gr_metric", "metric", "ensembl_gene_id"),
+    check = check_specs(
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  group_by(
+    gr_metric, metric
+  ) %>%
+  summarize(
+    p = list(
+      ggplot(
+        pick(everything()),
+        aes(
+          x = z_score, y = gr_value
+        )
+      ) +
+      geom_point() +
+      facet_wrap(vars(gene_name)) +
+      theme_bw() +
+      labs(
+        title = paste(cur_group()$gr_metric, cur_group()$metric, sep = " - "),
+      )
+    ),
+    .groups = "drop"
+  )
+ps$p
+
+```
+
+### Simple correlation
+
+```{r}
+deep_baseline_zscores_vs_gr_cor_raw <- deep_baseline_zscores_vs_gr %>%
+  group_by(gr_metric, metric, ensembl_gene_id) %>%
+  summarize(
+    res = list(
+      cor.test(
+        deep_baseline_zscores_vs_gr$z_score,
+        deep_baseline_zscores_vs_gr$gr_value
+      )
+    ),
+    .groups = "drop"
+  )
+
+```
+
+
 ## Correlation YKL differential expression with GR metrics
 
 Both GR corrected and uncorrected
@@ -756,6 +1089,17 @@ deseq_res_gr_long <- deseq_res_gr %>%
   ) |>
   pivot_wider(
     names_from = metric, values_from = value
+  ) %>%
+  bind_rows(
+    deseq_res_counts_gr_corrected %>%
+      filter(
+        agent == "YKL-5-124",
+        experiment == "cdk_467_2019_08",
+        cell_line %in% ykl_cell_lines_to_keep
+      ) %>%
+      mutate(
+        gr_correction = "gr_counts"
+      )
   )
 
 ykl_lfc_mat <- deseq_res_gr_long %>%
@@ -1022,10 +1366,11 @@ ps <- fgsea_res_p_long %>%
 
 pwalk(
   ps,
-  \(gr_metric, p, ...) {
+  \(gr_metric, p, data, ...) {
+    h <- nrow(data) * .2 + 2
     ggsave(
       file.path("plots_cdk7", paste0("fgsea_bars_gr_ykl_cor_", gr_metric, ".pdf")),
-      p, width = 8, height = 12
+      p, width = 8, height = h
     )
   }
 )

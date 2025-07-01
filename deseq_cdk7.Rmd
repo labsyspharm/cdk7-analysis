@@ -954,6 +954,10 @@ synStoreMany(
 
 ## Deep RNA-seq baseline
 
+Also some at /n/files/ImStor/sorger/data/rnaseq/lincs/baseline_phase2
+
+
+
 ```{r}
 deep_counts <- syn("syn60529544") %>%
   read_csv()
@@ -989,8 +993,8 @@ ensembl_gtf_old <- rtracklayer::readGFF(
 
 ```
 
-Can't do DESeq2 because no replicates. Use edgeR with estimated dispersion of .4
-instead. .4 recommended in manual for human samples.
+
+### Count correction
 
 ```{r}
 deep_counts_mat <- deep_counts %>%
@@ -1020,7 +1024,8 @@ deep_counts_corrected <- deep_counts_mat_corrected %>%
     values_to = "count"
   )
 
-deep_counts_varstab <- varianceStabilizingTransformation(deep_counts_mat) %>%
+deep_counts_varstab_mat <- rlogTransformation(deep_counts_mat)
+deep_counts_varstab <- deep_counts_varstab_mat %>%
   as_tibble(rownames = "ensembl_gene_id") %>%
   pivot_longer(
     cols = -ensembl_gene_id,
@@ -1068,7 +1073,63 @@ write_csv(
 #   design = ~0 + cell_line
 # ) %>%
 #   DESeq()
+```
 
+### Naive log2FC
+
+Computing naive log2FC for each cell line compared to the average of all other
+using the rlog transformed counts.
+
+```{r}
+deep_counts_varstab_means <- rowMeans(deep_counts_varstab_mat)
+deep_counts_varstab_differences <- apply(
+  deep_counts_varstab_mat,
+  2,
+  \(x) x - deep_counts_varstab_means
+) %>%
+  as_tibble(rownames = "ensembl_gene_id")
+
+deep_counts_varstab_zscores <- t(scale(t(deep_counts_varstab_mat))) %>%
+  as_tibble(rownames = "ensembl_gene_id")
+deep_counts_varstab_mad <- apply(
+  deep_counts_varstab_mat,
+  1,
+  mad
+) %>%
+  enframe("ensembl_gene_id", "mad")
+
+write_csv(
+  deep_counts_varstab_zscores,
+  file.path("deseq", "deep_baseline_varstab_zscores.csv.gz")
+)
+write_csv(
+  deep_counts_varstab_mad,
+  file.path("deseq", "deep_baseline_varstab_mad.csv.gz")
+)
+write_csv(
+  deep_counts_varstab_differences,
+  file.path("deseq", "deep_baseline_varstab_differences.csv.gz")
+)
+
+deep_counts_mat_corrected_means <- rowMeans(deep_counts_mat_corrected)
+deep_counts_naive_log2fc <- apply(
+  deep_counts_mat_corrected, 2,
+  \(x) log2(x / deep_counts_mat_corrected_means)
+) %>%
+  as_tibble(rownames = "ensembl_gene_id")
+
+write_csv(
+  deep_counts_naive_log2fc,
+  file.path("deseq", "deep_baseline_naive_log2fc.csv.gz")
+)
+```
+
+### EdgeR
+
+Can't do DESeq2 because no replicates. Use edgeR with estimated dispersion of .4
+instead. .4 recommended in manual for human samples.
+
+```{r}
 library(edgeR)
 deep_dge_list <- DGEList(
   counts = deep_counts_mat[, deep_meta$sample_id],
@@ -1191,9 +1252,13 @@ p <- deep_results_long %>%
 ```{r}
 synStoreMany(
   c(
-    file.path("deseq", "deep_baseline_counts_long.csv.gz")
+    file.path("deseq", "deep_baseline_counts_long.csv.gz"),
+    file.path("deseq", "deep_baseline_varstab_zscores.csv.gz"),
+    file.path("deseq", "deep_baseline_varstab_mad.csv.gz"),
+    file.path("deseq", "deep_baseline_naive_log2fc.csv.gz"),
+    file.path("deseq", "deep_baseline_varstab_differences.csv.gz")
   ),
-  parentId = "syn59470136",
+  parentId = "syn68500169",
   forceVersion = FALSE
 )
 

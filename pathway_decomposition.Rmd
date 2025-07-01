@@ -28,6 +28,13 @@ dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
 
 
 ```{r}
+deep_meta <- syn("syn60529546") %>%
+  readxl::read_excel() %>%
+  mutate(
+    sample_id = paste0("S", Sample)
+  ) %>%
+  dplyr::rename(cell_line = `Cell line`)
+
 ensembl_gtf <- rtracklayer::import("Homo_sapiens.GRCh38.109.gtf.gz") %>%
   as_tibble()
 
@@ -46,6 +53,18 @@ deseq_dge_baseline_res <- syn("syn60527359") %>%
   mutate(
     across(cell_line, \(x) str_replace_all(x, fixed("-"), ""))
   )
+
+deep_baseline_zscores <- syn("syn68500190") %>%
+  read_csv()
+
+deep_baseline_mad <- syn("syn68500191") %>%
+  read_csv()
+
+deep_baseline_naive_log2fc <- syn("syn68500457") %>%
+  read_csv()
+
+deep_baseline_varstab_differences <- syn("syn68509714") %>%
+  read_csv()
 ```
 
 ```{r}
@@ -362,7 +381,7 @@ gr_vs_progeny_glmnet_raw <- gr_vs_progeny_data %>%
   )
 ```
 
-## fgsea DGE baseline
+## fgsea deep baseline
 
 ```{r}
 library(fgsea)
@@ -384,6 +403,251 @@ selected_gene_sets_fgsea <- selected_gene_sets %>%
     ) %>%
       set_names(gs_name)
   )
+```
+
+Require at least 10 counts in 3 cell lines
+
+```{r}
+deep_baseline_nonzero_genes <- deep_baseline_counts_long %>%
+  filter(type == "normalized", count >= 10) %>%
+  count(ensembl_gene_id) %>%
+  filter(n >= 3)
+
+deep_baseline_nonzero_mad <- deep_baseline_mad %>%
+  semi_join(
+    deep_baseline_nonzero_genes
+  )
+
+deep_baseline_fgsea_inputs <- crossing(
+  method = c("zscore", "log2fc", "varstab_difference"),
+  filter = c("none", "mad25", "mad50")
+) %>%
+  mutate(
+    gs = map2(
+      method, filter,
+      \(x, y) {
+        eligible_genes <- if (y == "none") {
+          deep_baseline_nonzero_mad$ensembl_gene_id
+        } else {
+          thresh <- as.numeric(str_extract(y, "\\d+"))
+          deep_baseline_nonzero_mad %>%
+            filter(
+              mad >= quantile(mad, 1 - thresh / 100)
+            ) %>%
+            pull(ensembl_gene_id)
+        }
+        score_df <- if (x == "zscore") {
+          deep_baseline_zscores
+        } else if (x == "log2fc") {
+          deep_baseline_naive_log2fc %>%
+            # Replace -Inf
+            mutate(
+              min_log2fc = c_across(-ensembl_gene_id) %>%
+                {min(.[is.finite(.)], na.rm = TRUE)},
+              across(
+                -ensembl_gene_id,
+                \(x) ifelse(
+                  is.infinite(x) & x < 0,
+                  min_log2fc - 1,
+                  x
+                )
+              )
+            ) %>%
+            select(-min_log2fc)
+        } else if (x == "varstab_difference") {
+          deep_baseline_varstab_differences
+        } else {
+          stop("Unknown method")
+        }
+        score_df %>%
+          filter(
+            ensembl_gene_id %in% eligible_genes
+          ) %>%
+          pivot_longer(
+            cols = -ensembl_gene_id,
+            names_to = "sample_id",
+            values_to = "score"
+          ) %>%
+          power_inner_join(
+            deep_meta %>%
+              select(sample_id, cell_line),
+            by = "sample_id",
+            check = check_specs(
+              unmatched_keys_left = "warn",
+              unmatched_keys_right = "warn",
+              duplicate_keys_right = "warn"
+            )
+          ) %>%
+          group_nest(cell_line) %>%
+          mutate(
+            de = map(
+              data,
+              \(x) set_names(x$score, x$ensembl_gene_id)
+            )
+          ) %>%
+          select(cell_line, de)
+      }
+    )
+  ) %>%
+  unnest(gs)
+```
+
+```{r}
+deep_baseline_fgsea_res_raw <- deep_baseline_fgsea_inputs %>%
+  mutate(
+    res = map(
+      de,
+      \(x) fgseaMultilevel(
+        selected_gene_sets_fgsea$gs,
+        x
+      )
+    )
+  )
+
+
+deep_baseline_fgsea_res <- deep_baseline_fgsea_res_raw %>%
+  select(-de) %>%
+  unnest(res) %>%
+  mutate(
+    signed_padj = -sign(NES) * log10(padj),
+    across(
+      cell_line,
+      \(x) str_replace_all(x, fixed("-"), "")
+    )
+  )
+```
+
+```{r}
+deep_baseline_fgsea_res %>%
+  filter(padj < 0.05) %>%
+  count(method, filter, cell_line) %>%
+  View()
+
+deep_baseline_fgsea_res %>%
+  filter(padj < 0.05) %>%
+  count(method, filter, cell_line) %>%
+  group_by(method, filter) %>%
+  summarize(
+    mean_n = mean(n),
+    .groups = "drop"
+  )
+```
+
+
+Check zscore result vs vastab difference result
+
+```{r}
+deep_baseline_fgsea_res_zscore_vs_varstab <- deep_baseline_fgsea_res %>%
+  filter(
+    method %in% c("zscore", "varstab_difference"),
+    filter == "none"
+  ) %>%
+  select(-leadingEdge) %>%
+  pivot_wider(
+    names_from = method,
+    values_from = where(is.numeric)
+  )
+
+p <- ggplot(
+  deep_baseline_fgsea_res_zscore_vs_varstab,
+  aes(x = signed_padj_zscore, y = signed_padj_varstab_difference)
+) +
+  geom_point() +
+  facet_wrap(vars(cell_line)) +
+  theme_minimal()
+p
+```
+
+### glmnet
+
+```{r}
+gr_vs_deep_zscore_fgsea <- deep_baseline_fgsea_res %>%
+  filter(method == "zscore", filter == "none") %>%
+  power_inner_join(
+    gr_long,
+    by = c("cell_line"),
+    check = check_specs(
+      unmatched_keys_left = "info",
+      unmatched_keys_right = "info"
+    )
+  )
+
+gr_vs_deep_zscore_fgsea_sign <- gr_vs_deep_zscore_fgsea %>%
+  semi_join(
+    deep_baseline_fgsea_res %>%
+      filter(method == "zscore", filter == "none") %>%
+      group_by(pathway) %>%
+      filter(
+        any(padj < 0.05)
+      ) %>%
+      ungroup(),
+    by = "pathway"
+  )
+
+gr_vs_gsva_glmnet_raw <- gr_vs_deep_zscore_fgsea_sign %>%
+  group_by(gr_metric) %>%
+  summarize(
+    res = {
+      mat <- pivot_wider(
+        pick(cell_line, pathway, signed_padj, gr_value) %>%
+          mutate(across(signed_padj, \(x) replace_na(x, 0))),
+        names_from = pathway,
+        values_from = signed_padj
+      ) %>%
+        column_to_rownames("cell_line") %>%
+        as.matrix()
+      # browser()
+      glmnet::cv.glmnet(
+        x = mat[, colnames(mat) != "gr_value"],
+        y = mat[, "gr_value"],
+        alpha = 0.5, # Elastic net mixing parameter
+        nfolds = 10,
+        standardize = TRUE,
+        intercept = TRUE,
+        family = "gaussian"
+      ) %>%
+        list()
+    },
+    .groups = "drop"
+  )
+
+gr_vs_gsva_glmnet_coefs <- gr_vs_gsva_glmnet_raw %>%
+  mutate(
+    coefs = map(
+      res,
+      \(x) {
+        coef(x, s = "lambda.min") %>%
+          as.matrix() %>%
+          as_tibble(rownames = "pathway") %>%
+          filter(pathway != "(Intercept)", s0 > 0)
+      }
+    )
+  )
+
+p <- ggplot(
+  gsva_res_vs_gr %>%
+    filter(gr_metric == "neglog_GR50") %>%
+    power_inner_join(
+      gr_vs_gsva_glmnet_coefs$coefs[[4]],
+      by = "pathway",
+      check = check_specs(
+        unmatched_keys_right = "warn"
+      )
+    ),
+  aes(
+    x = activity, y = gr_value
+  )
+) +
+  geom_point() +
+  facet_wrap(~pathway, scales = "free")
+p
+```
+
+
+
+## fgsea DGE baseline
+
+```{r}
 
 selected_des <- deseq_dge_baseline_res %>%
   mutate(
