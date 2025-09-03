@@ -92,9 +92,12 @@ deep_baseline_varstab_zscores <- syn("syn68500190") %>%
 deep_baseline_varstab_differences<- syn("syn68509714") %>%
   read_csv()
 
-gr_raw <- syn("syn52242760") %>%
+gr_raw <- syn("syn68499802") %>%
   read_csv() %>%
-  mutate(neglog_GR50 = -log10(GR50))
+  mutate(neglog_GR50 = -log10(GR50)) %>%
+  select(
+    cell_line, agent, GR50, GRmax, GR_AOC, neglog_GR50
+  )
 
 ```
 
@@ -403,45 +406,49 @@ baseline_lfc_cor_highest <- baseline_lfc_cor_df %>%
 
 ## Baseline deep counts
 
-
 ```{r}
 
-
 gr_long <- gr_raw %>%
+  filter(agent != "Staurosporine") %>%
   mutate(
     cell_line = str_replace_all(cell_line, fixed("-"), "")
   ) %>%
-  select(cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
+  select(agent, cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
   pivot_longer(
-    cols = -cell_line,
+    cols = -c(cell_line, agent),
     names_to = "gr_metric",
     values_to = "gr_value"
   )
 
 gr_mats <- gr_raw %>%
+  filter(agent != "Staurosporine") %>%
   mutate(
     cell_line = str_replace_all(cell_line, fixed("-"), "")
   ) %>%
-  select(cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
-  column_to_rownames("cell_line") %>%
-  as.matrix() %>%
-  t()
+  split(.$agent) %>%
+  map(
+    \(x) select(x, cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
+      column_to_rownames("cell_line") %>%
+      as.matrix() %>%
+      t()
+  )
+
 
 intersect(
   counts_baseline$cell_line,
-  colnames(gr_mats)
+  colnames(gr_mats[[1]])
 )
 setdiff(
   counts_baseline$cell_line,
-  colnames(gr_mats)
+  colnames(gr_mats[[1]])
 )
 setdiff(
-  colnames(gr_mats),
+  colnames(gr_mats[[1]]),
   counts_baseline$cell_line
 )
 deep_baseline_cell_line_overlap <- intersect(
   counts_baseline$cell_line,
-  colnames(gr_mats)
+  colnames(gr_mats[[1]])
 )
 
 deep_baseline_eligible_genes <- counts_baseline %>%
@@ -478,19 +485,24 @@ baseline_deep_varstab_mat <- counts_baseline %>%
   as.matrix() %>%
   {.[, deep_baseline_cell_line_overlap]}
 
-gr_mats_ordered <- gr_mats[, deep_baseline_cell_line_overlap]
+gr_mats_ordered <- map(gr_mats, \(x) x[, deep_baseline_cell_line_overlap])
 
-baseline_deep_varstab_cor_df <- compute_correlation(
+baseline_deep_varstab_cor_df <- map(
   gr_mats_ordered,
-  baseline_deep_varstab_mat,
-  # log10(baseline_deep_varstab_mat + .5 * min(baseline_deep_varstab_mat[baseline_deep_varstab_mat > 0])),
-  method = "spearman"
+  \(x) compute_correlation(
+    x,
+    baseline_deep_varstab_mat,
+    # log10(baseline_deep_varstab_mat + .5 * min(baseline_deep_varstab_mat[baseline_deep_varstab_mat > 0])),
+    method = "spearman"
+  ) %>%
+    left_join(
+      counts_baseline %>%
+        distinct(ensembl_gene_id, hgnc_symbol, gene_name),
+      by = "ensembl_gene_id"
+    )
 ) %>%
-  left_join(
-    counts_baseline %>%
-      distinct(ensembl_gene_id, hgnc_symbol, gene_name),
-    by = "ensembl_gene_id"
-  )
+  bind_rows(.id = "agent")
+
 ```
 
 ```{r}
@@ -522,21 +534,49 @@ p <- baseline_deep_varstab_cor_df %>%
   )
 ```
 
+```{r}
+compound_meta <- tribble(
+  ~agent, ~target, ~cdk_target, ~inhibition_mode_full,
+  "Adavosertib", "Wee1", "CDK1", "ATP-competitive",
+  "AZD5363", "ATK1/2/3", "CDK4/6", "ATP-competitive",
+  "BAY1895344", "ATR", "CDK1/2", "ATP-competitive",
+  "CT7001", "CDK7", "CDK7", "ATP-competitive",
+  "JQ1", "BRD4", "none", "Acetyl-lysine competitive",
+  "JWZ", "CDK7", "CDK7", "PROTAC degrader",
+  "LDC4297", "CDK7", "CDK7", "ATP-competitive",
+  "LY3405105", "CDK7", "CDK7", "Covalent",
+  "Olaparib", "PARP", "none", "Competitive",
+  "Prexasertib", "CHK1", "CDK1", "ATP-competitive",
+  "RP-6306", "Wee1", "CDK1", "ATP-competitive",
+  "SY-5609", "CDK7", "CDK7", "ATP-competitive",
+  "YKL-5-124", "CDK7", "CDK7", "Covalent",
+) %>%
+  mutate(
+    inhibition_mode = case_when(
+      grepl("competitive", inhibition_mode_full, ignore.case = TRUE) ~ "Competitive",
+      grepl("Covalent", inhibition_mode_full) ~ "Covalent",
+      grepl("degrader", inhibition_mode_full) ~ "Degrader",
+      TRUE ~ "Other"
+    )
+  )
+
+```
 
 ```{r}
 baseline_deep_varstab_cor_df_top_10_data <- baseline_deep_varstab_cor_df %>%
   arrange(p) %>%
-  group_by(gr_metric) %>%
+  group_by(agent, gr_metric) %>%
   slice_head(n = 12) %>%
   ungroup() %>%
   left_join(
     counts_baseline_ranks %>%
       filter(type == "varstab", cell_line %in% deep_baseline_cell_line_overlap),
-    by = c("ensembl_gene_id", "hgnc_symbol", "gene_name")
+    by = c("ensembl_gene_id", "hgnc_symbol", "gene_name"),
+    relationship = "many-to-many"
   ) %>%
   powerjoin::power_left_join(
     gr_long,
-    by = c("cell_line", "gr_metric"),
+    by = c("agent", "cell_line", "gr_metric"),
     check = powerjoin::check_specs(
       unmatched_keys_left = "warn",
       duplicate_keys_right = "warn"
@@ -544,7 +584,7 @@ baseline_deep_varstab_cor_df_top_10_data <- baseline_deep_varstab_cor_df %>%
   )
 
 ps <- baseline_deep_varstab_cor_df_top_10_data %>%
-  group_nest(gr_metric) %>%
+  group_nest(agent, gr_metric) %>%
   rowwise() %>%
   mutate(
     p = list(
@@ -577,9 +617,9 @@ ps <- baseline_deep_varstab_cor_df_top_10_data %>%
 
 pwalk(
   ps,
-  \(gr_metric, p, ...) {
+  \(gr_metric, p, agent, ...) {
     ggsave(
-      file.path("plots_cdk7", paste0("deep_baseline_vs_gr_top10_spearman_correlated_ranks_", gr_metric, ".pdf")),
+      file.path("plots_cdk7", paste0("deep_baseline_vs_gr_top10_spearman_correlated_ranks_", agent, "_", gr_metric, ".pdf")),
       p, width = 12, height = 8
     )
   }
@@ -628,6 +668,157 @@ pwalk(
 ```
 
 
+
+
+```{r}
+library(ComplexHeatmap)
+library(seriation)
+
+createAnnotation <- function(df, colors = list(), which = "column") {
+  # Load necessary libraries
+  color_maps <- list()
+
+  # Iterate over each column in the dataframe
+  for (col_name in names(df)) {
+    # Check if the column is numeric
+    if (is.numeric(df[[col_name]])) {
+      # Create a color mapping function for numeric columns
+      if (is.null(colors[[col_name]]))
+        colors[[col_name]] <- c("white", "red")
+      if (is.function(colors[[col_name]])) {
+        col_fun <- colors[[col_name]]
+      } else if (is.character(colors[[col_name]])) {
+        n <- length(colors[[col_name]])
+        if (n == 1) {
+          col_fun <- circlize::colorRamp2(
+            seq(from = min(df[[col_name]]), to = max(df[[col_name]]), length.out = 100),
+            viridis(100, option = colors[[col_name]])
+          )
+        } else {
+          col_fun <- circlize::colorRamp2(
+            seq(from = min(df[[col_name]]), to = max(df[[col_name]]), length.out = n),
+            colors[[col_name]]
+          )
+        }
+      } else
+        stop("Dont know how to handle colors for column ", col_name)
+      color_maps[[col_name]] <- col_fun
+    } else {
+      if (is.character(colors[[col_name]])) {
+        color_maps[[col_name]] <- colors[[col_name]]
+        next
+      }
+      col_fun <- colors[[col_name]] %||% rainbow
+      # Create a named vector of colors for categorical columns
+      values <- df[[col_name]]
+      unique_values <- if (is.factor(values)) levels(values) else unique(df[[col_name]])
+      named_colors <- setNames(col_fun(length(unique_values)), unique_values)
+      color_maps[[col_name]] <- named_colors
+    }
+  }
+
+  # Combine all annotations
+  combined_annotations <- HeatmapAnnotation(df = df, col = color_maps, which = which)
+
+  return(combined_annotations)
+}
+
+cluster_fun_eucl <- function(mat, features_in_rows = TRUE) {
+  if (!features_in_rows) {
+    mat <- t(mat)
+  }
+  # mat_imp <- impute.knn(
+  #   mat, rng.seed = 42, colmax = 90
+  # )[["data"]]
+  # if (!features_in_rows) {
+  #   mat_imp <- t(mat_imp)
+  #   mat <- t(mat)
+  # }
+  # browser()
+  dist_mat <- dist(mat)
+  # dist_mat <- as.dist(mat)
+  clust <- hclust(dist_mat, method = "complete")
+  reorder(clust, dist_mat, method = "OLO")
+}
+
+baseline_deep_varstab_cor_df_hm_data <- baseline_deep_varstab_cor_df %>%
+  filter(gr_metric != "neglog_GR50") %>%
+  semi_join(
+    group_by(., gr_metric, agent) %>%
+      arrange(abs(r)) %>%
+      slice_tail(n = 30),
+    by = c("gr_metric", "ensembl_gene_id")
+  )
+
+paletteer_shim <- function(palette_name) {
+  \(n) {
+    paletteer::paletteer_d(palette_name)[seq_len(n)]
+  }
+}
+
+baseline_deep_varstab_cor_df_hms <- baseline_deep_varstab_cor_df_hm_data %>%
+  group_nest(gr_metric) %>%
+  mutate(
+    mat = map(
+      data,
+      \(x) select(
+        x, agent, ensembl_gene_id, r
+      ) %>%
+        pivot_wider(values_from = r, names_from = agent) %>%
+        column_to_rownames("ensembl_gene_id") %>%
+        as.matrix()
+    ),
+    hm = pmap(
+      list(mat, gr_metric),
+      \(x, y) {
+        col_fun = circlize::colorRamp2(
+          {
+            qs <- quantile(x, c(.05, .95), na.rm = TRUE)
+            absmax <- max(abs(qs))
+            seq(-absmax, absmax, length.out = 11)
+          },
+          rev(RColorBrewer::brewer.pal(11, "RdBu"))
+        )
+        # browser()
+        col_meta <- compound_meta %>%
+          select(agent, target, cdk_target, inhibition_mode) %>%
+          slice(match(colnames(x), agent)) %>%
+          column_to_rownames("agent")
+        Heatmap(
+          x,
+          name = paste("Correlation", y),
+          col = col_fun,
+          cluster_rows = cluster_fun_eucl,
+          cluster_columns = cluster_fun_eucl,
+          show_row_names = FALSE,
+          bottom_annotation = createAnnotation(
+            col_meta,
+            colors = list(
+              cdk_target = paletteer_shim("rockthemes::californication"),
+              inhibition_mode = \(n) ggokabeito::palette_okabe_ito(seq_len(n))
+            )
+          )
+        )
+      }
+    )
+  )
+
+pwalk(
+  baseline_deep_varstab_cor_df_hms,
+  \(gr_metric, hm, data, ...) {
+    withr::with_pdf(
+      file.path("plots_cdk7", paste0("baseline_deep_varstab_rank_cor_hm_", gr_metric, ".pdf")),
+      {
+        draw(hm)
+      },
+    width = 7, height = 8
+    )
+  }
+)
+```
+
+
+
 ```{r}
 library(fgsea)
 library(msigdbr)
@@ -664,7 +855,7 @@ selected_gene_sets_gr <- selected_gene_sets %>%
 
 selected_des <- baseline_deep_varstab_cor_df %>%
   drop_na(r) %>%
-  group_nest(gr_metric) %>%
+  group_nest(agent, gr_metric) %>%
   mutate(
     de = map(
       data,
@@ -695,7 +886,7 @@ fgsea_res_raw <- selected_des %>%
   )
 
 fgsea_res_long <- fgsea_res_raw %>%
-  select(gr_metric, res) %>%
+  select(agent, gr_metric, res) %>%
   unnest(res) %>%
   mutate(
     signed_p = -sign(NES) * log10(padj),
@@ -718,7 +909,7 @@ fgsea_res_long_selected <- fgsea_res_long %>%
   ) %>%
   select(
     gr_metric, pathway,
-    pval, padj, p_cut, ES, NES, size_leading_edge, size,
+    signed_p, pval, padj, p_cut, ES, NES, size_leading_edge, size,
     leadingEdge
   )
 
@@ -794,6 +985,100 @@ pwalk(
 )
 ```
 
+
+```{r}
+fgsea_res_long_selected_hm_data <- fgsea_res_long %>%
+  semi_join(
+    group_by(., gr_metric, agent) %>%
+      arrange(padj) %>%
+      slice_head(n = 20),
+    by = c("gr_metric", "pathway")
+  ) %>%
+  mutate(
+    size_leading_edge = map_int(
+      leadingEdge, length
+    )
+  ) %>%
+  transmute(
+    agent, gr_metric, pathway,
+    pathway_short = str_trunc(
+      pathway, {
+        # Find minimum length that preserves uniqueness
+        min_length <- 30
+        max_length <- 80
+        unique_pathways <- unique(pathway)
+        for (len in min_length:max_length) {
+          truncated <- str_trunc(unique_pathways, len)
+          if (length(unique(truncated)) == length(unique(unique_pathways))) {
+            break
+          }
+        }
+        len
+      }
+    ),
+    signed_p, pval, padj, p_cut, ES, NES, size_leading_edge, size
+  )
+
+fgsea_res_long_selected_hms <- fgsea_res_long_selected_hm_data %>%
+  group_nest(gr_metric) %>%
+  mutate(
+    mat = map(
+      data,
+      \(x) select(
+        x, agent, pathway_short, signed_p
+      ) %>%
+        pivot_wider(values_from = signed_p, names_from = agent) %>%
+        column_to_rownames("pathway_short") %>%
+        as.matrix()
+    ),
+    hm = pmap(
+      list(mat, gr_metric),
+      \(x, y) {
+        qs <- quantile(x, c(.05, .95), na.rm = TRUE)
+        absmax <- max(abs(qs))
+        col_fun <- circlize::colorRamp2(
+          seq(-absmax, absmax, length.out = 11),
+          rev(RColorBrewer::brewer.pal(11, "RdBu"))
+        )
+        col_meta <- compound_meta %>%
+          select(agent, target, cdk_target, inhibition_mode) %>%
+          slice(match(colnames(x), agent)) %>%
+          column_to_rownames("agent")
+        Heatmap(
+          x,
+          name = paste("NES", y),
+          col = col_fun,
+          cluster_rows = cluster_fun_eucl,
+          cluster_columns = cluster_fun_eucl,
+          show_row_names = TRUE,
+          show_column_names = TRUE,
+          row_names_max_width = max_text_width(
+            rownames(x),
+            gp = gpar(fontsize = 10)
+          ),
+          bottom_annotation = createAnnotation(
+            col_meta,
+            colors = list(
+              cdk_target = paletteer_shim("rockthemes::californication"),
+              inhibition_mode = \(n) ggokabeito::palette_okabe_ito(seq_len(n))
+            )
+          )
+        )
+      }
+    )
+  )
+
+pwalk(
+  fgsea_res_long_selected_hms,
+  \(gr_metric, hm, data, ...) {
+    withr::with_pdf(
+      file.path("plots_cdk7", paste0("baseline_deep_varstab_rank_cor_fgsea_hm_", gr_metric, ".pdf")),
+      draw(hm),
+      width = 10, height = 18
+    )
+  }
+)
+```
 
 ```{r}
 library(indra.gsea)
