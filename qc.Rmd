@@ -12,6 +12,13 @@ library(tidyverse)
 library(data.table)
 library(synExtra)
 library(qs)
+library(powerjoin)
+
+conflicted::conflict_prefer("filter", "dplyr")
+conflicted::conflict_prefer("select", "dplyr")
+conflicted::conflict_prefer("mutate", "dplyr")
+conflicted::conflict_prefer("rename", "dplyr")
+conflicted::conflicts_prefer(base::setdiff)
 
 synapser::synLogin()
 syn <- synDownloader("~/data", .cache = TRUE)
@@ -32,7 +39,9 @@ if (!file.exists(ensembl_gtf_file)) {
   )
 }
 
-ensembl_gtf <- rtracklayer::readGFF(ensembl_gtf_file) %>%
+ensembl_gtf_all <- rtracklayer::readGFF(ensembl_gtf_file)
+
+ensembl_gtf <- ensembl_gtf_all %>%
   filter(gene_biotype == "protein_coding") %>%
   distinct(
     ensembl_gene_id = gene_id,
@@ -116,6 +125,7 @@ raw_counts <- prepare_counts(
   select(-gene_biotype)
 
 ```
+
 ## Count plots
 
 ```{r}
@@ -227,7 +237,7 @@ qsave(
 
 For exploratory analysis (PCA etc), use only genes that are differentially
 expressed in *any* condition. To find these genes, use Likelihood-ratio test (LRT)
-from DESeq2, comparing a model with a single term for every condition (~condition) 
+from DESeq2, comparing a model with a single term for every condition (~condition)
 against an intercept-only null model (~1).
 
 ```{r}
@@ -540,3 +550,230 @@ fwrite(old_samples_de_meta, "deseq/old_samples_de_meta.csv.gz")
 
 ```
 
+
+
+## Acquired resistance deep RNA-seq
+
+```{r}
+
+ensembl_gtf_file_111 <- "Homo_sapiens.GRCh38.111.gtf.gz"
+if (!file.exists(ensembl_gtf_file_111)) {
+  download.file(
+    "ftp://ftp.ensembl.org/pub/release-111/gtf/homo_sapiens/Homo_sapiens.GRCh38.111.gtf.gz",
+    ensembl_gtf_file_111, method = "curl"
+  )
+}
+
+ensembl_gtf_111 <- rtracklayer::readGFF(ensembl_gtf_file_111) %>%
+  filter(type == "gene") %>%
+  distinct(
+    ensembl_gene_id = gene_id,
+    hgnc_symbol = gene_name,
+    gene_biotype
+  ) %>%
+  drop_na(ensembl_gene_id) %>%
+  as_tibble()
+
+
+raw_acquired <- syn("syn68633956") %>%
+  read_csv()
+
+meta_acquired <- syn("syn68633957") %>%
+  read_csv() %>%
+  select(-condition) %>%
+  rename(
+    condition = cell_line
+  ) %>%
+  separate_wider_delim(
+    condition,
+    delim = "_",
+    names = c("cell_line", "treatment"),
+    cols_remove = FALSE
+  ) %>%
+  mutate(
+    batch = str_sub(sample_id, 1, 1),
+    resistant = if_else(
+      str_detect(treatment, ".+r[0-9]") | treatment == "parent",
+      treatment,
+      NA_character_
+    )
+  ) %>%
+  group_by(
+    condition
+  ) %>%
+  mutate(
+    bridge_sample = if (n_distinct(batch) > 1) {
+      condition
+    } else {
+      NA_character_
+    }
+  ) %>%
+  ungroup()
+
+write_csv(
+  meta_acquired,
+  "deseq/meta_acquired.csv.gz"
+)
+```
+
+
+```{r}
+mat_acquired <- raw_acquired %>%
+  column_to_rownames("...1") %>%
+  as.matrix()
+
+setdiff(rownames(mat_acquired), ensembl_gtf_111$ensembl_gene_id)
+
+
+```
+
+
+Only consider genes that have at least 5 counts in more than 3 samples to
+speed up analysis. Doesn't have impact on outcome because DESeq2 would exclude
+these anyways, but take longer.
+
+```{r}
+library(DESeq2)
+genes_to_keep_acquired <- {mat_acquired > 5} %>%
+  rowSums() %>% {
+    .[. > 3]
+  } %>%
+  names()
+
+de_acquired <- DESeqDataSetFromMatrix(
+  mat_acquired %>% {
+      .[genes_to_keep_acquired, meta_acquired$sample_id]
+    },
+  meta_acquired,
+  design = ~condition + batch
+) %>%
+  DESeq()
+
+qsave(
+  de_acquired, "deseq/de_input_acquired.qs"
+)
+
+```
+
+
+```{r}
+processed_counts_acquired <- list(
+  raw = counts(de_acquired, normalized = FALSE),
+  normalized = counts(de_acquired, normalized = TRUE),
+  vst = varianceStabilizingTransformation(de_acquired) %>%
+    assay()
+) %>%
+  map(\(x) as_tibble(x, rownames = "ensembl_gene_id")) %>%
+  bind_rows(.id = "type")
+
+write_csv(
+  processed_counts_acquired,
+  "deseq/processed_counts_acquired.csv.gz"
+)
+```
+
+
+### PCA
+
+```{r}
+vst_mat_acquired <- processed_counts_acquired %>%
+  filter(type == "vst") %>%
+  select(-type) %>%
+  column_to_rownames("ensembl_gene_id") %>%
+  as.matrix()
+
+pca_acquired_raw <- prcomp(t(vst_mat_acquired))
+
+pca_acquired_x <- pca_acquired_raw$x %>%
+  as_tibble(rownames = "sample_id")
+
+pca_acquired_x_long <- pca_acquired_x %>%
+  pivot_longer(-sample_id, names_to = "component", values_to = "value")
+
+pca_acquired_sds <- broom::tidy(pca_acquired_raw, matrix = "eigenvalues")
+
+pca_pca_acquired_x_vs <- combn(paste0("PC", 1:4), 2) %>%
+  t() %>%
+  magrittr::set_colnames(paste0("component_", 1:2)) %>%
+  as_tibble() %>%
+  power_left_join(
+    pca_acquired_x_long,
+    by = c("component_1" = "component"),
+    check = check_specs(
+      unmatched_keys_left = "warn"
+    )
+  ) %>%
+  power_left_join(
+    pca_acquired_x_long,
+    by = c("component_2" = "component", "sample_id" = "sample_id"),
+    suffix = c("_1", "_2"),
+    check = check_specs(
+      unmatched_keys_left = "warn"
+    )
+  ) %>%
+  power_left_join(
+    meta_acquired,
+    by = "sample_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+```
+
+
+```{r}
+p <- ggplot(
+  pca_pca_acquired_x_vs,
+  aes(
+    value_1, value_2,
+    color = bridge_sample,
+    shape = batch
+  )
+) +
+  geom_point() +
+  scale_color_discrete(na.value = "gray") +
+  facet_wrap(vars(component_1, component_2), scales = "free")
+p
+
+p <- ggplot(
+  pca_pca_acquired_x_vs,
+  aes(
+    value_1, value_2,
+    color = treatment,
+    shape = cell_line
+  )
+) +
+  geom_point() +
+  scale_color_discrete(na.value = "gray") +
+  facet_wrap(vars(component_1, component_2), scales = "free")
+p
+
+
+p <- ggplot(
+  pca_pca_acquired_x_vs,
+  aes(
+    value_1, value_2,
+    color = str_remove(resistant, "r[0-9]$"),
+    shape = cell_line
+  )
+) +
+  geom_point() +
+  scale_color_discrete(na.value = "gray") +
+  facet_wrap(vars(component_1, component_2), scales = "free")
+p
+```
+
+```{r}
+syn_acquired <- synMkdir("syn68500169", "acquired")
+
+synStoreMany(
+  c(
+    "deseq/meta_acquired.csv.gz",
+    "deseq/processed_counts_acquired.csv.gz",
+    "deseq/de_input_acquired.qs"
+  ),
+  parentId = syn_acquired,
+  forceVersion = FALSE
+)
+```

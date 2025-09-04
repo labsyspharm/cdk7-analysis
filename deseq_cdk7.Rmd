@@ -17,6 +17,12 @@ library(synExtra)
 library(IHW)
 library(powerjoin)
 
+conflicted::conflict_prefer("filter", "dplyr")
+conflicted::conflict_prefer("select", "dplyr")
+conflicted::conflict_prefer("mutate", "dplyr")
+conflicted::conflict_prefer("rename", "dplyr")
+conflicted::conflicts_prefer(base::setdiff)
+
 synapser::synLogin()
 syn <- synDownloader("~/data", .cache = TRUE)
 
@@ -2162,3 +2168,85 @@ synStoreMany(
 
 ```
 
+## Acquired resistance
+
+```{r}
+ensembl_gtf_file_111 <- "Homo_sapiens.GRCh38.111.gtf.gz"
+if (!file.exists(ensembl_gtf_file_111)) {
+  download.file(
+    "ftp://ftp.ensembl.org/pub/release-111/gtf/homo_sapiens/Homo_sapiens.GRCh38.111.gtf.gz",
+    ensembl_gtf_file_111, method = "curl"
+  )
+}
+
+ensembl_gtf_111 <- rtracklayer::readGFF(ensembl_gtf_file_111) %>%
+  filter(type == "gene") %>%
+  distinct(
+    ensembl_gene_id = gene_id,
+    hgnc_symbol = gene_name,
+    gene_biotype
+  ) %>%
+  drop_na(ensembl_gene_id) %>%
+  as_tibble()
+
+meta_acquired <- syn("syn69681450") %>%
+  read_csv()
+
+de_acquired <- syn("syn69681454") %>%
+  qread()
+```
+
+
+Compare every condition vs the parental condition
+
+```{r}
+condition_meta_acquired <- meta_acquired %>%
+  distinct(cell_line, treatment, condition, resistant, bridge_sample)
+
+res_acquired <- condition_meta_acquired %>%
+  filter(treatment != "parent") %>%
+  power_inner_join(
+    condition_meta_acquired %>%
+      filter(treatment == "parent") %>%
+      distinct(cell_line, control_condition = condition),
+    by = c("cell_line"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  rowwise() %>%
+  mutate(
+    res = extract_deseq_result(
+      de_acquired,
+      contrast = c(
+        "condition",
+        condition,
+        control_condition
+      )
+    ) %>%
+      list()
+  ) %>%
+  ungroup()
+
+res_acquired_long <- res_acquired %>%
+  unnest(res)
+
+write_csv(
+  res_acquired_long,
+  file.path("deseq", "cdk7_res_acquired_long.csv.gz")
+)
+```
+
+
+```{r}
+synStoreMany(
+  c(
+    file.path("deseq", "cdk7_res_acquired_long.csv.gz")
+  ),
+  parentId = "syn69681449",
+  forceVersion = FALSE
+)
+
+```
