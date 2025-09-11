@@ -2668,7 +2668,7 @@ p <- ggplot(
   labs(x = NULL, y = NULL) +
   ggforce::facet_row(~comparison_type, scales = "free_x", space = "free", drop = TRUE)
 
-  
+
 ```
 
 Combined FGSEA and topGO results

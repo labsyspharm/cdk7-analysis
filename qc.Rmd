@@ -652,7 +652,7 @@ de_acquired <- DESeqDataSetFromMatrix(
 qsave(
   de_acquired, "deseq/de_input_acquired.qs"
 )
-
+de_acquired <- qread("deseq/de_input_acquired.qs")
 ```
 
 
@@ -670,6 +670,7 @@ write_csv(
   processed_counts_acquired,
   "deseq/processed_counts_acquired.csv.gz"
 )
+processed_counts_acquired <- read_csv("deseq/processed_counts_acquired.csv.gz")
 ```
 
 
@@ -731,10 +732,14 @@ p <- ggplot(
     shape = batch
   )
 ) +
-  geom_point() +
+  geom_point(alpha = .7) +
   scale_color_discrete(na.value = "gray") +
   facet_wrap(vars(component_1, component_2), scales = "free")
 p
+
+ggsave(
+  "plots/qc/pca_acquired_bridge_samples.pdf", p, width = 10, height = 7
+)
 
 p <- ggplot(
   pca_pca_acquired_x_vs,
@@ -758,11 +763,18 @@ p <- ggplot(
     shape = cell_line
   )
 ) +
-  geom_point() +
+  geom_point(alpha = .7) +
   scale_color_discrete(na.value = "gray") +
-  facet_wrap(vars(component_1, component_2), scales = "free")
+  facet_wrap(vars(component_1, component_2), scales = "free") +
+  labs(
+    color = "Resistance"
+  )
 p
-```
+
+ggsave(
+  "plots/qc/pca_acquired_resistance.pdf", p, width = 10, height = 7
+)
+ ```
 
 ```{r}
 syn_acquired <- synMkdir("syn68500169", "acquired")

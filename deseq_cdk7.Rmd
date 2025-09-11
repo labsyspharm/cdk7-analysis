@@ -2194,6 +2194,9 @@ meta_acquired <- syn("syn69681450") %>%
 
 de_acquired <- syn("syn69681454") %>%
   qread()
+
+counts_acquired <- syn("syn69681453") %>%
+  read_csv()
 ```
 
 
@@ -2240,13 +2243,253 @@ write_csv(
 ```
 
 
+### Acquired multifactor model
+
+```{r}
+meta_acquired_multi <- meta_acquired %>%
+  mutate(
+    drug_treatment = case_when(
+      str_detect(treatment, fixed("YKLr")) | treatment == "Y1uM" ~ "YKL-5-124",
+      str_detect(treatment, fixed("SYr")) | treatment == "S100nM" ~ "SY-5609",
+      TRUE ~ "DMSO"
+    ) %>%
+     as.factor() %>%
+      relevel("DMSO"),
+    resistant = replace_na(resistant, "no") %>%
+      recode(parent = "no") %>%
+      as.factor() %>%
+      relevel("no"),
+    resistant_overall = str_remove(resistant, "[0-9]+$") %>%
+      as.factor() %>%
+      relevel("no")
+    # resistant_specific = paste0(resistant, "_", cell_line) %>%
+    #   as.factor() %>%
+    #   relevel("no_OVCAR4")
+  ) %>%
+  group_by(cell_line, resistant_overall) %>%
+  mutate(
+    resistant_batch = if (cur_group()$resistant_overall == "no")
+      1L
+    else
+      as.integer(as.factor(as.character(resistant)))
+  ) %>%
+  ungroup() %>%
+  mutate(
+    resistant_batch = paste0("batch", resistant_batch) %>%
+      as.factor() %>%
+      relevel("batch1")
+  )
+
+df <- ~batch + cell_line + drug_treatment + drug_treatment:cell_line + resistant_overall + resistant_overall:cell_line + resistant_overall:cell_line:resistant_batch
+
+mm <- model.matrix(
+  df,
+  data = meta_acquired_multi
+) %>%
+  .[, colSums(.) != 0]
+
+de_acquired_multi <- DESeqDataSetFromMatrix(
+  counts(de_acquired, normalized = FALSE)[, meta_acquired_multi$sample_id],
+  colData = column_to_rownames(meta_acquired_multi, "sample_id"),
+  design = mm
+) %>%
+  DESeq()
+
+# Fit linear model for a single gene
+single_gene_data <- meta_acquired_multi %>%
+  mutate(
+    expression = counts(de_acquired, normalized = TRUE)["ENSG00000170312", sample_id]
+  )
+
+mdl <- lm(
+  expression ~ batch + cell_line + drug_treatment + drug_treatment:cell_line + resistant_overall + resistant_overall:cell_line + resistant_overall:cell_line:resistant_batch,
+  data = single_gene_data
+)
+
+library(emmeans)
+# Perform pairwise comparisons between resistant_overall groups using estimated marginal means
+#
+# This code extracts all pairwise contrasts between levels of the resistant_overall factor
+# from the fitted model. To recover the actual contrast vectors/coefficients that emmeans
+# uses for these comparisons, you can:
+#
+# 1. Use summary() with infer=c(TRUE,TRUE) to see contrast coefficients:
+#    summary(xxxx, infer=c(TRUE,TRUE))
+#
+# 2. Extract contrast matrix directly:
+#    xxxx@linfct  # for the linear function coefficients
+#
+# 3. Use contrast() with explicit contrast specification:
+#    contrast(emmeans(mdl, ~resistant_overall), "pairwise",
+#             adjust="none", infer=c(TRUE,TRUE))
+#
+# 4. Access the underlying contrast matrix:
+#    attr(xxxx, "grid")  # to see the reference grid
+#    xxxx@V              # for variance-covariance matrix of contrasts
+# To exclude the effect of drug_treatment, we need to marginalize over it
+# This calculates the effect of resistant_overall averaging across all drug_treatment levels
+
+ykl_emm <- emmeans(
+  mdl, ~resistant_overall,
+  at = list(drug_treatment = c("YKL-5-124"))
+) %>%
+  contrast("trt.vs.ctrl", ref = "no")
+ykl_emm
+
+ykl_emm_by_cell <- emmeans(
+  mdl, ~resistant_overall | cell_line,
+  at = list(drug_treatment = c("YKL-5-124"))
+) %>%
+  contrast("trt.vs.ctrl", ref = "no")
+ykl_emm_by_cell
+
+
+res_emm_ykl <- list(
+  ykl_emm,
+  ykl_emm_by_cell
+) %>%
+  map(
+    \(x) x@grid  %>%
+      as_tibble() %>%
+      mutate(
+        contrast_vec = asplit(x@linfct, 1)
+      )
+  ) %>%
+  bind_rows() %>%
+  mutate(
+    cell_line = replace_na(as.character(cell_line), "all_cells")
+  ) %>%
+  filter(
+    contrast %in% c(
+      "YKLr - no",
+      "YKLrTQr - no"
+    )
+  ) %>%
+  mutate(
+    res = map(
+      contrast_vec,
+      \(x) {
+        contrast_de <- set_names(
+          x[colnames(mm)],
+          resultsNames(de_acquired_multi)
+        )
+        extract_deseq_result(
+          de_acquired_multi,
+          contrast = contrast_de
+        ) %>%
+          mutate(
+            signed_p = -log10(pvalue) * sign(log2FoldChange_MLE)
+          )
+      }
+    )
+  )
+
+res_emm_ykl_long <- res_emm_ykl %>%
+  select(-contrast_vec) %>%
+  unnest(res) %>%
+  power_inner_join(
+    ensembl_gtf_111 %>%
+      select(ensembl_gene_id, hgnc_symbol, gene_biotype),
+    by = c("gene_id" = "ensembl_gene_id"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+write_csv(
+  res_emm_ykl_long,
+  file.path("deseq", "cdk7_res_acquired_emm_ykl.csv.gz")
+)
+
+sy_emm <- emmeans(mdl, ~resistant_overall,
+                at = list(drug_treatment = c("SY-5609"))) %>%
+  contrast("trt.vs.ctrl", ref = "no")
+
+
+xxxx
+x <- c( "resistant_overallSY", "resistant_overallYKL", "resistant_overallYKLrTQ") %>%
+  set_names() %>%
+  map(
+    \(x) extract_deseq_result(de_acquired_multi, name = x)
+  ) %>%
+  bind_rows(.id = "contrast")
+
+
+
+
+res_emm <- xxxx@grid  %>%
+  as_tibble() %>%
+  mutate(
+    res = imap(
+      contrast,
+      \(x, i) {
+        extract_deseq_result(
+          de_acquired_multi,
+          contrast = set_names(xxxx@linfct[i, colnames(mm)], colnames(mm))
+        )
+      }
+    )
+  )
+```
+
+
+```{r}
+counts_acquired_long <- counts_acquired %>%
+  pivot_longer(
+    -c(type, ensembl_gene_id),
+    names_to = "sample_id",
+    values_to = "count"
+  ) %>%
+  power_inner_join(
+    meta_acquired_multi,
+    by = "sample_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  power_inner_join(
+    ensembl_gtf_111 %>%
+      select(ensembl_gene_id, hgnc_symbol, gene_biotype),
+    by = "ensembl_gene_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+library(ggbeeswarm)
+p <- counts_acquired_long %>%
+  filter(
+    type == "vst",
+    ensembl_gene_id == "ENSG00000003436"
+  ) %>%
+  ggplot(
+    aes(
+      x = count,
+      y = interaction(cell_line, resistant_overall),
+      color = drug_treatment,
+      shape = resistant_batch
+    )
+  ) +
+  geom_quasirandom()
+p
+```
+
+
+
+### Upload Synapse
+
 ```{r}
 synStoreMany(
   c(
-    file.path("deseq", "cdk7_res_acquired_long.csv.gz")
+    file.path("deseq", "cdk7_res_acquired_long.csv.gz"),
+    file.path("deseq", "cdk7_res_acquired_emm_ykl.csv.gz")
   ),
   parentId = "syn69681449",
   forceVersion = FALSE
 )
 
 ```
+
