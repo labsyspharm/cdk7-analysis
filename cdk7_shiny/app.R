@@ -138,7 +138,7 @@ scale_df <- function(df) {
     mutate(
       across(
         -ensembl_gene_id,
-        \(x) scale(x, center = TRUE, scale = TRUE)[, 1]
+        \(x) scale(x, center = FALSE, scale = TRUE)[, 1]
       )
     )
 }
@@ -259,25 +259,34 @@ ui <- dashboardPage(
 
   dashboardBody(
     fluidRow(
-      column(12,
-        box(
-          title = "Interactive Heatmap",
-          status = "primary",
-          solidHeader = TRUE,
-          width = 12,
-          InteractiveComplexHeatmapOutput("heatmap", height1 = "750px")
+      box(
+        status = "primary",
+        width = 6,
+        InteractiveComplexHeatmapOutput(
+          "heatmap",
+          title1 = "",
+          height1 = "750px",
+          compact = TRUE
+        )
+      ),
+      box(
+        status = "primary",
+        width = 6,
+        InteractiveComplexHeatmapOutput(
+          "subheatmap",
+          title1 = "",
+          height1 = "750px",
+          compact = TRUE
         )
       )
     ),
     fluidRow(
-      column(12,
-        box(
-          title = "Gene VST Counts",
-          status = "info",
-          solidHeader = TRUE,
-          width = 12,
-          uiOutput("gene_plot_ui")
-        )
+      box(
+        title = "Gene VST Counts",
+        status = "info",
+        solidHeader = TRUE,
+        width = 12,
+        uiOutput("gene_plot_ui")
       )
     )
   )
@@ -286,8 +295,9 @@ ui <- dashboardPage(
 # Server
 server <- function(input, output, session) {
 
-  # Store selected gene ID
+  # Store selected gene ID and brushed selection
   selected_gene <- reactiveVal(NULL)
+  brushed_row_indices <- reactiveVal(NULL)
 
   # Reactive heatmap data generation
   heatmap_matrix <- eventReactive(input$generate, {
@@ -335,7 +345,7 @@ server <- function(input, output, session) {
       )
 
       setProgress(0.4, detail = "Clustering...")
-
+1
       # Perform clustering
       hm_row_clust <- cluster_fun_eucl_imp(hm_mat)
 
@@ -344,7 +354,7 @@ server <- function(input, output, session) {
       # Create heatmap
       hm <- Heatmap(
         hm_mat,
-        name = "Z-score",
+        name = "Scaled\nsignal",
         na_col = "grey",
         cluster_rows = hm_row_clust,
         row_labels = gene_id_gene_name_map[rownames(hm_mat)],
@@ -353,7 +363,7 @@ server <- function(input, output, session) {
         show_column_names = TRUE,
         column_names_gp = gpar(fontsize = 8),
         heatmap_legend_param = list(
-          title = "Z-score",
+          title = "Scaled\nsignal",
           title_position = "topcenter",
           legend_height = unit(4, "cm")
         )
@@ -361,20 +371,82 @@ server <- function(input, output, session) {
 
       setProgress(1, detail = "Complete!")
 
+      # Clear previous selections when new heatmap is generated
+      brushed_row_indices(NULL)
+      selected_gene(NULL)
+
       hm
     })
   })
 
-  # Render interactive heatmap with click action
+  # Render main interactive heatmap with brush action
   observe({
     hm <- heatmap_matrix()
     if (!is.null(hm)) {
       makeInteractiveComplexHeatmap(
         input, output, session, hm, "heatmap",
+        brush_action = function(df, output) {
+          if (!is.null(df) && nrow(df) > 0) {
+            # Get row indices from brush selection
+            row_indices <- unique(unlist(df$row_index))
+            brushed_row_indices(row_indices)
+          } else {
+            brushed_row_indices(NULL)
+          }
+        }
+      )
+    }
+  })
+
+  # Create reactive second heatmap from brushed selection
+  subheatmap_matrix <- reactive({
+    hm <- heatmap_matrix()
+    row_indices <- brushed_row_indices()
+
+    if (!is.null(hm) && !is.null(row_indices) && length(row_indices) > 0) {
+      sub_mat <- hm@matrix[row_indices, , drop = FALSE]
+
+      # Only create heatmap if we have enough genes
+      if (nrow(sub_mat) > 1) {
+        # Perform clustering on subset
+        sub_row_clust <- cluster_fun_eucl_imp(sub_mat)
+
+        # Create sub-heatmap
+        Heatmap(
+          sub_mat,
+          name = "Scaled\nsignal",
+          na_col = "grey",
+          cluster_rows = sub_row_clust,
+          row_labels = gene_id_gene_name_map[rownames(sub_mat)],
+          cluster_columns = FALSE,
+          show_row_names = TRUE,
+          show_column_names = TRUE,
+          column_names_gp = gpar(fontsize = 8),
+          row_names_gp = gpar(fontsize = 10),
+          heatmap_legend_param = list(
+            title = "Scaled\nsignal",
+            title_position = "topcenter",
+            legend_height = unit(4, "cm")
+          )
+        )
+      } else {
+        NULL
+      }
+    } else {
+      NULL
+    }
+  })
+
+  # Render second interactive heatmap with click action
+  observe({
+    sub_hm <- subheatmap_matrix()
+    if (!is.null(sub_hm)) {
+      makeInteractiveComplexHeatmap(
+        input, output, session, sub_hm, "subheatmap",
         click_action = function(df, output) {
           if (!is.null(df) && nrow(df) > 0) {
-            # Get the first selected gene ID from the heatmap row
-            gene_id <- rownames(hm@matrix)[df[1, "row_index"]]
+            # Get the first selected gene ID from the sub-heatmap row
+            gene_id <- rownames(sub_hm@matrix)[df[1, "row_index"]]
             selected_gene(gene_id)
           }
         }
