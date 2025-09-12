@@ -2737,6 +2737,51 @@ prep_gigantic_hm(
 
 ```
 
+```{r}
+# Export data for ginormous heatmap Shiny app
+gigantic_heatmap_data <- list(
+  baseline_deep_varstab_cor_df = baseline_deep_varstab_cor_df,
+  crispr_joined = crispr_joined,
+  deseq_res_acquired_data = deseq_res_acquired_data,
+  deseq_res_acquired_ykl = deseq_res_acquired_ykl,
+  deseq_res_resistant_vs_treatment_classes = deseq_res_resistant_vs_treatment_classes
+)
+
+qsave(gigantic_heatmap_data, "data/gigantic_heatmap_data.qs")
+
+
+ensembl_gtf_file <- "Homo_sapiens.GRCh38.109.gtf.gz"
+if (!file.exists(ensembl_gtf_file)) {
+  download.file(
+    "ftp://ftp.ensembl.org/pub/release-109/gtf/homo_sapiens/Homo_sapiens.GRCh38.109.gtf.gz",
+    ensembl_gtf_file, method = "curl"
+  )
+}
+
+ensembl_gtf_111 <- rtracklayer::readGFF(
+  "Homo_sapiens.GRCh38.111.gtf.gz"
+) %>%
+  distinct(
+    ensembl_gene_id = gene_id,
+    hgnc_symbol = gene_name,
+    gene_biotype
+  ) %>%
+  drop_na(ensembl_gene_id) %>%
+  mutate(
+    gene_name = coalesce(hgnc_symbol, ensembl_gene_id)
+  )
+
+gene_id_name_map <- with(
+  ensembl_gtf_111,
+  set_names(gene_name, ensembl_gene_id)
+)
+
+qsave(
+  gene_id_name_map,
+  "data/ensembl_111_gene_id_name_map.qs"
+)
+```
+
 
 
 ```{r}
