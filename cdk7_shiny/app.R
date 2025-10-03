@@ -11,9 +11,10 @@ library(tibble)
 library(grid)
 library(seriation)
 library(ggbeeswarm)
+library(here)
 
 # Load data and extract parameter options
-heatmap_data <- qread("../data/gigantic_heatmap_data.qs")
+heatmap_data <- qread(here("data", "gigantic_heatmap_data.qs"))
 
 # Extract unique parameter values from data
 gr_agents <- sort(unique(heatmap_data$baseline_deep_varstab_cor_df$agent))
@@ -24,10 +25,10 @@ gene_expr_cell_lines <- sort(unique(heatmap_data$deseq_res_acquired_data$cell_li
 emm_contrasts <- sort(unique(heatmap_data$deseq_res_acquired_ykl$contrast))
 emm_cell_lines <- sort(unique(heatmap_data$deseq_res_acquired_ykl$cell_line))
 
-gene_id_gene_name_map <- qread("../data/ensembl_111_gene_id_name_map.qs")
+gene_id_gene_name_map <- qread(here("data", "ensembl_111_gene_id_name_map.qs"))
 
 # Load VST counts data for gene-specific visualization
-counts_acquired_long <- read_csv("../deseq/cdk7_counts_acquired_long.csv.gz", show_col_types = FALSE)
+counts_acquired_long <- read_csv(here("data", "cdk7_counts_acquired_long.csv.gz"), show_col_types = FALSE)
 
 # Available gene expression metrics
 gene_expr_metrics <- c("signed_p", "log2FoldChange", "pvalue", "padj")
@@ -35,8 +36,8 @@ gene_expr_metrics <- c("signed_p", "log2FoldChange", "pvalue", "padj")
 # Default selections (matching original analysis)
 default_gr_agents <- c("YKL-5-124", "SY-5609")
 default_gr_metrics <- c("GR50", "GRmax")
-default_crispr_screens <- c("SYcrispri", "YKLcrispri", "SYcrispra", "YKLcrispra")
-default_gene_expr_conditions <- c("Y1uM", "S100nM", "YKLr1", "YKLr2", "YKLr3", "SYr3", "YKLrTQr1", "YKLrTQr3")
+default_crispr_screens <- c("YKLcrispri", "YKLcrispra")
+default_gene_expr_conditions <- c("Y1uM")
 default_gene_expr_cell_lines <- c("OVCAR4", "SNU8", "OVCAR8", "OVCAR3")
 default_emm_contrasts <- c("YKLr - no")
 default_emm_cell_lines <- c("all_cells")
@@ -80,31 +81,52 @@ prep_gigantic_hm <- function(
       cell_line %in% gene_expression_emm_cell_lines
     )
 
-  genes_to_keep <- list(
-    cor_df %>%
-      filter(p < .01),
-    crispr_df %>%
-      filter(`Mann-Whitney p-value` < .01),
-    expression_df %>%
-      filter(padj < .01) %>%
-      anti_join(
-        heatmap_data$deseq_res_resistant_vs_treatment_classes %>%
-          filter(combined_simple == "both_same"),
-        by = c("ensembl_gene_id" = "gene_id", "cell_line", "treatment")
-      ),
-    emm_df %>%
-      filter(padj < .01)
-  ) %>%
-    map("ensembl_gene_id") %>%
-    {
-      gene_counts <- table(unlist(.))
-      names(gene_counts)[gene_counts >= n_min]
-    }
+  # Create significance indicator dataframes for each data source
+  cor_sig <- cor_df %>%
+    filter(p < .01) %>%
+    select(agent, ensembl_gene_id, gr_metric) %>%
+    mutate(sig = 1) %>%
+    pivot_wider(names_from = c(agent, gr_metric), values_from = sig, values_fill = 0)
+
+  crispr_sig <- crispr_df %>%
+    filter(`Mann-Whitney p-value` < .01) %>%
+    select(ensembl_gene_id, screen) %>%
+    mutate(sig = 1) %>%
+    pivot_wider(names_from = screen, values_from = sig, values_fill = 0)
+
+  expression_sig <- expression_df %>%
+    filter(padj < .01) %>%
+    anti_join(
+      heatmap_data$deseq_res_resistant_vs_treatment_classes %>%
+        filter(combined_simple == "both_same"),
+      by = c("ensembl_gene_id" = "gene_id", "cell_line", "treatment")
+    ) %>%
+    select(ensembl_gene_id, cell_line, treatment) %>%
+    mutate(sig = 1) %>%
+    pivot_wider(names_from = c(treatment, cell_line), values_from = sig, values_fill = 0)
+
+  emm_sig <- emm_df %>%
+    filter(padj < .01) %>%
+    select(ensembl_gene_id, cell_line, contrast) %>%
+    mutate(sig = 1) %>%
+    pivot_wider(names_from = c(contrast, cell_line), values_from = sig, values_fill = 0)
+
+  # Join all significance indicators and count columns per gene
+  all_sigs <- list(cor_sig, crispr_sig, expression_sig, emm_sig) %>%
+    reduce(full_join, by = "ensembl_gene_id") %>%
+    replace(is.na(.), 0)
+
+  # Count significant columns per gene and filter
+  genes_to_keep <- all_sigs %>%
+    mutate(n_sig = rowSums(select(., -ensembl_gene_id))) %>%
+    filter(n_sig >= n_min) %>%
+    pull(ensembl_gene_id)
 
   if (length(genes_to_keep) == 0) {
     return(NULL)
   }
 
+  # Format data for heatmap
   cor_df_formatted <- cor_df %>%
     select(agent, ensembl_gene_id, gr_metric, r) %>%
     pivot_wider(names_from = c(agent, gr_metric), values_from = r)
@@ -245,7 +267,7 @@ ui <- dashboardPage(
       h4("Filtering"),
       numericInput(
         "n_min",
-        "Minimum Gene Count:",
+        "Significant in at least n columns:",
         value = 2,
         min = 1,
         max = 10
@@ -301,13 +323,6 @@ server <- function(input, output, session) {
 
   # Reactive heatmap data generation
   heatmap_matrix <- eventReactive(input$generate, {
-
-    # Validate inputs
-    validate(
-      need(length(input$gr_agents) > 0, "Please select at least one GR agent"),
-      need(length(input$gr_metrics) > 0, "Please select at least one GR metric"),
-      need(length(input$crispr_screens) > 0, "Please select at least one CRISPR screen")
-    )
 
     withProgress(message = "Generating heatmap...", {
 
@@ -490,6 +505,12 @@ server <- function(input, output, session) {
 
         # Create the plot
         p <- gene_data %>%
+          mutate(
+            resistant_overall = recode(
+              resistant_overall,
+              no = "baseline"
+            )
+          ) %>%
           ggplot(
             aes(
               x = count,
@@ -514,7 +535,7 @@ server <- function(input, output, session) {
 
         renderPlot({
           p
-        }, height = 400)
+        }, height = 500)
       }
     }
   })
@@ -522,3 +543,19 @@ server <- function(input, output, session) {
 
 # Run app
 shinyApp(ui = ui, server = server)
+
+# rsconnect::deployApp(
+#   appFiles = c(
+#     "cdk7_shiny/app.R",
+#     file.path(
+#       "data",
+#       c(
+#         "cdk7_counts_acquired_long.csv.gz",
+#         "ensembl_111_gene_id_name_map.qs",
+#         "gigantic_heatmap_data.qs"
+#       )
+#     )
+#   ),
+#   appPrimaryDoc = "cdk7_shiny/app.R",
+#   account = "chug", appMode = "shiny"
+# )
