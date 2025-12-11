@@ -15,10 +15,13 @@ library(qs)
 library(powerjoin)
 library(synExtra)
 library(IHW)
+library(conflicted)
 
-conflicted::conflict_prefer("filter", "dplyr")
-conflicted::conflict_prefer("select", "dplyr")
-conflicted::conflicts_prefer(base::setdiff)
+conflicts_prefer(
+  dplyr::filter,
+  dplyr::select,
+  base::setdiff
+)
 
 synapser::synLogin()
 syn <- synDownloader("~/data", .cache = TRUE)
@@ -116,7 +119,7 @@ gr_raw <- syn("syn68499802") %>%
 Comparing gene expression of each cell line compared to the grand
 mean of all cell lines at baseline (DMSO)
 
-Because there are big batch effects between cell lines (evidenced)
+Because there are big batch effects between cell lines evidenced
 by the PCA plots, only use the 2019_08 experiment here. That way
 we also only have 24h time point instead of 24h and 48h.
 
@@ -680,7 +683,7 @@ pwalk(
 ```
 
 
-
+### GR correlation heatmaps
 
 ```{r}
 library(ComplexHeatmap)
@@ -829,40 +832,58 @@ pwalk(
 )
 ```
 
-
+## GSEA on baseline GR correlation
 
 ```{r}
 library(fgsea)
 library(msigdbr)
 
+database_abbreviations <- c(
+  "REACTOME" = "R",
+  "HALLMARK" = "H",
+  "PID" = "P",
+  "KEGG_MEDICUS" = "K",
+  "GOBP" = "BP",
+  "GOMF" = "MF",
+  "GOCC" = "CC"
+)
+
+abbreviate_prefix <- function(strings, abbr_map = database_abbreviations) {
+  # Create regex pattern from abbreviation names
+  pattern <- paste0("^(", paste(names(abbr_map), collapse = "|"), ")_")
+
+  # Replace matching prefixes with abbreviations
+  str_replace(strings, pattern, function(x) {
+    prefix <- str_remove(x, "_$")
+    paste0(abbr_map[prefix], "_")
+  })
+}
+
 all_gene_sets <- msigdbr(species = "Homo sapiens")
 selected_gene_sets <- all_gene_sets %>%
   filter(
-    gs_collection == "H" | (
-      gs_subcollection == "CP:KEGG"
-    ) | gs_subcollection == "CP:REACTOME"
-  ) %>%
-  separate_wider_delim(
-    gs_name,
-    delim = "_",
-    names = c("gs_db", "gs_name_short"),
-    too_many = "merge",
-    cols_remove = FALSE
+    gs_collection %in% c("H") |
+      gs_subcollection %in% c(
+        "CP:PID",
+        "CP:REACTOME",
+        "CP:KEGG_MEDICUS"
+      ),
+    !str_detect(gs_name, coll("MEDICUS_PATHOGEN")),
+    !str_detect(gs_name, coll("MEDICUS_VARIANT"))
   ) %>%
   mutate(
-    gs_name_db = paste(
-      str_sub(gs_db, end = 1), gs_name_short, sep = "_"
-    )
+    database = str_extract(gs_name, paste0("^(", paste(names(database_abbreviations), collapse = "|"), ")")),
+    pathway = abbreviate_prefix(gs_name)
   )
 
-selected_gene_sets_gr <- selected_gene_sets %>%
-  group_nest(gs_collection, gs_subcollection, gs_name, gs_name_db, gs_db) %>%
+selected_gene_sets_list <- selected_gene_sets %>%
+  group_nest(gs_collection, gs_subcollection, gs_name, database, pathway) %>%
   mutate(
     gs = map(
       data,
       \(x) unique(x$ensembl_gene)
     ) %>%
-      set_names(gs_name_db)
+      set_names(pathway)
   )
 
 selected_des <- baseline_deep_varstab_cor_df %>%
@@ -884,14 +905,14 @@ fgsea_res_raw <- selected_des %>%
     res = map(
       de,
       \(x) fgseaMultilevel(
-        selected_gene_sets_gr$gs,
+        selected_gene_sets_list$gs,
         x
       )
     ),
     res_p = map(
       de_p,
       \(x) fgseaMultilevel(
-        selected_gene_sets_gr$gs,
+        selected_gene_sets_list$gs,
         x
       )
     )
@@ -904,7 +925,11 @@ fgsea_res_long <- fgsea_res_raw %>%
     signed_p = -sign(NES) * log10(padj),
     p_cut = cut(padj, breaks = c(-Inf, 0.01, 0.05, Inf), labels = c("**", "*", ""))
   )
+```
 
+### Barplots
+
+```{r}
 fgsea_res_long_selected <- fgsea_res_long %>%
   filter(
     pathway %in% {
@@ -997,6 +1022,7 @@ pwalk(
 )
 ```
 
+### Heatmaps
 
 ```{r}
 fgsea_res_long_selected_hm_data <- fgsea_res_long %>%
@@ -1091,6 +1117,8 @@ pwalk(
   }
 )
 ```
+
+## INDRA queries
 
 ```{r}
 library(indra.gsea)
@@ -2113,8 +2141,8 @@ deseq_res_resistant_vs_treatment_classes <- deseq_res_resistant_vs_treatment %>%
       log2FoldChange_treatment < 0 ~ "down",
       TRUE ~ "ns"
     ),
-    combined_class = paste("resistant", resistant_class, "treatment", treatment_class, sep = "_"),
-    combined_simple = case_when(
+    resistant_vs_treatment_class = paste("resistant", resistant_class, "treatment", treatment_class, sep = "_"),
+    resistant_vs_treatment_simple = case_when(
       resistant_class == "ns" & treatment_class == "ns" ~ "ns",
       resistant_class != "ns" & treatment_class == "ns" ~ "resistant_only",
       resistant_class == "ns" & treatment_class != "ns" ~ "treatment_only",
@@ -2126,26 +2154,26 @@ deseq_res_resistant_vs_treatment_classes <- deseq_res_resistant_vs_treatment %>%
 
 deseq_res_resistant_vs_treatment_classes %>%
   count(
-    resistant_condition, combined_class
+    resistant_condition, resistant_vs_treatment_class
   ) %>%
   View()
 
 deseq_res_resistant_vs_treatment_classes %>%
   count(
-    resistant_condition, combined_simple
+    resistant_condition, resistant_vs_treatment_simple
   ) %>%
   View()
 
 p <- deseq_res_resistant_vs_treatment_classes %>%
   count(
-    resistant_condition, combined_simple
+    resistant_condition, resistant_vs_treatment_simple
   ) %>%
   filter(
-    combined_simple != "ns"
+    resistant_vs_treatment_simple != "ns"
   ) %>%
   ggplot(
     aes(
-      n, resistant_condition, fill = combined_simple
+      n, resistant_condition, fill = resistant_vs_treatment_simple
     )
   ) +
   geom_col(position = "dodge") +
@@ -2182,24 +2210,47 @@ and one with both combined
 feasible_gene_vec <- deseq_res_resistant_vs_treatment$gene_id %>%
   unique()
 
-resistant_vs_treatment_sets <- deseq_res_resistant_vs_treatment_classes %>%
-  filter(
-    combined_simple %in% c("resistant_only", "opposite")
-  ) %>% {
-    list(
-      separate = group_by(., resistant_condition, resistant_class) %>%
-        summarize(
-          gene_set = list(gene_id),
-          .groups = "drop"
-        ),
-      combined = group_by(., resistant_condition) %>%
-        summarize(
-          gene_set = list(gene_id),
-          .groups = "drop"
-        )
-    )
-  } %>%
-  bind_rows(.id = "updown_definition") %>%
+resistant_vs_treatment_sets <- bind_rows(
+  deseq_res_resistant_vs_treatment_classes %>%
+    filter(
+      resistant_vs_treatment_simple %in% c("resistant_only", "opposite")
+    ) %>% {
+      list(
+        separate = group_by(., resistant_condition, resistant_class) %>%
+          summarize(
+            gene_set = list(gene_id),
+            .groups = "drop"
+          ),
+        combined = group_by(., resistant_condition) %>%
+          summarize(
+            gene_set = list(gene_id),
+            .groups = "drop"
+          )
+      )
+    } %>%
+    bind_rows(.id = "updown_definition") %>%
+    mutate(
+      resistant_vs_treatment_simple = "resistant_only_and_opposite"
+    ),
+  deseq_res_resistant_vs_treatment_classes %>%
+    filter(
+      resistant_vs_treatment_simple %in% c("resistant_only", "opposite")
+    ) %>% {
+      list(
+        separate = group_by(., resistant_condition, resistant_class, resistant_vs_treatment_simple) %>%
+          summarize(
+            gene_set = list(gene_id),
+            .groups = "drop"
+          ),
+        combined = group_by(., resistant_condition, resistant_vs_treatment_simple) %>%
+          summarize(
+            gene_set = list(gene_id),
+            .groups = "drop"
+          )
+      )
+    } %>%
+    bind_rows(.id = "updown_definition")
+) %>%
   mutate(
     gene_set_vec = map(
       gene_set,
@@ -2323,40 +2374,12 @@ go_meta <- topgo_res %>%
 
 
 ```{r}
-selected_msigdbr <- all_gene_sets %>%
-  filter(
-    gs_collection == "H" |
-      gs_subcollection %in% c("CP:REACTOME", "CP:KEGG_MEDICUS")
-  ) %>%
-  separate_wider_delim(
-    gs_name,
-    delim = "_",
-    names = c("gs_db", "gs_name_short"),
-    too_many = "merge",
-    cols_remove = FALSE
-  ) %>%
-  mutate(
-    gs_name_db = paste(
-      str_sub(gs_db, end = 1), gs_name_short, sep = "_"
-    )
-  )
-
-selected_msigdbr_gr <- selected_msigdbr %>%
-  group_nest(gs_collection, gs_subcollection, gs_name, gs_name_db, gs_db) %>%
-  mutate(
-    gs = map(
-      data,
-      \(x) unique(x$ensembl_gene)
-    ) %>%
-      set_names(gs_name_db)
-  )
-
 fgsea_res_raw <- resistant_vs_treatment_sets %>%
   mutate(
     res = map(
       gene_set,
       \(x) fora(
-        selected_msigdbr_gr$gs,
+        selected_gene_sets_list$gs,
         x, universe = feasible_gene_vec
       )
     )
@@ -2377,18 +2400,49 @@ fgsea_res_long <- fgsea_res_raw %>%
 
 ```{r}
 fgsea_res_selected <- fgsea_res_long %>%
-  semi_join(
-    group_by(., updown_definition, pathway) %>%
-      summarize(n_sig = sum(padj < 0.01)) %>%
-      filter(n_sig > 1)
+  group_nest(
+    resistant_vs_treatment_simple, updown_definition, resistant_class
+  ) %>%
+  mutate(
+    data = map(
+      data,
+      \(x) semi_join(
+        x,
+        group_by(x, pathway) %>%
+          summarize(n_sig = sum(padj < 0.01)) %>%
+          filter(n_sig > 1)
+      )
+    )
   )
 
-fgsea_res_selected_mat <- fgsea_res_selected %>%
-  filter(updown_definition == "combined") %>%
-  select(resistant_condition, pathway, signed_p) %>%
-  pivot_wider(names_from = resistant_condition, values_from = signed_p, values_fill = 0) %>%
-  column_to_rownames("pathway") %>%
-  as.matrix()
+fgsea_res_hms <- fgsea_res_selected %>%
+  mutate(
+    hm = map(
+      data,
+      \(x) {
+        mat <- x %>%
+          select(resistant_condition, pathway, signed_p) %>%
+          pivot_wider(names_from = resistant_condition, values_from = signed_p, values_fill = 0) %>%
+          column_to_rownames("pathway") %>%
+          as.matrix()
+        abs_95 <- max(abs(quantile(mat, c(0.05, 0.95))))
+        Heatmap(
+          mat,
+          col = circlize::colorRamp2(
+            c(-abs_95, 0, abs_95),
+            c("blue", "white", "red")
+          ),
+          name = "signed -log10(padj)",
+          cluster_rows = TRUE,
+          cluster_columns = FALSE,
+          show_row_names = TRUE,
+          show_column_names = TRUE
+        )
+      }
+    )
+  )
+
+
 
 hm <- Heatmap(
   fgsea_res_selected_mat,
@@ -2431,9 +2485,9 @@ resistant_vs_treatment_sets_topgo_res_selected <- resistant_vs_treatment_sets_to
   )
 
 resistant_vs_treatment_sets_topgo_res_selected_mat <- resistant_vs_treatment_sets_topgo_res_selected %>%
-  filter(updown_definition == "combined") %>%
-  select(resistant_condition, term_unique, signed_p) %>%
-  pivot_wider(names_from = resistant_condition, values_from = signed_p, values_fill = 0) %>%
+  filter(updown_definition == "separate") %>%
+  select(resistant_class, resistant_condition, term_unique, signed_p) %>%
+  pivot_wider(names_from = c(resistant_class, resistant_condition), values_from = signed_p, values_fill = 0) %>%
   column_to_rownames("term_unique") %>%
   as.matrix()
 
@@ -2442,10 +2496,12 @@ hm <- Heatmap(
   name = "signed -log10(padj)",
   cluster_rows = TRUE,
   cluster_columns = FALSE,
-  show_row_names = FALSE,
+  show_row_names = TRUE,
   show_column_names = TRUE
 )
 hm
+
+InteractiveComplexHeatmap::htShiny(hm)
 ```
 
 
@@ -2559,7 +2615,8 @@ prep_gigantic_hm <- function(
   gene_expression_cell_lines = c("OVCAR4", "SNU8", "OVCAR8", "OVCAR3"),
   gene_expression_emm_contrasts = c("YKLr - no"),
   gene_expression_emm_cell_lines = c("all_cells"),
-  n_min = 2L
+  n_min = 2L,
+  p_threshold = 0.01
 ) {
   ge_metric_sym <- sym(gene_expression_metric)
   cor_df <- baseline_deep_varstab_cor_df %>%
@@ -2585,18 +2642,18 @@ prep_gigantic_hm <- function(
     )
   genes_to_keep <- list(
     cor_df %>%
-      filter(p < .01),
+      filter(p < p_threshold),
     crispr_df %>%
-      filter(`Mann-Whitney p-value` < .01),
+      filter(`Mann-Whitney p-value` < p_threshold),
     expression_df %>%
-      filter(padj < .01) %>%
+      filter(padj < p_threshold) %>%
       anti_join(
         deseq_res_resistant_vs_treatment_classes %>%
           filter(combined_simple == "both_same"),
         by = c("ensembl_gene_id" = "gene_id", "cell_line", "treatment")
       ),
     emm_df %>%
-      filter(padj < .01)
+      filter(padj < p_threshold)
   ) %>%
     map("ensembl_gene_id") %>%
     {
@@ -2632,7 +2689,7 @@ scale_df <- function(df) {
     mutate(
       across(
         -ensembl_gene_id,
-        \(x) scale(x, center = TRUE, scale = TRUE)[, 1]
+        \(x) scale(x, center = FALSE, scale = TRUE)[, 1]
       )
     )
 }
@@ -2780,6 +2837,7 @@ qsave(
   gene_id_name_map,
   "data/ensembl_111_gene_id_name_map.qs"
 )
+gene_id_name_map <- qread("data/ensembl_111_gene_id_name_map.qs")
 ```
 
 
@@ -2849,4 +2907,274 @@ To Do:
 3. Gigantic heatmap Shiny app
 4. Polish fgsea enrichment from GR correlation results
 
+### Function to find genes by pattern
 
+
+```{r}
+find_genes_by_pattern <- function(
+  gr_crit = NULL,
+  crispr_crit = NULL,
+  expression_crit = NULL,
+  emm_crit = NULL,
+  gr_cor_agents = c("YKL-5-124", "SY-5609"),
+  gr_cor_metrics = c("GR50", "GRmax"),
+  crispr_screens = c("SYcrispri", "YKLcrispri", "SYcrispra", "YKLcrispra"),
+  gene_expression_conditions = c("Y1uM", "S100nM", "YKLr1", "YKLr2", "YKLr3", "SYr3", "YKLrTQr1", "YKLrTQr3"),
+  gene_expression_metric = c("signed_p"),
+  gene_expression_cell_lines = c("OVCAR4", "SNU8", "OVCAR8", "OVCAR3"),
+  gene_expression_emm_contrasts = c("YKLr - no"),
+  gene_expression_emm_cell_lines = c("all_cells"),
+  combine_with = c("AND", "OR")
+) {
+  combine_with <- match.arg(combine_with)
+  ge_metric_sym <- sym(gene_expression_metric)
+
+  # Prepare datasets as before
+  cor_df <- baseline_deep_varstab_cor_df %>%
+    filter(
+      agent %in% gr_cor_agents,
+      gr_metric %in% gr_cor_metrics
+    )
+  crispr_df <- crispr_joined %>%
+    filter(screen %in% crispr_screens)
+  expression_df <- deseq_res_acquired_data %>%
+    rename(ensembl_gene_id = gene_id) %>%
+    mutate(across(c(signed_p), \(x) replace_na(x, 0))) %>%
+    filter(
+      treatment %in% gene_expression_conditions,
+      cell_line %in% gene_expression_cell_lines
+    )
+  emm_df <- deseq_res_acquired_ykl %>%
+    rename(ensembl_gene_id = gene_id) %>%
+    mutate(across(c(signed_p), \(x) replace_na(x, 0))) %>%
+    filter(
+      contrast %in% gene_expression_emm_contrasts,
+      cell_line %in% gene_expression_emm_cell_lines
+    )
+
+  # Format datasets
+  cor_df_formatted <- cor_df %>%
+    select(agent, ensembl_gene_id, gr_metric, r, p) %>%
+    pivot_wider(
+      names_from = c(agent, gr_metric),
+      values_from = c(r, p),
+      names_sep = "_"
+    )
+
+  crispr_df_formatted <- crispr_df %>%
+    select(ensembl_gene_id, screen, signed_p, `Mann-Whitney p-value`) %>%
+    pivot_wider(
+      names_from = screen,
+      values_from = c(signed_p, `Mann-Whitney p-value`),
+      names_sep = "_"
+    )
+
+  expression_df_formatted <- expression_df %>%
+    select(ensembl_gene_id, cell_line, treatment, {{ge_metric_sym}}, padj) %>%
+    pivot_wider(
+      names_from = c(treatment, cell_line),
+      values_from = c({{ge_metric_sym}}, padj),
+      names_sep = "_"
+    )
+
+  emm_df_formatted <- emm_df %>%
+    select(ensembl_gene_id, cell_line, contrast, {{ge_metric_sym}}, padj) %>%
+    pivot_wider(
+      names_from = c(contrast, cell_line),
+      values_from = c({{ge_metric_sym}}, padj),
+      names_sep = "_"
+    )
+
+  # Join all datasets
+  combined_df <- list(
+    cor_df_formatted,
+    crispr_df_formatted,
+    expression_df_formatted,
+    emm_df_formatted
+  ) %>%
+    reduce(full_join, by = "ensembl_gene_id")
+
+  # Apply criteria filters
+  gene_sets <- list()
+
+  if (!is.null(gr_crit)) {
+    for (i in seq_along(gr_crit)) {
+      genes <- combined_df %>%
+        filter(!!rlang::f_rhs(gr_crit[[i]])) %>%
+        pull(ensembl_gene_id)
+      gene_sets[[paste0("gr_", i)]] <- genes
+    }
+  }
+
+  if (!is.null(crispr_crit)) {
+    for (i in seq_along(crispr_crit)) {
+      genes <- combined_df %>%
+        filter(!!rlang::f_rhs(crispr_crit[[i]])) %>%
+        pull(ensembl_gene_id)
+      gene_sets[[paste0("crispr_", i)]] <- genes
+    }
+  }
+
+  if (!is.null(expression_crit)) {
+    for (i in seq_along(expression_crit)) {
+      genes <- combined_df %>%
+        filter(!!rlang::f_rhs(expression_crit[[i]])) %>%
+        pull(ensembl_gene_id)
+      gene_sets[[paste0("expression_", i)]] <- genes
+    }
+  }
+
+  if (!is.null(emm_crit)) {
+    for (i in seq_along(emm_crit)) {
+      genes <- combined_df %>%
+        filter(!!rlang::f_rhs(emm_crit[[i]])) %>%
+        pull(ensembl_gene_id)
+      gene_sets[[paste0("emm_", i)]] <- genes
+    }
+  }
+
+  # Combine gene sets
+  if (length(gene_sets) == 0) {
+    return(character(0))
+  } else if (length(gene_sets) == 1) {
+    final_genes <- gene_sets[[1]]
+  } else {
+    if (combine_with == "AND") {
+      final_genes <- Reduce(intersect, gene_sets)
+    } else {
+      final_genes <- Reduce(union, gene_sets)
+    }
+  }
+
+  # Return results
+  list(
+    genes = final_genes,
+    gene_sets = gene_sets,
+    combined_data = combined_df
+  )
+}
+
+
+hm_mat <- prep_gigantic_hm(
+  gr_cor_agents = c("YKL-5-124"),
+  gr_cor_metrics = c("GR50", "GRmax"),
+  crispr_screens = c("YKLcrispri", "YKLcrispra"),
+  gene_expression_conditions = c("Y1uM", "YKLr1", "YKLr2", "YKLr3", "YKLrTQr1", "YKLrTQr2", "YKLrTQr3"),
+  gene_expression_metric = c("signed_p"),
+  gene_expression_cell_lines = c("OVCAR4", "SNU8", "OVCAR8", "OVCAR3"),
+  gene_expression_emm_contrasts = c("YKLr - no", "YKLrTQr - no"),
+  gene_expression_emm_cell_lines = c("all_cells"),
+  n_min = 1,
+  p_threshold = 0.05
+) %>%
+  scale_df() %>%
+  column_to_rownames("ensembl_gene_id") %>%
+  as.matrix()
+
+crispri_enriched_downregulated <- find_genes_by_pattern(
+  crispr_crit = list(~signed_p_YKLcrispri > 1.5),
+  # expression_crit = list(~`signed_p_YKLr1_OVCAR4` > -1.5 & `signed_p_YKLr1_OVCAR4` < 1.5),
+  emm_crit = list(~`signed_p_YKLr - no_all_cells` < -1.5),
+  combine_with = "AND"
+)
+
+clipr::write_clip(
+  gene_id_name_map[crispri_enriched_downregulated$genes]
+)
+
+mat <- hm_mat[crispri_enriched_downregulated$genes, ]
+
+hm_row_clust <- cluster_fun_eucl_imp(mat)
+
+hm <- Heatmap(
+  mat,
+  name = "Z-score",
+  na_col = "grey",
+  cluster_rows = hm_row_clust,
+  cluster_columns = FALSE,
+  show_row_names = TRUE,
+  row_labels = gene_id_name_map[rownames(mat)],
+  show_column_names = TRUE
+)
+hm
+withr::with_pdf(
+  file.path("plots_cdk7", "gigantic_hm2.pdf"),
+  draw(hm),
+  width = 15,
+  height = 20
+)
+
+crispri_depleted_upregulated <- find_genes_by_pattern(
+  crispr_crit = list(~signed_p_YKLcrispri < -1.5),
+  emm_crit = list(~`signed_p_YKLr - no_all_cells` > 1.5),
+  combine_with = "AND"
+)
+
+clipr::write_clip(
+  gene_id_name_map[crispri_depleted_upregulated$genes]
+)
+
+mat <- hm_mat[crispri_depleted_upregulated$genes, ]
+
+hm_row_clust <- cluster_fun_eucl_imp(mat)
+
+hm <- Heatmap(
+  mat,
+  name = "Z-score",
+  na_col = "grey",
+  cluster_rows = hm_row_clust,
+  cluster_columns = FALSE,
+  show_row_names = TRUE,
+  row_labels = gene_id_name_map[rownames(mat)],
+  show_column_names = TRUE
+)
+hm
+
+
+crispra_enriched_upregulated <- find_genes_by_pattern(
+  crispr_crit = list(~signed_p_YKLcrispra > 1.5),
+  # expression_crit = list(~`signed_p_YKLr1_OVCAR4` > -1.5 & `signed_p_YKLr1_OVCAR4` < 1.5),
+  emm_crit = list(~`signed_p_YKLr - no_all_cells` > 1.5),
+  combine_with = "AND"
+)
+
+mat <- hm_mat[crispra_enriched_upregulated$genes, ]
+
+hm_row_clust <- cluster_fun_eucl_imp(mat)
+
+hm <- Heatmap(
+  mat,
+  name = "Z-score",
+  na_col = "grey",
+  cluster_rows = hm_row_clust,
+  cluster_columns = FALSE,
+  show_row_names = TRUE,
+  row_labels = gene_id_name_map[rownames(mat)],
+  show_column_names = TRUE
+)
+hm
+
+
+crispra_depleted_downregulated <- find_genes_by_pattern(
+  crispr_crit = list(~signed_p_YKLcrispra < -1.5),
+  # expression_crit = list(~`signed_p_YKLr1_OVCAR4` > -1.5 & `signed_p_YKLr1_OVCAR4` < 1.5),
+  emm_crit = list(~`signed_p_YKLr - no_all_cells` < -1.5),
+  combine_with = "AND"
+)
+
+mat <- hm_mat[crispra_depleted_downregulated$genes, ]
+
+hm_row_clust <- cluster_fun_eucl_imp(mat)
+
+hm <- Heatmap(
+  mat,
+  name = "Z-score",
+  na_col = "grey",
+  cluster_rows = hm_row_clust,
+  cluster_columns = FALSE,
+  show_row_names = TRUE,
+  row_labels = gene_id_name_map[rownames(mat)],
+  show_column_names = TRUE
+)
+hm
+```

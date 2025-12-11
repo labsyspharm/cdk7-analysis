@@ -16,12 +16,15 @@ library(DESeq2)
 library(synExtra)
 library(IHW)
 library(powerjoin)
+library(conflicted)
 
-conflicted::conflict_prefer("filter", "dplyr")
-conflicted::conflict_prefer("select", "dplyr")
-conflicted::conflict_prefer("mutate", "dplyr")
-conflicted::conflict_prefer("rename", "dplyr")
-conflicted::conflicts_prefer(base::setdiff)
+conflicts_prefer(
+  dplyr::filter,
+  dplyr::select,
+  dplyr::mutate,
+  dplyr::rename,
+  base::setdiff
+)
 
 synapser::synLogin()
 syn <- synDownloader("~/data", .cache = TRUE)
@@ -294,7 +297,10 @@ meta_kept %>%
     )
   ) +
   geom_tile() +
-  facet_grid(cell_line ~ time)
+  facet_grid(cell_line ~ time) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
 
 ```
 
@@ -905,6 +911,40 @@ qsave(
   file.path("deseq", "cdk7_deseq_baseline.qs")
 )
 
+library(emmeans)
+de_baseline_emm <- lm(
+  count ~ 0 + cell_line,
+  data = mutate(
+    baseline_meta,
+    count = counts_mat["ENSG00000000003", sample_id]
+  )
+) %>%
+  emmeans(~cell_line)
+
+de_baseline_contrasts <- contrast(
+  de_baseline_emm,
+  method = "eff",
+  adjust = "none"
+)
+```
+de_baseline_contrasts@linfct
+      cell_line59M cell_lineCOV318 cell_lineCOV362 cell_lineCOV504 cell_lineFUOV1 cell_lineKuramochi cell_lineONCODG1 cell_lineOVCAR3 cell_lineOVCAR8 cell_lineSKOV3 cell_lineSNU8
+ [1,]   0.90909091     -0.09090909     -0.09090909     -0.09090909    -0.09090909        -0.09090909      -0.09090909     -0.09090909     -0.09090909    -0.09090909   -0.09090909
+ [2,]  -0.09090909      0.90909091     -0.09090909     -0.09090909    -0.09090909        -0.09090909      -0.09090909     -0.09090909     -0.09090909    -0.09090909   -0.09090909
+ [3,]  -0.09090909     -0.09090909      0.90909091     -0.09090909    -0.09090909        -0.09090909      -0.09090909     -0.09090909     -0.09090909    -0.09090909   -0.09090909
+ [4,]  -0.09090909     -0.09090909     -0.09090909      0.90909091    -0.09090909        -0.09090909      -0.09090909     -0.09090909     -0.09090909    -0.09090909   -0.09090909
+ [5,]  -0.09090909     -0.09090909     -0.09090909     -0.09090909     0.90909091        -0.09090909      -0.09090909     -0.09090909     -0.09090909    -0.09090909   -0.09090909
+ [6,]  -0.09090909     -0.09090909     -0.09090909     -0.09090909    -0.09090909         0.90909091      -0.09090909     -0.09090909     -0.09090909    -0.09090909   -0.09090909
+ [7,]  -0.09090909     -0.09090909     -0.09090909     -0.09090909    -0.09090909        -0.09090909       0.90909091     -0.09090909     -0.09090909    -0.09090909   -0.09090909
+ [8,]  -0.09090909     -0.09090909     -0.09090909     -0.09090909    -0.09090909        -0.09090909      -0.09090909      0.90909091     -0.09090909    -0.09090909   -0.09090909
+ [9,]  -0.09090909     -0.09090909     -0.09090909     -0.09090909    -0.09090909        -0.09090909      -0.09090909     -0.09090909      0.90909091    -0.09090909   -0.09090909
+[10,]  -0.09090909     -0.09090909     -0.09090909     -0.09090909    -0.09090909        -0.09090909      -0.09090909     -0.09090909     -0.09090909     0.90909091   -0.09090909
+[11,]  -0.09090909     -0.09090909     -0.09090909     -0.09090909    -0.09090909        -0.09090909      -0.09090909     -0.09090909     -0.09090909    -0.09090909    0.90909091
+
+So this approach below is correct. From the emmeans doc:
+eff.emmc gives weights (k-1)/k and -1/k respectively, as in subtracting the overall EMM from each EMM
+
+```{r}
 de_baseline_res <- resultsNames(de_baseline) %>%
   set_names() %>%
   map(
@@ -1145,36 +1185,6 @@ deep_dge_list <- DGEList(
 ) %>%
   normLibSizes()
 
-deep_design_sum <- contr.sum(
-  factor(deep_meta$cell_line)
-) %>%
-  magrittr::set_rownames(deep_meta$sample_id)
-
-deep_glm_sum <- glmFit(
-  deep_dge_list, deep_design_sum,
-  dispersion = .4
-)
-
-test_res <- glmLRT(
-  deep_glm_sum,
-  coef = 6,
-) %>%
-  topTags(n = Inf) %>%
-  as.data.frame() %>%
-  as_tibble()
-
-test_res %>%
-  mutate(up_down = if_else(logFC > 0, "up", "down")) %>%
-  filter(FDR < 0.05) %>%
-  dplyr::count(up_down)
-
-
-library(contrast)
-
-contrast(
-
-)
-
 deep_design <- model.matrix(~0 + cell_line, data = deep_meta) %>%
   magrittr::set_rownames(deep_meta$sample_id)
 
@@ -1182,32 +1192,6 @@ deep_glm <- glmFit(
   deep_dge_list, deep_design,
   dispersion = .4
 )
-
-test_res <- glmLRT(
-  deep_glm,
-  contrast = {
-    n <- ncol(deep_design)
-    print(n)
-    contrast_vec <- rep(
-      1 / (n - 1),
-      n
-    )
-    contrast_vec[2] <- -1
-    # contrast_vec <- rep(0, n)
-    # # contrast_vec[3] <- -1
-    # contrast_vec[c(1, 2)] <- -(1 - 1/n)
-    # contrast_vec[4] <- 1
-    contrast_vec
-  }
-) %>%
-  topTags(n = Inf) %>%
-  as.data.frame() %>%
-  as_tibble()
-
-test_res %>%
-  mutate(up_down = if_else(logFC > 0, "up", "down")) %>%
-  filter(FDR < 0.05) %>%
-  dplyr::count(up_down)
 
 deep_results <- deep_meta %>%
   distinct(cell_line) %>%
@@ -1220,7 +1204,7 @@ deep_results <- deep_meta %>%
           -1 / n,
           n
         )
-        contrast_vec[match(paste0("cell_line", x), colnames(deep_design))] <- 1
+        contrast_vec[match(paste0("cell_line", x), colnames(deep_design))] <- (n - 1) / n
         glmLRT(
           deep_glm,
           contrast = contrast_vec
@@ -1232,12 +1216,15 @@ deep_results <- deep_meta %>%
     )
   )
 
-deep_results_long <- deep_results %>%
+deep_results_long_new <- deep_results %>%
   select(cell_line, res) %>%
   unnest(res)
 
 write_csv(
   deep_results_long,
+  file.path("deseq", "deep_baseline_edger_res.csv.gz")
+)
+deep_results_long <- read_csv(
   file.path("deseq", "deep_baseline_edger_res.csv.gz")
 )
 ```
@@ -2459,11 +2446,22 @@ counts_acquired_long <- counts_acquired %>%
     )
   )
 
+counts_acquired_long_vst <- counts_acquired_long %>%
+  filter(type == "vst")
+
+write_csv(
+  counts_acquired_long,
+  file.path("data", "cdk7_counts_acquired_long.csv.gz")
+)
+counts_acquired_long <- read_csv(
+  file.path("data", "cdk7_counts_acquired_long.csv.gz")
+)
+
 library(ggbeeswarm)
 p <- counts_acquired_long %>%
   filter(
     type == "vst",
-    ensembl_gene_id == "ENSG00000003436"
+    ensembl_gene_id == "ENSG00000174720"
   ) %>%
   ggplot(
     aes(
