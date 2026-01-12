@@ -1,0 +1,13 @@
+{
+    "input": "samplesheet.csv",
+    "outdir": "results",
+    "split_fastq": 0,
+    "tools": "mutect2,strelka,manta,vep",
+    "trim_fastq": true,
+    "save_trimmed": true,
+    "aligner": "bwa-mem",
+    "save_mapped": true,
+    "joint_mutect2": true,
+    "vep_include_fasta": true,
+    "vep_dbnsfp": true
+}

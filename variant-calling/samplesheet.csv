@@ -1,0 +1,15 @@
+patient,status,sample,lane,fastq_1,fastq_2
+OV8,1,OV8-Y2,lane,fastq/OV8-Y2_R1_001.fastq.gz,fastq/OV8-Y2_R2_001.fastq.gz
+OV8,1,OV8-Y1,lane,fastq/OV8-Y1_R1_001.fastq.gz,fastq/OV8-Y1_R2_001.fastq.gz
+OV4,1,OV4-YT1,lane,fastq/OV4-YT1_R1_001.fastq.gz,fastq/OV4-YT1_R2_001.fastq.gz
+SNU8,1,SNU-Y1,lane,fastq/SNU-Y1_R1_001.fastq.gz,fastq/SNU-Y1_R2_001.fastq.gz
+OV3,0,OV3-P,lane,fastq/OV3-P_R1_001.fastq.gz,fastq/OV3-P_R2_001.fastq.gz
+OV8,1,OV8-YT1,lane,fastq/OV8-YT1_R1_001.fastq.gz,fastq/OV8-YT1_R2_001.fastq.gz
+OV4,1,OV4-Y1,lane,fastq/OV4-Y1_R1_001.fastq.gz,fastq/OV4-Y1_R2_001.fastq.gz
+OV3,1,OV3-Y1,lane,fastq/OV3-Y1_R1_001.fastq.gz,fastq/OV3-Y1_R2_001.fastq.gz
+OV8,1,OV8-Y3,lane,fastq/OV8-Y3_R1_001.fastq.gz,fastq/OV8-Y3_R2_001.fastq.gz
+OV8,1,OV8-S3,lane,fastq/OV8-S3_R1_001.fastq.gz,fastq/OV8-S3_R2_001.fastq.gz
+OV8,0,OV8-P,lane,fastq/OV8-P_R1_001.fastq.gz,fastq/OV8-P_R2_001.fastq.gz
+SNU8,0,SNU-P,lane,fastq/SNU-P_R1_001.fastq.gz,fastq/SNU-P_R2_001.fastq.gz
+OV4,0,OV4-P,lane,fastq/OV4-P_R1_001.fastq.gz,fastq/OV4-P_R2_001.fastq.gz
+OV8,1,OV8-YT3,lane,fastq/OV8-YT3_R1_001.fastq.gz,fastq/OV8-YT3_R2_001.fastq.gz
