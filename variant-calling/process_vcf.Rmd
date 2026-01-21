@@ -1,0 +1,507 @@
+---
+title: "CDK7 variant calls"
+author: "Clemens Hug"
+date: "2026-01-12"
+output:
+  html_document:
+    theme: flatly
+    toc: yes
+    number_sections: true
+    toc_float:
+      collapsed: false
+    toc_depth: 4
+    code_folding: show
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(data.table)
+library(qs)
+library(synExtra)
+library(DT)
+library(powerjoin)
+library(conflicted)
+library(VariantAnnotation)
+library(here)
+library(openxlsx)
+
+conflicts_prefer(
+  dplyr::filter,
+  dplyr::select,
+  dplyr::mutate,
+  dplyr::rename,
+  base::setdiff,
+  SummarizedExperiment::rowRanges,
+  dplyr::count,
+  dplyr::slice
+)
+
+synapser::synLogin()
+syn <- synDownloader("~/data", .cache = TRUE)
+```
+
+```{r}
+dt_options <- list(
+  dom = "Bfrtip",
+  buttons = "copy"
+)
+
+dt_format_signif <- function(dt) {
+  formatSignif(
+    dt,
+    keep(dt$x$data, is.numeric) |> names(),
+    digits = 2
+  )
+}
+
+dt_default_table <- function(df) {
+  datatable(
+    df |>
+      select(where(negate(is.list))),
+    extensions = "Buttons",
+    options = dt_options
+  ) |>
+    dt_format_signif()
+}
+```
+
+## Load data
+
+### VCFs
+
+```{r}
+vcf_syn <- synGlob(
+  "syn72323033", "*.vcf.gz"
+)
+
+vcf_paths <- map_chr(vcf_syn, syn)
+```
+
+```{r}
+vcf_raw <- map(
+  vcf_paths,
+  \(x) readVcf(x, "hg38", row.names = FALSE)
+) %>%
+  set_names(
+    str_remove(
+      names(.),
+      stringr::fixed(".mutect2.filtered_VEP.ann.vcf.gz")
+    ) |>
+      str_remove("_vs_.+")
+  )
+```
+
+### CRISPR
+
+```{r}
+crispr_raw <- syn("syn68586959") |>
+  read_csv()
+
+crispr_symbol_map <- syn("syn69693337") |>
+  read_csv(skip = 1) |>
+  mutate(
+    across(
+      `Match type`,
+      \(x) factor(x, levels = c("Approved symbol", "Alias symbol", "Previous symbol", "Entry withdrawn", "Unmatched"))
+    )
+  ) |>
+  group_by(Input) |>
+  slice(
+    which.min(as.integer(`Match type`))
+  ) |>
+  ungroup()
+
+crispr_joined <- crispr_raw |>
+  power_inner_join(
+    crispr_symbol_map |>
+      distinct(Input, approved_symbol = `Approved symbol`),
+    by = c("gene" = "Input"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn",
+      unmatched_keys_right = "warn"
+    )
+  ) |>
+  mutate(
+    signed_p = -sign(`average phenotype of strongest 5`) * log10(`Mann-Whitney p-value`)
+  )
+
+crispr_wide <- crispr_joined |>
+  transmute(
+    approved_symbol,
+    p = `Mann-Whitney p-value`,
+    phenotype = `average phenotype of strongest 5`,
+    screen = str_remove(screen, stringr::coll("crispr"))
+  ) |>
+  pivot_wider(
+    names_from = screen,
+    values_from = c(p, phenotype),
+    names_glue = "{screen}_{.value}",
+    names_vary = "slowest",
+    names_sort = TRUE,
+    values_fn = mean
+  )
+
+join_crispr <- function(df, by = "SYMBOL") {
+  left_join(
+    df,
+    crispr_wide,
+    # crispr_joined |>
+    #   select(
+    #     approved_symbol,
+    #     screen,
+    #     crispr_signed_p = signed_p,
+    #     crispr_avg_phenotype = `average phenotype of strongest 5`,
+    #     crispr_mw_p = `Mann-Whitney p-value`
+    #   ),
+    by = set_names("approved_symbol", by)
+  )
+}
+```
+
+## Filter VCFs
+
+```{r}
+dir.create(
+  here("variant-calling", "filtered"),
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+vcf_filtered <- map(
+  vcf_raw,
+  \(x) x[
+    rowRanges(x)$FILTER == "PASS"
+  ]
+)
+```
+
+```{r}
+iwalk(
+  vcf_filtered,
+  \(x, n) {
+    writeVcf(
+      x,
+      here(
+        "variant-calling", "filtered",
+        paste0(n, ".vcf.gz")
+      ),
+      index = TRUE
+    )
+  }
+)
+
+```
+
+## Identify shared variant positions
+
+Create subset of VCFs that only contain variants that are present in more
+than one sample.
+
+```{r}
+dir.create(
+  here("variant-calling", "shared_positions"),
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+shared_position_keys <- vcf_filtered |>
+  imap_dfr(
+    \(vcf, path) {
+      gr <- rowRanges(vcf)
+
+      tibble(
+        source = basename(path),
+        seqnames = as.character(GenomeInfoDb::seqnames(gr)),
+        pos = GenomicRanges::start(gr)
+      ) |>
+        distinct(source, seqnames, pos)
+    }
+  ) |>
+  count(seqnames, pos, name = "n_files") |>
+  filter(n_files > 1) |>
+  transmute(coord_id = paste(seqnames, pos, sep = "_")) |>
+  pull(coord_id)
+
+vcf_shared_positions <- map(
+  vcf_filtered,
+  \(vcf) {
+    gr <- rowRanges(vcf)
+    keys <- paste(
+      as.character(GenomeInfoDb::seqnames(gr)),
+      GenomicRanges::start(gr),
+      sep = "_"
+    )
+    keep <- keys %in% shared_position_keys
+
+    vcf[keep, ]
+  }
+)
+
+iwalk(
+  vcf_shared_positions,
+  \(x, n) {
+    writeVcf(
+      x,
+      here(
+        "variant-calling", "shared_positions",
+        paste0(
+          tools::file_path_sans_ext(basename(n), compression = TRUE),
+          ".vcf.gz"
+        )
+      ),
+      index = TRUE
+    )
+  }
+)
+```
+
+## Identify significant variants
+
+### Variants predicted to have high impact on protein function
+
+Including variants that have a "HIGH" impact severity (stop codons, frameshifts,
+splice site variants) or missense variants that are predicted to be "probably damaging"
+by PolyPhen. Even variants that are only present in a single clone are included here.
+
+```{r}
+csq_cols <- str_split_1(
+  "Allele|Consequence|IMPACT|SYMBOL|Gene|Feature_type|Feature|BIOTYPE|EXON|INTRON|HGVSc|HGVSp|cDNA_position|CDS_position|Protein_position|Amino_acids|Codons|Existing_variation|DISTANCE|STRAND|FLAGS|VARIANT_CLASS|SYMBOL_SOURCE|HGNC_ID|CANONICAL|MANE|MANE_SELECT|MANE_PLUS_CLINICAL|TSL|APPRIS|CCDS|ENSP|SWISSPROT|TREMBL|UNIPARC|UNIPROT_ISOFORM|GENE_PHENO|SIFT|PolyPhen|DOMAINS|miRNA|HGVS_OFFSET|AF|AFR_AF|AMR_AF|EAS_AF|EUR_AF|SAS_AF|gnomADe_AF|gnomADe_AFR_AF|gnomADe_AMR_AF|gnomADe_ASJ_AF|gnomADe_EAS_AF|gnomADe_FIN_AF|gnomADe_MID_AF|gnomADe_NFE_AF|gnomADe_REMAINING_AF|gnomADe_SAS_AF|gnomADg_AF|gnomADg_AFR_AF|gnomADg_AMI_AF|gnomADg_AMR_AF|gnomADg_ASJ_AF|gnomADg_EAS_AF|gnomADg_FIN_AF|gnomADg_MID_AF|gnomADg_NFE_AF|gnomADg_REMAINING_AF|gnomADg_SAS_AF|MAX_AF|MAX_AF_POPS|FREQS|CLIN_SIG|SOMATIC|PHENO|PUBMED|MOTIF_NAME|MOTIF_POS|HIGH_INF_POS|MOTIF_SCORE_CHANGE|TRANSCRIPTION_FACTORS",
+  stringr::fixed("|")
+)
+
+filter_vcf_csq <- function(vcf, filter_fn) {
+  parsed_csq <- transmute(
+    as_tibble(info(vcf)),
+    idx = seq_len(n()),
+    CSQ
+  ) |>
+    unchop(CSQ) |>
+    separate_wider_delim(
+      CSQ,
+      delim = "|",
+      names = csq_cols
+    )
+  filtered_csq <- filter_fn(parsed_csq)
+  consolidated_csq <- filtered_csq |>
+    select(
+      idx,
+      Gene, SYMBOL, Consequence, IMPACT, PolyPhen
+    )
+  # make sure we only have a single entry per variant
+  if (any(duplicated(consolidated_csq$idx))) {
+    stop("Filter function did not reduce to unique variants!")
+  }
+  filtered_vcf <- vcf[unique(consolidated_csq$idx), ]
+  info(filtered_vcf) <- cbind(info(filtered_vcf), consolidated_csq)
+  filtered_vcf
+}
+
+damaging_variants <- vcf_filtered |>
+  map(
+    \(x) {
+      res_vcf <- filter_vcf_csq(
+        x,
+        \(c) filter(
+          c,
+          IMPACT == "HIGH" |
+            (str_detect(Consequence, stringr::coll("missense_variant")) &
+            str_detect(PolyPhen, stringr::coll("probably_damaging")))
+        )
+      )
+      res_df <- rowRanges(res_vcf) |>
+        as_tibble() |>
+        transmute(
+          chrom = seqnames, start, end
+        ) |>
+        bind_cols(
+          info(res_vcf) |>
+            as_tibble() |>
+            transmute(
+              Gene, SYMBOL, across(TLOD, as.double), Consequence, IMPACT, PolyPhen
+            )
+        ) |>
+        arrange(desc(TLOD))
+      # browser()
+      res_df
+    }
+  ) |>
+  bind_rows(.id = "sample") |>
+  join_crispr("SYMBOL")
+
+write_csv(
+  damaging_variants,
+  here("variant-calling", "damaging_variants_summary.csv.gz")
+)
+```
+
+
+```{r}
+damaging_variants_gene_summary <- damaging_variants |>
+  group_by(Gene, SYMBOL) |>
+  summarise(
+    n_vcfs = n_distinct(sample),
+    n_cell_lines = n_distinct(str_split_fixed(sample, stringr::fixed("-"), 2)[, 1]),
+    affected_vcfs = list(sort(unique(sample))),
+    affected_vcfs_str = map_chr(affected_vcfs, \(x) paste(x, collapse = "; ")),
+    .groups = "drop"
+  ) |>
+  arrange(desc(n_vcfs)) |>
+  join_crispr("SYMBOL")
+```
+
+#### Tables  {.tabset .tabset-pills}
+
+##### All damaging variants
+
+```{r, echo=FALSE}
+dt_default_table(damaging_variants)
+```
+
+##### Damaging variants gene summary
+
+
+```{r, echo=FALSE}
+dt_default_table(damaging_variants_gene_summary)
+```
+
+### Less impactful variants present in multiple clones
+
+```{r}
+variant_whitelist <- c(
+  "coding_sequence_variant",
+  "5_prime_UTR_variant",
+  "3_prime_UTR_variant",
+  "coding_transcript_variant",
+  "TFBS_ablation",
+  "TFBS_amplification",
+  "TF_binding_site_variant",
+  "regulatory_region_ablation",
+  "regulatory_region_amplification",
+  "regulatory_region_variant",
+  "splice_donor_5th_base_variant",
+  "splice_region_variant",
+  "splice_donor_region_variant",
+  "splice_polypyrimidine_tract_variant"
+)
+
+shared_position_gene_hits <- vcf_shared_positions |>
+  imap(
+    \(vcf, path) {
+      map(
+        info(vcf)$CSQ,
+        \(x) {
+          csq_split <- str_split_fixed(
+            x,
+            stringr::fixed("|"),
+            n = 5
+          )
+          csq_split[, 4][
+            csq_split[, 3] %in% c("HIGH", "MODERATE") |
+              str_detect(
+                csq_split[, 2],
+                paste(variant_whitelist, collapse = "|")
+              )
+          ]
+        }
+      ) |>
+        purrr::reduce(base::union)
+    }
+  )
+
+shared_position_gene_summary <- enframe(
+  shared_position_gene_hits,
+  name = "sample", value = "gene_symbol"
+) |>
+  unchop(gene_symbol) |>
+  group_by(gene_symbol) |>
+  summarise(
+    n_vcfs = n_distinct(sample),
+    n_cell_lines = n_distinct(str_split_fixed(sample, stringr::fixed("-"), 2)[, 1]),
+    affected_vcfs = list(sort(unique(sample))),
+    affected_vcfs_str = map_chr(affected_vcfs, \(x) paste(x, collapse = "; ")),
+    .groups = "drop"
+  ) |>
+  arrange(desc(n_vcfs)) |>
+  join_crispr("gene_symbol")
+```
+
+```{r, echo=FALSE}
+dt_default_table(shared_position_gene_summary)
+```
+
+## Make Excel summary file
+
+```{r}
+format_p <- function(wb, sheet_name, col_name, table) {
+  data_rows <- nrow(table) + 1  # +1 for header
+  col_idx <- which(names(table) == col_name)
+
+  conditionalFormatting(
+    wb = wb,
+    sheet = sheet_name,
+    cols = col_idx,
+    rows = 2:data_rows,  # Skip header row
+    type = "expression",
+    rule = paste0(
+      "AND(NOT(ISBLANK(", openxlsx::int2col(col_idx), "2)),",
+      "ISNUMBER(", openxlsx::int2col(col_idx), "2),",
+      openxlsx::int2col(col_idx), "2<0.05)"
+    ),
+    style = createStyle(bgFill = "#FF9999")  # Light red background
+  )
+}
+
+format_phenotype <- function(wb, sheet_name, col_name, table) {
+  data_rows <- nrow(table) + 1  # +1 for header
+  col_idx <- which(names(table) == col_name)
+
+  min_max <- quantile(table[[col_name]], probs = c(0.025, 0.975), na.rm = TRUE) |>
+    abs() |>
+    max()
+
+  conditionalFormatting(
+    wb = wb,
+    sheet = sheet_name,
+    cols = col_idx,
+    rows = 2:data_rows,  # Skip header row
+    type = "colourScale",
+    style = c("blue", "white", "red"),
+    rule = c(-1, 0, 1) * min_max
+  )
+}
+
+add_sheet <- function(wb, sheet_name, table) {
+  addWorksheet(wb, sheet_name)
+  table <- select(table, where(negate(is.list)))
+  writeDataTable(wb, sheet_name, table, tableStyle = "TableStyleLight1")
+  walk(
+    str_subset(names(table), "_p$"),
+    \(col_name) format_p(wb, sheet_name, col_name, table)
+  )
+  walk(
+    str_subset(names(table), "_phenotype$"),
+    \(col_name) format_phenotype(wb, sheet_name, col_name, table)
+  )
+  setColWidths(wb, sheet_name, cols = seq_len(ncol(table)), widths = "auto")
+}
+
+wb <- createWorkbook()
+
+list(
+  "Damaging Variants" = damaging_variants,
+  "Damaging Variants Gene Summary" = damaging_variants_gene_summary,
+  "Shared Position Gene Summary" = shared_position_gene_summary
+) |>
+  iwalk(\(t, n) add_sheet(wb, n, t))
+
+# Save the workbook
+saveWorkbook(
+  wb, here("variant-calling", "variant_calling_summary.xlsx"), overwrite = TRUE
+)
+
+
+```

@@ -21,3 +21,6 @@ nextflow run nf-core/sarek -r 3.5.1 -profile singularity \
   -params-file nf-params.json -c ~/o2.config \
   -with-trace -with-report report-${ts}.html -with-timeline timeline-${ts}.html \
   "$@"
+
+# whole exome sequencing
+
