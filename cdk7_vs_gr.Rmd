@@ -16,6 +16,10 @@ library(powerjoin)
 library(synExtra)
 library(IHW)
 library(conflicted)
+library(furrr)
+library(openxlsx)
+library(seriation)
+library(withr)
 
 conflicts_prefer(
   dplyr::filter,
@@ -31,27 +35,12 @@ syn_analysis <- synMkdir("syn52226362", "analysis")
 
 
 ```{r}
+ensembl_gtf_combined <- syn("syn71972264") %>%
+  read_csv()
 
-ensembl_gtf_file <- "Homo_sapiens.GRCh38.109.gtf.gz"
-if (!file.exists(ensembl_gtf_file)) {
-  download.file(
-    "ftp://ftp.ensembl.org/pub/release-109/gtf/homo_sapiens/Homo_sapiens.GRCh38.109.gtf.gz",
-    ensembl_gtf_file, method = "curl"
-  )
-}
-
-ensembl_gtf <- rtracklayer::readGFF(
-  ensembl_gtf_file
-) %>%
-  distinct(
-    ensembl_gene_id = gene_id,
-    hgnc_symbol = gene_name,
-    gene_biotype
-  ) %>%
-  drop_na(ensembl_gene_id) %>%
-  mutate(
-    gene_name = coalesce(hgnc_symbol, ensembl_gene_id)
-  )
+gene_id_to_name_map <- ensembl_gtf_combined %>%
+  split(.$assay) %>%
+  map(\(x) with(x, set_names(gene_name, ensembl_gene_id)))
 
 deep_meta <- syn("syn60529546") %>%
   readxl::read_excel() %>%
@@ -63,6 +52,11 @@ deep_meta <- syn("syn60529546") %>%
     cell_line = str_replace_all(cell_line, fixed("-"), "")
   )
 
+dge_meta <- syn("syn71968688") %>%
+  read_csv()
+
+dge_counts_combined <- syn("syn71969557") %>%
+  read_csv()
 
 deseq_res_combined <- synPluck(
   syn_analysis, "cdk7_deseq_res_combined_long.csv"
@@ -76,7 +70,7 @@ deseq_res_gr <- synPluck(
   syn() %>%
   read_csv()
 
-deseq_res_baseline <- synPluck(
+deseq_res_baseline_dge <- synPluck(
   syn_analysis, "cdk7_deseq_baseline_res.csv"
 ) %>%
   syn() %>%
@@ -104,7 +98,7 @@ counts_baseline <- syn("syn60530854") %>%
 deep_baseline_varstab_zscores <- syn("syn68500190") %>%
   read_csv()
 
-deep_baseline_varstab_differences<- syn("syn68509714") %>%
+deep_baseline_varstab_differences <- syn("syn68509714") %>%
   read_csv()
 
 gr_raw <- syn("syn68499802") %>%
@@ -123,102 +117,89 @@ Because there are big batch effects between cell lines evidenced
 by the PCA plots, only use the 2019_08 experiment here. That way
 we also only have 24h time point instead of 24h and 48h.
 
-
-```{r}
-p <- deseq_res_baseline %>%
-  ggplot(
-    aes(log2FoldChange, -log10(padj))
-  ) +
-  ggrastr::rasterize(geom_point(shape = 16, alpha = 0.3), dev = "ragg", dpi = 200) +
-  facet_wrap(~cell_line)
-
-ggsave(
-  file.path("plots_cdk7", "baseline_lfc_padj.pdf"),
-  p,
-  width = 10,
-  height = 8
-)
-```
-
-
-```{r}
-de_baseline_n_sig <- deseq_res_baseline %>%
-  group_by(cell_line) %>%
-  summarize(
-    n_sig = sum(padj < 0.05, na.rm = TRUE),
-    .groups = "drop"
-  )
-
-p <- de_baseline_n_sig %>%
-  ggplot(
-    aes(cell_line, n_sig)
-  ) +
-    geom_col() +
-    coord_flip() +
-    labs(x = NULL, y = "Number of significant genes")
-
-ggsave(
-  file.path("plots_cdk7", "baseline_n_sig.pdf"),
-  p,
-  width = 6,
-  height = 4
-)
-
-de_baseline_selected_genes <- deseq_res_baseline %>%
-  group_by(ensembl_gene_id) %>%
-  filter(any(padj < 0.05)) %>%
-  ungroup() %>%
-  pull(ensembl_gene_id) %>%
-  unique()
-```
-
-```{r}
-better_contrast <- function(
-  colors1, colors2, threshold = 0
-) {
-  # browser()
-  farver::compare_colour(
-    farver::decode_colour(colors1),
-    farver::decode_colour(colors2),
-    from_space = "rgb",
-    method = "cie2000"
-  ) %>% {
-      .[, 1] < (1 + threshold) * .[, 2]
-    } %>%
-    if_else(colors2[2], colors2[1])
-}
-```
-
-## Correlation DGE baseline
+## Correlating baseline expression and GR scores
 
 Correlate GR50 vs log2FC of each cell line compared to the grand
 mean. Hopefully we're able to identify some genes that are correlated
 
+First have to compute the mean vst count for DGE data, where we have more than
+one replicate per cell line.
+
+```{r}
+dge_counts_baseline_mean <- dge_counts_combined %>%
+  filter(
+    type == "varstab"
+  ) %>%
+  pivot_longer(
+    cols = -c(ensembl_gene_id, type, hgnc_symbol, gene_name),
+    names_to = "sample_id",
+    values_to = "count"
+  ) %>%
+  power_inner_join(
+    dge_meta %>%
+      filter(
+        experiment == "cdk_467_2019_08",
+        agent == "control",
+      ) %>%
+      select(cell_line, sample_id),
+    by = "sample_id",
+    check = check_specs(
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  group_by(cell_line, ensembl_gene_id, hgnc_symbol, gene_name) %>%
+  summarize(
+    count_sd = sd(count),
+    count = mean(count),
+    .groups = "drop"
+  )
+
+```
+
+and figure out which genes are eligible
+
+```{r}
+cor_eligible_genes <- bind_rows(
+  deep = counts_baseline %>%
+    filter(type == "raw"),
+  dge = dge_counts_combined %>%
+    filter(type == "raw") %>%
+    select(
+      ensembl_gene_id,
+      any_of(
+        dge_meta %>%
+          filter(
+            experiment == "cdk_467_2019_08",
+            agent == "control",
+          ) %>%
+          pull(sample_id)
+      )
+    ) %>%
+    pivot_longer(
+      -c(ensembl_gene_id),
+      names_to = "sample_id",
+      values_to = "count"
+    ),
+  .id = "assay"
+) %>%
+  group_by(assay, ensembl_gene_id) %>%
+  summarize(
+    n_over_10 = sum(count > 10),
+    .groups = "drop"
+  ) %>%
+  filter(n_over_10 > 3)
+
+
+gr_long <- gr_raw %>%
+  pivot_longer(
+    cols = -c(cell_line, agent),
+    names_to = "gr_metric",
+    values_to = "gr_value"
+  )
+```
+
 ```{r}
 library(IHW)
-
-baseline_lfc_mat <- deseq_res_baseline %>%
-  select(cell_line, ensembl_gene_id, log2FoldChange) %>%
-  pivot_wider(names_from = cell_line, values_from = log2FoldChange, values_fill = 0) %>%
-  column_to_rownames("ensembl_gene_id") %>%
-  as.matrix()
-
-
-gr_raw %>%
-  filter(cell_line %in% baseline_meta$cell_line) %>%
-  View()
-
-gr_mats <- gr_raw %>%
-  select(cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
-  column_to_rownames("cell_line") %>%
-  as.matrix() %>%
-  t() %>% {
-    .[, baseline_meta$cell_line]
-  }
-
-baseline_lfc_mat_overlap <- baseline_lfc_mat[
-  de_baseline_selected_genes, baseline_meta$cell_line
-]
 
 compute_correlation <- function(gr_mat, lfc_mat, ...) {
   mean_expr <- rowMeans(lfc_mat, na.rm = TRUE) %>%
@@ -273,281 +254,113 @@ compute_correlation <- function(gr_mat, lfc_mat, ...) {
   cor_df
 }
 
-baseline_lfc_cor_df <- compute_correlation(
-  gr_mats,
-  baseline_lfc_mat_overlap
-)
-
-p <- baseline_lfc_cor_df %>%
-  pivot_longer(
-    cols = -c(ensembl_gene_id, hgnc_symbol, gene_name, gr_metric),
-    names_to = "cor_metric",
-    values_to = "value"
-  ) %>%
-  ggplot(aes(value, color = cor_metric)) +
-    stat_ecdf(geom = "step") +
-    facet_wrap(~gr_metric)
-
-dir.create("plots_cdk7")
-ggsave(
-  file.path("plots_cdk7", "baseline_lfc_cor_ecdf.pdf"),
-  p,
-  width = 10,
-  height = 8
-)
-
-p <- baseline_lfc_cor_df %>%
-  select(-lfc_var) %>%
-  pivot_longer(
-    cols = -c(ensembl_gene_id, hgnc_symbol, gene_name, gr_metric),
-    names_to = "cor_metric",
-    values_to = "value"
-  ) %>%
-  ggplot(aes(value, color = cor_metric)) +
-    geom_freqpoly() +
-    facet_wrap(~gr_metric)
-
-baseline_lfc_cor_sig <- baseline_lfc_cor_df %>%
-  group_by(gr_metric) %>%
-  arrange(p) %>%
-  slice_head(n = 10) %>%
-  ungroup()
-  # filter(p.adj < 0.1) %>%
-  # arrange(p.adj)
-
-p <- baseline_lfc_cor_df %>%
-  inner_join(
-    de_baseline_res
-  ) %>%
-  inner_join(
-    gr_raw %>%
-      select(cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
-      pivot_longer(-cell_line, names_to = "gr_metric", values_to = "gr_value"),
-  ) %>%
-  ggplot(
-    aes(gr_value, log2FoldChange, color = gr_metric)
-  ) +
-    geom_point() +
-    geom_smooth(method = "lm") +
-    facet_wrap(~gene_name, scales = "free")
-
-p <- baseline_lfc_cor_df %>%
-  filter(gr_metric %in% c("neglog_GR50", "GRmax")) %>%
-  filter(
-    ensembl_gene_id %in% {
-      group_by(., gr_metric) %>%
-        arrange(p) %>%
-        slice_head(n = 10) %>%
-        pull(ensembl_gene_id)
-    }
-  ) %>%
-  inner_join(
-    de_baseline_res
-  ) %>%
-  inner_join(
-    gr_raw %>%
-      select(cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
-      pivot_longer(-cell_line, names_to = "gr_metric", values_to = "gr_value"),
-  ) %>%
-  group_nest(gr_metric) %>%
-  mutate(
-    p = map2(
-      data, gr_metric,
-      function(df, g) {
-        ggplot(
-          df %>%
-            arrange(p) %>%
-            mutate(across(gene_name, fct_inorder)),
-          aes(gr_value, log2FoldChange)
-        ) +
-          geom_point() +
-          geom_smooth(method = "lm") +
-          geom_text(
-            aes(x = x, y = y, label = p),
-            hjust = 0, vjust = 1,
-            nudge_x = 0.1, nudge_y = -0.1,
-            data = \(df) distinct(df, gene_name, p) %>%
-              mutate(
-                across(p, \(x) signif(x, digits = 2)),
-                x = if (g == "GR50") Inf else -Inf, y = Inf
-              )
-          ) +
-          facet_wrap(~gene_name, scales = "free") +
-          scale_x_continuous(
-            trans = switch(
-              g,
-              neglog_GR50 = "identity",
-              GR50 = c("reverse"),
-              "identity"
-            )
-          ) +
-          labs(
-            x = g,
-            y = "log2FoldChange cell line vs grand mean",
-            title = g
-          )
-      }
+baseline_gr_cor_inputs <- tribble(
+  ~assay, ~expression_metric, ~expression_data,
+  "dge", "log2FoldChange", deseq_res_baseline %>%
+    transmute(
+      cell_line,
+      ensembl_gene_id,
+      expression_value = log2FoldChange
+    ),
+  "dge", "signed_p", deseq_res_baseline %>%
+    transmute(
+      cell_line,
+      ensembl_gene_id,
+      expression_value = -log10(
+        if_else(
+          pvalue == 0,
+          .Machine$double.xmin,
+          replace_na(pvalue, 1)
+        )
+      ) * sign(log2FoldChange)
+    ),
+  "dge", "vst", dge_counts_baseline_mean %>%
+    select(cell_line, ensembl_gene_id, expression_value = count),
+  "deep", "vst", counts_baseline %>%
+    filter(type == "varstab") %>%
+    select(
+      cell_line,
+      ensembl_gene_id,
+      expression_value = count
     )
+) %>%
+  crossing(
+    cor_metric = c("spearman")
+  ) %>%
+  inner_join(
+    cor_eligible_genes %>%
+      group_nest(assay, .key = "eligible_genes"),
+    by = "assay"
   )
 
-ps <- patchwork::wrap_plots(p$p)
-
-ggsave(
-  file.path("plots_cdk7", "baseline_lfc_cor_most_sig.pdf"),
-  ps,
-  width = 16,
-  height = 8
+qsave(
+  baseline_gr_cor_inputs,
+  file.path("data", "baseline_gr_cor_inputs.qs")
 )
-
-p <- baseline_lfc_cor_df %>%
-  ggplot(
-    aes(cor, color = metric)
-  ) +
-    stat_ecdf(geom = "step")
-
-baseline_lfc_cor_highest <- baseline_lfc_cor_df %>%
-  arrange(cor) %>%
-  group_by(metric) %>%
-  dplyr::slice(
-    1:10, (n() - 9):n()
-  ) %>%
-  ungroup() %>%
-  left_join(
-    ensembl_gtf %>%
-      select(ensembl_gene_id, hgnc_symbol),
-    by = "ensembl_gene_id"
-  )
-```
-
-## Baseline deep counts
-
-```{r}
-
-gr_long <- gr_raw %>%
-  filter(agent != "Staurosporine") %>%
-  mutate(
-    cell_line = str_replace_all(cell_line, fixed("-"), "")
-  ) %>%
-  select(agent, cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
-  pivot_longer(
-    cols = -c(cell_line, agent),
-    names_to = "gr_metric",
-    values_to = "gr_value"
-  )
 
 gr_mats <- gr_raw %>%
   filter(agent != "Staurosporine") %>%
-  mutate(
-    cell_line = str_replace_all(cell_line, fixed("-"), "")
-  ) %>%
+  select(agent, cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
   split(.$agent) %>%
   map(
-    \(x) select(x, cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
+    \(x) select(x, -agent) %>%
       column_to_rownames("cell_line") %>%
       as.matrix() %>%
       t()
   )
 
-
-intersect(
-  counts_baseline$cell_line,
-  colnames(gr_mats[[1]])
-)
-setdiff(
-  counts_baseline$cell_line,
-  colnames(gr_mats[[1]])
-)
-setdiff(
-  colnames(gr_mats[[1]]),
-  counts_baseline$cell_line
-)
-deep_baseline_cell_line_overlap <- intersect(
-  counts_baseline$cell_line,
-  colnames(gr_mats[[1]])
-)
-
-deep_baseline_eligible_genes <- counts_baseline %>%
-  filter(
-    type == "normalized",
-    cell_line %in% deep_baseline_cell_line_overlap
-  ) %>%
-  group_by(ensembl_gene_id) %>%
-  summarize(
-    n_above_10 = sum(count > 10), .groups = "drop"
-  ) %>%
-  filter(n_above_10 > 5) %>%
-  pull(ensembl_gene_id) %>%
-  unique()
-
-counts_baseline_ranks <- counts_baseline %>%
-  group_by(
-    type, ensembl_gene_id, hgnc_symbol, gene_name
-  ) %>%
+baseline_gr_cor_res_raw <- baseline_gr_cor_inputs %>%
+  # filter(expression_metric == "vst", assay == "deep") %>%
   mutate(
-    count_rank = rank(count)
-  ) %>%
-  ungroup()
-
-baseline_deep_varstab_mat <- counts_baseline %>%
-  filter(
-    type == "varstab",
-    cell_line %in% deep_baseline_cell_line_overlap,
-    ensembl_gene_id %in% deep_baseline_eligible_genes
-  ) %>%
-  select(cell_line, ensembl_gene_id, count) %>%
-  pivot_wider(names_from = cell_line, values_from = count, values_fill = 0) %>%
-  column_to_rownames("ensembl_gene_id") %>%
-  as.matrix() %>%
-  {.[, deep_baseline_cell_line_overlap]}
-
-gr_mats_ordered <- map(gr_mats, \(x) x[, deep_baseline_cell_line_overlap])
-
-baseline_deep_varstab_cor_df <- map(
-  gr_mats_ordered,
-  \(x) compute_correlation(
-    x,
-    baseline_deep_varstab_mat,
-    # log10(baseline_deep_varstab_mat + .5 * min(baseline_deep_varstab_mat[baseline_deep_varstab_mat > 0])),
-    method = "spearman"
-  ) %>%
-    left_join(
-      counts_baseline %>%
-        distinct(ensembl_gene_id, hgnc_symbol, gene_name),
-      by = "ensembl_gene_id"
-    )
-) %>%
-  bind_rows(.id = "agent")
-
-```
-
-```{r}
-library(ggrepel)
-
-p <- baseline_deep_varstab_cor_df %>%
-  drop_na(r) %>%
-  ggplot(
-    aes(r, -log10(p))
-  ) +
-  ggrastr::rasterize(geom_point(), dev = "ragg", dpi = 150) +
-  geom_text_repel(
-    aes(label = gene_name),
-    data = \(x) group_by(
-      x, gr_metric
-    ) %>%
-      arrange(p) %>%
-      mutate(
-        gene_name = if_else(
-          row_number() %in% 1:5,
-          gene_name,
-          ""
+    cor_res = pmap(
+      pick(everything()),
+      \(cor_metric, expression_data, eligible_genes, expression_metric, ...) {
+        message(expression_metric, "...")
+        expr_mat <- expression_data %>%
+          pivot_wider(
+            names_from = cell_line,
+            values_from = expression_value
+          ) %>%
+          column_to_rownames("ensembl_gene_id") %>%
+          as.matrix()
+        # browser()
+        map(
+          gr_mats,
+          \(x) {
+            common_cell_lines <- intersect(
+              colnames(x),
+              colnames(expr_mat)
+            )
+            compute_correlation(
+              x[, common_cell_lines],
+              expr_mat[eligible_genes$ensembl_gene_id, common_cell_lines],
+              method = cor_metric
+            )
+          }
         )
-      ),
-    max.overlaps = Inf
-  ) +
-  ggh4x::facet_wrap2(
-    ~gr_metric
+      }
+    )
   )
+
+baseline_gr_cor_res <- baseline_gr_cor_res_raw %>%
+  transmute(
+    assay, expression_metric,
+    cor_metric,
+    cor_res = map(
+      cor_res,
+      \(x) bind_rows(x, .id = "agent")
+    )
+  ) %>%
+  unnest(cor_res)
+
+write_csv(
+  baseline_gr_cor_res,
+  file.path("data", "baseline_gr_cor_res.csv.gz")
+)
+
 ```
+
+## Baseline vs GR plots
 
 ```{r}
 compound_meta <- tribble(
@@ -578,25 +391,27 @@ compound_meta <- tribble(
 ```
 
 ```{r}
-baseline_deep_varstab_cor_df_top_10_data <- baseline_deep_varstab_cor_df %>%
+baseline_gr_cor_df_top_10_data <- baseline_gr_cor_res %>%
   arrange(p) %>%
-  group_by(agent, gr_metric) %>%
+  group_by(agent, gr_metric, cor_metric, expression_metric, assay) %>%
   slice_head(n = 12) %>%
   ungroup() %>%
   left_join(
-    counts_baseline_ranks %>%
-      filter(type == "varstab", cell_line %in% deep_baseline_cell_line_overlap),
-    by = c("ensembl_gene_id", "hgnc_symbol", "gene_name"),
+    baseline_gr_cor_inputs %>%
+      select(-eligible_genes) %>%
+      unnest(expression_data),
+    by = c("assay", "expression_metric", "cor_metric", "ensembl_gene_id"),
     relationship = "many-to-many"
   ) %>%
-  powerjoin::power_left_join(
+  powerjoin::power_inner_join(
     gr_long,
     by = c("agent", "cell_line", "gr_metric"),
     check = powerjoin::check_specs(
-      unmatched_keys_left = "warn",
       duplicate_keys_right = "warn"
     )
   )
+
+baseline_gr_cor_res %>% filter(agent == "AZD5363", cell_line == "OCE2")
 
 ps <- baseline_deep_varstab_cor_df_top_10_data %>%
   group_nest(agent, gr_metric) %>%
@@ -756,13 +571,14 @@ cluster_fun_eucl <- function(mat, features_in_rows = TRUE) {
   reorder(clust, dist_mat, method = "OLO")
 }
 
-baseline_deep_varstab_cor_df_hm_data <- baseline_deep_varstab_cor_df %>%
+baseline_cor_df_hm_data <- baseline_gr_cor_res %>%
   filter(gr_metric != "neglog_GR50") %>%
   semi_join(
-    group_by(., gr_metric, agent) %>%
+    group_by(., assay, expression_metric, gr_metric, cor_metric, agent) %>%
+      drop_na(r) %>%
       arrange(abs(r)) %>%
       slice_tail(n = 30),
-    by = c("gr_metric", "ensembl_gene_id")
+    by = c("assay", "expression_metric", "cor_metric", "gr_metric", "ensembl_gene_id")
   )
 
 paletteer_shim <- function(palette_name) {
@@ -771,8 +587,8 @@ paletteer_shim <- function(palette_name) {
   }
 }
 
-baseline_deep_varstab_cor_df_hms <- baseline_deep_varstab_cor_df_hm_data %>%
-  group_nest(gr_metric) %>%
+baseline_cor_df_hms_all_agents <- baseline_cor_df_hm_data %>%
+  group_nest(assay, expression_metric, gr_metric, cor_metric) %>%
   mutate(
     mat = map(
       data,
@@ -819,10 +635,10 @@ baseline_deep_varstab_cor_df_hms <- baseline_deep_varstab_cor_df_hm_data %>%
   )
 
 pwalk(
-  baseline_deep_varstab_cor_df_hms,
-  \(gr_metric, hm, data, ...) {
+  baseline_cor_df_hms_all_agents,
+  \(gr_metric, hm, data, assay, expression_metric, cor_metric, ...) {
     withr::with_pdf(
-      file.path("plots_cdk7", paste0("baseline_deep_varstab_rank_cor_hm_", gr_metric, ".pdf")),
+      file.path("plots_cdk7", paste0("baseline_cor_hm_", assay, "_", expression_metric, "_", cor_metric, "_", gr_metric, ".pdf")),
       {
         draw(hm)
       },
@@ -864,7 +680,6 @@ selected_gene_sets <- all_gene_sets %>%
   filter(
     gs_collection %in% c("H") |
       gs_subcollection %in% c(
-        "CP:PID",
         "CP:REACTOME",
         "CP:KEGG_MEDICUS"
       ),
@@ -886,46 +701,43 @@ selected_gene_sets_list <- selected_gene_sets %>%
       set_names(pathway)
   )
 
-selected_des <- baseline_deep_varstab_cor_df %>%
+baseline_gr_cor_fgsea_input <- baseline_gr_cor_res %>%
   drop_na(r) %>%
-  group_nest(agent, gr_metric) %>%
+  group_nest(agent, assay, expression_metric, cor_metric, gr_metric) %>%
   mutate(
     de = map(
       data,
       \(x) set_names(x$r, x$ensembl_gene_id)
-    ),
-    de_p = map(
-      data,
-      \(x) set_names(-sign(x$r) * log10(x$p), x$ensembl_gene_id)
     )
   )
 
-fgsea_res_raw <- selected_des %>%
+baseline_gr_cor_fgsea_res_raw <- baseline_gr_cor_fgsea_input %>%
   mutate(
     res = map(
       de,
-      \(x) fgseaMultilevel(
+      \(x) withr::with_seed(42, quietly(fgseaMultilevel)(
         selected_gene_sets_list$gs,
         x
-      )
-    ),
-    res_p = map(
-      de_p,
-      \(x) fgseaMultilevel(
-        selected_gene_sets_list$gs,
-        x
-      )
+      ))
     )
   )
 
-fgsea_res_long <- fgsea_res_raw %>%
-  select(agent, gr_metric, res) %>%
-  unnest(res) %>%
+
+baseline_gr_cor_fgsea_res_long <- baseline_gr_cor_fgsea_res_raw %>%
+  select(agent, assay, expression_metric, cor_metric, gr_metric, res) %>%
+  unnest_wider(res, transform = list(warnings = \(x) paste(x, collapse = ""))) %>%
+  unnest(result) %>%
   mutate(
     signed_p = -sign(NES) * log10(padj),
     p_cut = cut(padj, breaks = c(-Inf, 0.01, 0.05, Inf), labels = c("**", "*", ""))
   )
+
+write_csv(
+  baseline_gr_cor_fgsea_res_long,
+  file.path("data", "baseline_gr_cor_fgsea_res.csv.gz")
+)
 ```
+
 
 ### Barplots
 
@@ -1116,6 +928,475 @@ pwalk(
     )
   }
 )
+```
+
+
+Lots and lots of ties (>90% often), doing overrep analysis on top n genes instead
+
+## Using fora instead
+
+```{r}
+baseline_gr_cor_fora_input <- baseline_gr_cor_res %>%
+  drop_na(r) %>%
+  mutate(
+    direction = if_else(r > 0, "positive", "negative")
+  ) %>%
+  arrange(p) %>%
+  group_by(
+    agent, assay, expression_metric, cor_metric, gr_metric, direction
+  ) %>%
+  summarize(
+    de = list(head(ensembl_gene_id[p < .05], n = 300)),
+    universe = list(ensembl_gene_id),
+    .groups = "drop"
+  )
+
+
+plan(multicore, workers = 6)
+baseline_gr_cor_fora_res_raw <- baseline_gr_cor_fora_input %>%
+  mutate(
+    res = map2(
+      de, universe,
+      \(x, y) withr::with_seed(42, fora(
+        selected_gene_sets_list$gs,
+        x,
+        universe = y
+      ))
+    ),
+    res_reduced = future_pmap(
+      list(res, de, universe),
+      \(res, de, universe) {
+        collapsePathwaysORA(
+          filter(res, padj < .05),
+          selected_gene_sets_list$gs,
+          de,
+          universe
+        )
+      },
+      .progress = TRUE
+    )
+  )
+
+baseline_gr_cor_fora_res_long <- baseline_gr_cor_fora_res_raw %>%
+  transmute(
+    agent, assay, expression_metric, cor_metric, gr_metric, direction,
+    res = map2(
+      res, res_reduced,
+      \(full, reduced) {
+        mutate(
+          full,
+          is_main = pathway %in% reduced$mainPathways,
+          parent_pathway = reduced$parentPathways[pathway]
+        )
+      }
+    )
+  ) %>%
+  unnest(res) %>%
+  mutate(
+    signed_p = if_else(direction == "up", 1, -1) * log10(padj),
+    overlapNames = map2(
+      overlapGenes, assay,
+      \(x, y) gene_id_to_name_map[[y]][x]
+    )
+  )
+
+write_csv(
+  baseline_gr_cor_fora_res_long,
+  file.path("data", "baseline_gr_cor_fora_res.csv.gz")
+)
+```
+
+### Excel sheet
+
+```{r}
+significant_style <- createStyle(fontColour = "red")
+
+baseline_gr_cor_fora_excel <- createWorkbook()
+
+baseline_gr_cor_fora_res_long %>%
+  select(-c(overlapGenes)) %>%
+  filter(
+    gr_metric != "neglog_GR50",
+    assay == "deep",
+    expression_metric == "vst",
+    cor_metric == "spearman"
+  ) %>%
+  arrange(padj, pval) %>%
+  group_by(agent) %>%
+  group_walk(
+    \(df, g) {
+      addWorksheet(
+        baseline_gr_cor_fora_excel,
+        g$agent
+      )
+      writeDataTable(
+        baseline_gr_cor_fora_excel,
+        sheet = g$agent,
+        x = df,
+        tableStyle = "TableStyleLight8"
+      )
+      setColWidths(
+        baseline_gr_cor_fora_excel, g$agent,
+        cols = seq_len(ncol(df)),
+        widths = "auto"
+      )
+      walk(
+        which(names(df) == "padj"),
+        \(i) {
+          data_rows <- nrow(df) + 1L  # +1 for header
+          de_col_data <- df[[i]]
+          significant_rows <- which(!is.na(de_col_data) & de_col_data < 0.05) + 1L  # +1 for header
+          if (length(significant_rows) > 0) {
+            addStyle(
+              wb = baseline_gr_cor_fora_excel,
+              sheet = g$agent,
+              style = significant_style,
+              rows = significant_rows,
+              cols = i,
+              gridExpand = FALSE
+            )
+          }
+        }
+      )
+    }
+  )
+
+saveWorkbook(
+  baseline_gr_cor_fora_excel,
+  file.path("plots_cdk7", "baseline_gr_cor_fora_overrepresentation.xlsx"),
+  overwrite = TRUE
+)
+```
+
+
+### Dot plots
+
+```{r}
+baseline_gr_cor_fora_dotplots <- baseline_gr_cor_fora_res_long %>%
+  filter(gr_metric != "neglog_GR50") %>%
+  mutate(
+    log2_foldEnrichment = log2(if_else(foldEnrichment == 0, .5, foldEnrichment)),
+    directed_enrichment = pmax(
+      log2_foldEnrichment,
+      0
+    ) * if_else(direction == "positive", 1, -1),
+    p_cut = cut(
+      padj,
+      breaks = c(-Inf, 0.001, 0.01, 0.05, Inf),
+      labels = c("<0.001", "<0.01", "<0.05", "ns")
+    )
+  ) %>%
+  group_nest(
+    agent, assay, expression_metric, cor_metric
+  ) %>%
+  mutate(
+    res = map(
+      data,
+      \(x) {
+        # browser()
+        # d <- semi_join(
+        #   x,
+        #   group_by(x, contrast) %>%
+        #     filter(padj < y),
+        #   by = "pathway"
+        # )
+        d <- semi_join(
+          x,
+          group_by(x, gr_metric, direction) %>%
+            filter(padj < .05) %>%
+            arrange(pval) %>%
+            slice_head(n = 20),
+          by = "pathway"
+        )
+        if (nrow(d) <= 6) {
+          return(NULL)
+        }
+        # d <- semi_join(
+        #   x,
+        #   group_by(x, pathway) %>%
+        #     filter(padj < .05, is_main) %>%
+        #     summarize(groups = paste(sort(unique(contrast)), collapse = "_"), p_mean = 1 / sum(1 / padj, na.rm = TRUE)) %>%
+        #     group_by(groups) %>%
+        #     arrange(p_mean) %>%
+        #     slice_head(n = 5),
+        #     # bind_rows(tibble(pathway = "P_P38_MK2_PATHWAY")),
+        #   by = "pathway"
+        # )
+        dwide <- d %>%
+          arrange(pathway) %>%
+          pivot_wider(
+            id_cols = pathway,
+            names_from = c(gr_metric, direction),
+            values_from = directed_enrichment
+          )
+        dmat <- dwide %>%
+          column_to_rownames("pathway") %>%
+          as.matrix() %>%
+          dist()
+        # browser()
+        clust <- hclust(dmat, method = "average") %>%
+          reorder(dmat, method = "OLO")
+        row_labels <- clust$labels[clust$order] %>% {
+          set_names(
+            str_replace_all(., coll("_"), " ") %>%
+              str_sub(start = 2),
+            .
+          )
+        }
+        # sim_hm <- msigdbr_of_interest_sim_trans[
+        #   rev(clust$labels[clust$order]), rev(clust$labels[clust$order])
+        # ] %>%
+        #   pheatmap(
+        #     cluster_rows = FALSE,
+        #     cluster_cols = FALSE
+        #   )
+        est_perc <- quantile(d$directed_enrichment, c(.05, .95))
+        abs_max_est_perc <- max(abs(est_perc))
+        # browser()
+        p <- ggplot(
+          d %>%
+            mutate(
+              pathway = factor(pathway, levels = clust$labels[clust$order])
+            ),
+          aes(
+            x = gr_metric,
+            y = fct_rev(pathway),
+            color = directed_enrichment,
+            size = p_cut,
+            shape = direction
+          )
+        ) +
+          geom_text(
+            aes(
+              label = if_else(direction == "positive", "◗", "◖"),
+              hjust = if_else(direction == "positive", .5, .5)
+            ),
+            vjust = .5
+          ) +
+          guides(
+            size = guide_legend(override.aes = list(shape = "◖"))
+          ) +
+          paletteer::scale_color_paletteer_c(
+            palette = "ggthemes::Orange-Blue-White Diverging",
+            limits = c(-abs_max_est_perc, abs_max_est_perc),
+            oob = scales::squish,
+            direction = -1
+          ) +
+          scale_size_manual(
+            values = rev(c("<0.001" = 8, "<0.01" = 6, "<0.05" = 4, "ns" = 2))
+          ) +
+          scale_x_discrete(position = "top") +
+          scale_y_discrete(
+            breaks = names(row_labels),
+            labels = unname(row_labels)
+          ) +
+          theme(
+            axis.text.x = element_text(angle = 45, hjust = 0),
+            panel.grid.major.x = element_blank()
+          ) +
+          labs(
+            x = NULL,
+            y = NULL,
+            size = "FDR",
+            color = "log2 fold\nenrichment"
+          )
+        list(
+          p = p,
+          clust_data = d
+          # sim_hm = sim_hm
+        ) %>%
+          map(list)
+      }
+    )
+  ) %>%
+  select(-data) %>%
+  unnest_wider(
+    res
+  )
+
+pwalk(
+  baseline_gr_cor_fora_dotplots,
+  \(agent, assay, expression_metric, cor_metric, p, ...) {
+    if (is.null(p[[1]])) {
+      return(NULL)
+    }
+    ggsave(
+      file.path(
+        "plots_cdk7", paste0("fora_baseline_gr_cor_dotplot_", agent, "_", assay, "_", expression_metric, "_", cor_metric, ".pdf")
+      ), p[[1]], width = 10, height = 8, dev = cairo_pdf
+    )
+  }
+)
+
+```
+
+Broken down by metric instead of agent
+
+
+```{r}
+baseline_gr_cor_fora_dotplots <- baseline_gr_cor_fora_res_long %>%
+  filter(
+    gr_metric != "neglog_GR50",
+    assay == "deep", expression_metric == "vst", cor_metric == "spearman"
+  ) %>%
+  mutate(
+    log2_foldEnrichment = log2(if_else(foldEnrichment == 0, .5, foldEnrichment)),
+    directed_enrichment = pmax(
+      log2_foldEnrichment,
+      0
+    ) * if_else(direction == "positive", 1, -1),
+    p_cut = cut(
+      padj,
+      breaks = c(-Inf, 0.001, 0.01, 0.05, Inf),
+      labels = c("<0.001", "<0.01", "<0.05", "ns")
+    )
+  ) %>%
+  group_nest(
+    gr_metric
+  ) %>%
+  mutate(
+    res = map(
+      data,
+      \(x) {
+        # browser()
+        # d <- semi_join(
+        #   x,
+        #   group_by(x, contrast) %>%
+        #     filter(padj < y),
+        #   by = "pathway"
+        # )
+        # d <- semi_join(
+        #   x,
+        #   group_by(x, gr_metric, direction) %>%
+        #     filter(padj < .05) %>%
+        #     arrange(pval) %>%
+        #     slice_head(n = 20),
+        #   by = "pathway"
+        # )
+        d <- semi_join(
+          x,
+          group_by(x, pathway, direction) %>%
+            filter(padj < .05) %>%
+            summarize(
+              groups = paste(sort(unique(paste(agent, direction, sep = "_"))), collapse = "_"),
+              p_mean = 1 / sum(1 / padj, na.rm = TRUE),
+              .groups = "drop"
+            ) %>%
+            group_by(groups) %>%
+            arrange(p_mean) %>%
+            slice_head(n = 10),
+            # bind_rows(tibble(pathway = "P_P38_MK2_PATHWAY")),
+          by = "pathway"
+        )
+        if (nrow(d) <= 6) {
+          return(NULL)
+        }
+        dwide <- d %>%
+          arrange(pathway) %>%
+          pivot_wider(
+            id_cols = pathway,
+            names_from = c(agent, direction),
+            values_from = directed_enrichment
+          )
+        dmat <- dwide %>%
+          column_to_rownames("pathway") %>%
+          as.matrix() %>%
+          dist()
+        # browser()
+        clust <- hclust(dmat, method = "average") %>%
+          reorder(dmat, method = "OLO")
+        row_labels <- clust$labels[clust$order] %>% {
+          set_names(
+            str_replace_all(., coll("_"), " ") %>%
+              str_sub(start = 2),
+            .
+          )
+        }
+        # sim_hm <- msigdbr_of_interest_sim_trans[
+        #   rev(clust$labels[clust$order]), rev(clust$labels[clust$order])
+        # ] %>%
+        #   pheatmap(
+        #     cluster_rows = FALSE,
+        #     cluster_cols = FALSE
+        #   )
+        est_perc <- quantile(d$directed_enrichment, c(.05, .95))
+        abs_max_est_perc <- max(abs(est_perc))
+        # browser()
+        p <- ggplot(
+          d %>%
+            mutate(
+              pathway = factor(pathway, levels = clust$labels[clust$order])
+            ),
+          aes(
+            x = agent,
+            y = fct_rev(pathway),
+            color = directed_enrichment,
+            size = p_cut,
+            shape = direction
+          )
+        ) +
+          geom_text(
+            aes(
+              label = if_else(direction == "positive", "◗", "◖"),
+              hjust = if_else(direction == "positive", .5, .5)
+            ),
+            vjust = .5
+          ) +
+          guides(
+            size = guide_legend(override.aes = list(shape = "◖"))
+          ) +
+          paletteer::scale_color_paletteer_c(
+            palette = "ggthemes::Orange-Blue-White Diverging",
+            limits = c(-abs_max_est_perc, abs_max_est_perc),
+            oob = scales::squish,
+            direction = -1
+          ) +
+          scale_size_manual(
+            values = rev(c("<0.001" = 8, "<0.01" = 6, "<0.05" = 4, "ns" = 2))
+          ) +
+          scale_x_discrete(position = "top") +
+          scale_y_discrete(
+            breaks = names(row_labels),
+            labels = unname(row_labels)
+          ) +
+          theme(
+            axis.text.x = element_text(angle = 45, hjust = 0),
+            panel.grid.major.x = element_blank()
+          ) +
+          labs(
+            x = NULL,
+            y = NULL,
+            size = "FDR",
+            color = "log2 fold\nenrichment"
+          )
+        list(
+          p = p,
+          clust_data = d
+          # sim_hm = sim_hm
+        ) %>%
+          map(list)
+      }
+    )
+  ) %>%
+  select(-data) %>%
+  unnest_wider(
+    res
+  )
+
+pwalk(
+  baseline_gr_cor_fora_dotplots,
+  \(gr_metric, p, ...) {
+    if (is.null(p[[1]])) {
+      return(NULL)
+    }
+    ggsave(
+      file.path(
+        "plots_cdk7", paste0("fora_baseline_gr_cor_dotplot_by_metric_", gr_metric, ".pdf")
+      ), p[[1]], width = 10, height = 8, dev = cairo_pdf
+    )
+  }
+)
+
 ```
 
 ## INDRA queries
@@ -1446,18 +1727,23 @@ ykl_lfc_mat <- deseq_res_gr_long %>%
       select(ensembl_gene_id, cell_line, log2FoldChange) %>%
       pivot_wider(names_from = cell_line, values_from = log2FoldChange, values_fill = 0) %>%
       column_to_rownames("ensembl_gene_id") %>%
-      as.matrix() %>%
+      as.matrix() %>% {
+        # Ensure columns are in the same order as ykl_cell_lines_to_keep
+        .[, ykl_cell_lines_to_keep]
+      } %>%
       list()
   ) %>%
   ungroup()
 
 
 ykl_gr_mat <- gr_raw %>%
-  filter(cell_line %in% ykl_cell_lines_to_keep) %>%
+  filter(cell_line %in% ykl_cell_lines_to_keep, agent == "YKL-5-124") %>%
   select(cell_line, GR50, GRmax, GR_AOC, neglog_GR50) %>%
   column_to_rownames("cell_line") %>%
   as.matrix() %>%
-  t()
+  t() %>% {
+    .[, ykl_cell_lines_to_keep]
+  }
 
 ykl_gr_cor_df <- ykl_lfc_mat %>%
   rowwise() %>%
@@ -1584,108 +1870,322 @@ ggsave(
 
 
 ```{r}
-selected_des <- ykl_gr_cor_df_long %>%
+ykl_gr_cor_fgsea_input <- ykl_gr_cor_df_long %>%
   drop_na(r) %>%
   group_nest(gr_metric, gr_correction) %>%
   mutate(
     de = map(
       data,
       \(x) set_names(x$r, x$ensembl_gene_id)
-    ),
-    de_p = map(
-      data,
-      \(x) set_names(-sign(x$r) * log10(x$p), x$ensembl_gene_id)
     )
   )
 
-fgsea_res_raw <- selected_des %>%
+ykl_gr_cor_fgsea_res_raw <- ykl_gr_cor_fgsea_input %>%
   mutate(
     res = map(
       de,
-      \(x) fgseaMultilevel(
-        selected_gene_sets_gr$gs,
+      \(x) withr::with_seed(42, quietly(fgseaMultilevel)(
+        selected_gene_sets_list$gs,
         x
-      )
+      ))
     ),
-    res_p = map(
-      de_p,
-      \(x) fgseaMultilevel(
-        selected_gene_sets_gr$gs,
-        x
-      )
+    res_reduced = future_pmap(
+      list(res, de),
+      \(res, de) {
+        collapsePathways(
+          filter(res$result, padj < .05),
+          selected_gene_sets_list$gs,
+          de
+        )
+      },
+      .progress = TRUE
     )
   )
 
-fgsea_res_p_long <- fgsea_res_raw %>%
-  select(gr_metric, gr_correction, res_p) %>%
-  unnest(res_p) %>%
+ykl_gr_cor_fgsea_res <- ykl_gr_cor_fgsea_res_raw %>%
+  unnest_wider(res, transform = list(warnings = \(x) paste(x, collapse = ""))) %>%
+  transmute(
+    gr_metric, gr_correction,
+    res = map2(
+      result, res_reduced,
+      \(full, reduced) {
+        mutate(
+          full,
+          is_main = pathway %in% reduced$mainPathways,
+          parent_pathway = reduced$parentPathways[pathway]
+        )
+      }
+    )
+  ) %>%
+  unnest(res) %>%
   mutate(
     signed_p = -sign(NES) * log10(padj),
-    p_cut = cut(padj, breaks = c(-Inf, 0.01, 0.05, Inf), labels = c("**", "*", ""))
-  ) %>%
-  filter(
-    pathway %in% {
-      group_by(., pathway) %>%
-        summarize(n_sig = sum(padj < 0.05)) %>%
-        filter(n_sig > 0) %>%
-        pull(pathway)
-    }
-  ) %>%
-  mutate(
-    size_leading_edge = map_int(
-      leadingEdge, length
+    p_cut = cut(padj, breaks = c(-Inf, 0.01, 0.05, Inf), labels = c("**", "*", "")),
+    leadingEdgeNames = map(
+      leadingEdge,
+      \(x) gene_id_to_name_map[["dge"]][x]
     )
   ) %>%
-  select(
-    gr_metric, gr_correction, pathway,
-    pval, padj, p_cut, ES, NES, size_leading_edge, size,
-    leadingEdge
+  arrange(padj, pval)
+```
+
+### Excel sheet
+
+```{r}
+ykl_gr_cor_fgsea_excel <- createWorkbook()
+
+ykl_gr_cor_fgsea_res %>%
+  select(-c(leadingEdge)) %>%
+  filter(
+    gr_metric != "neglog_GR50"
+  ) %>%
+  arrange(padj, pval) %>%
+  group_by(gr_correction) %>%
+  group_walk(
+    \(df, g) {
+      addWorksheet(
+        ykl_gr_cor_fgsea_excel,
+        g$gr_correction
+      )
+      writeDataTable(
+        ykl_gr_cor_fgsea_excel,
+        sheet = g$gr_correction,
+        x = df,
+        tableStyle = "TableStyleLight8"
+      )
+      # setColWidths(
+      #   ykl_gr_cor_fgsea_excel, g$gr_correction,
+      #   cols = seq_len(ncol(df)),
+      #   widths = "auto"
+      # )
+      walk(
+        which(names(df) == "padj"),
+        \(i) {
+          data_rows <- nrow(df) + 1L  # +1 for header
+          de_col_data <- df[[i]]
+          significant_rows <- which(!is.na(de_col_data) & de_col_data < 0.05) + 1L  # +1 for header
+          if (length(significant_rows) > 0) {
+            addStyle(
+              wb = ykl_gr_cor_fgsea_excel,
+              sheet = g$gr_correction,
+              style = significant_style,
+              rows = significant_rows,
+              cols = i,
+              gridExpand = FALSE
+            )
+          }
+        }
+      )
+    }
   )
 
-ps <- fgsea_res_p_long %>%
-  filter(padj < .1) %>%
-  group_nest(
-    gr_metric
+saveWorkbook(
+  ykl_gr_cor_fgsea_excel,
+  file.path("plots_cdk7", "ykl_gr_cor_fgsea.xlsx"),
+  overwrite = TRUE
+)
+
+
+```
+
+### Dot plots
+
+```{r}
+ykl_gr_cor_fgsea_hm <- ykl_gr_cor_fgsea_res %>%
+  filter(
+    gr_metric != "neglog_GR50"
   ) %>%
-  rowwise() %>%
   mutate(
-    p = list(
-      ggplot(
-        data %>%
-          group_by(pathway) %>%
-          mutate(avg_NES = mean(NES)) %>%
-          ungroup() %>%
-          arrange(avg_NES) %>%
-          mutate(
-            pathway = fct_inorder(pathway)
-          ),
-        aes(NES, pathway, fill = p_cut, color = gr_correction)
-      ) +
-        geom_col(aes(group = gr_correction), position = position_dodge()) +
-        geom_text(
-          aes(
-            x = x_pos,
-            y = pathway,
-            label = pathway,
-            hjust = hjust
-          ),
-          data = \(x) mutate(
-            x,
-            x_pos = if_else(NES > 0, -.1, .1),
-            hjust = if_else(NES > 0, 1, 0)
-          ) %>%
-            distinct(pathway, x_pos, hjust),
-          inherit.aes = FALSE
-        ) +
-        scale_fill_viridis_d(direction = -1) +
-        labs(
-          x = "Normalized Enrichment Score",
-          y = NULL,
-          title = gr_metric
-        ) +
-        theme(
-          axis.text.y = element_blank()
+    p_cut = cut(
+      padj,
+      breaks = c(-Inf, 0.001, 0.01, 0.05, Inf),
+      labels = c("<0.001", "<0.01", "<0.05", "ns")
+    )
+  ) %>%
+  group_nest(
+    gr_correction
+  ) %>%
+  mutate(
+    res = map(
+      data,
+      \(x) {
+        # browser()
+        # d <- semi_join(
+        #   x,
+        #   group_by(x, contrast) %>%
+        #     filter(padj < y),
+        #   by = "pathway"
+        # )
+        d <- semi_join(
+          x,
+          group_by(x, gr_metric) %>%
+            filter(padj < .05) %>%
+            arrange(pval) %>%
+            slice_head(n = 20),
+          by = "pathway"
         )
+        # d <- semi_join(
+        #   x,
+        #   group_by(x, pathway, gr_metric) %>%
+        #     filter(padj < .05) %>%
+        #     summarize(
+        #       groups = paste(sort(unique(paste(gr_metric, sep = "_"))), collapse = "_"),
+        #       p_mean = 1 / sum(1 / padj, na.rm = TRUE),
+        #       .groups = "drop"
+        #     ) %>%
+        #     group_by(groups) %>%
+        #     arrange(p_mean) %>%
+        #     slice_head(n = 20),
+        #     # bind_rows(tibble(pathway = "P_P38_MK2_PATHWAY")),
+        #   by = "pathway"
+        # )
+        if (nrow(d) <= 6) {
+          return(NULL)
+        }
+        dwide <- d %>%
+          arrange(pathway) %>%
+          pivot_wider(
+            id_cols = pathway,
+            names_from = gr_metric,
+            values_from = NES
+          )
+        dmat <- dwide %>%
+          column_to_rownames("pathway") %>%
+          as.matrix() %>%
+          dist()
+        # browser()
+        clust <- hclust(dmat, method = "average") %>%
+          reorder(dmat, method = "OLO")
+        row_labels <- clust$labels[clust$order] %>% {
+          set_names(
+            str_replace_all(., coll("_"), " ") %>%
+              str_sub(start = 2),
+            .
+          )
+        }
+        # sim_hm <- msigdbr_of_interest_sim_trans[
+        #   rev(clust$labels[clust$order]), rev(clust$labels[clust$order])
+        # ] %>%
+        #   pheatmap(
+        #     cluster_rows = FALSE,
+        #     cluster_cols = FALSE
+        #   )
+        est_perc <- quantile(d$NES, c(.05, .95))
+        abs_max_est_perc <- max(abs(est_perc))
+        # browser()
+        p <- ggplot(
+          d %>%
+            mutate(
+              pathway = factor(pathway, levels = clust$labels[clust$order])
+            ),
+          aes(
+            x = gr_metric,
+            y = fct_rev(pathway),
+            color = NES,
+            size = p_cut
+          )
+        ) +
+          geom_point(
+            shape = 16
+          ) +
+          paletteer::scale_color_paletteer_c(
+            palette = "ggthemes::Orange-Blue-White Diverging",
+            limits = c(-abs_max_est_perc, abs_max_est_perc),
+            oob = scales::squish,
+            direction = -1
+          ) +
+          scale_size_manual(
+            values = rev(c("<0.001" = 8, "<0.01" = 6, "<0.05" = 4, "ns" = 2))
+          ) +
+          scale_x_discrete(position = "top") +
+          scale_y_discrete(
+            breaks = names(row_labels),
+            labels = unname(row_labels)
+          ) +
+          theme(
+            axis.text.x = element_text(angle = 45, hjust = 0),
+            panel.grid.major.x = element_blank()
+          ) +
+          labs(
+            x = NULL,
+            y = NULL,
+            size = "FDR",
+            color = "NES"
+          )
+        list(
+          p = p,
+          clust_data = d
+          # sim_hm = sim_hm
+        ) %>%
+          map(list)
+      }
+    )
+  ) %>%
+  select(-data) %>%
+  unnest_wider(
+    res
+  )
+
+pwalk(
+  ykl_gr_cor_fgsea_hm,
+  \(gr_correction, p, ...) {
+    ggsave(
+      file.path(
+        "plots_cdk7", paste0("ykl_gr_cor_fgsea_dotplot_", gr_correction, ".pdf")
+      ), p[[1]], width = 8, height = 10, dev = cairo_pdf
+    )
+  }
+)
+
+
+```
+
+
+### Bar plots of top enriched pathways
+
+```{r}
+ps <- ykl_gr_cor_fgsea_res %>%
+  filter(padj < .05) %>%
+  group_nest(
+    gr_metric, gr_correction
+  ) %>%
+  mutate(
+    p = map2(
+      data, gr_metric,
+      \(df, gr_metric) {
+        ggplot(
+          df %>%
+            arrange(pval) %>%
+            slice_head(n = 30) %>%
+            mutate(pathway = fct_reorder(pathway, NES)),
+          aes(NES, pathway, fill = p_cut)
+        ) +
+          geom_col() +
+          geom_text(
+            aes(
+              x = x_pos,
+              y = pathway,
+              label = pathway,
+              hjust = hjust
+            ),
+            data = \(x) mutate(
+              x,
+              x_pos = if_else(NES > 0, -.1, .1),
+              hjust = if_else(NES > 0, 1, 0)
+            ) %>%
+              distinct(pathway, x_pos, hjust),
+            inherit.aes = FALSE
+          ) +
+          scale_fill_viridis_d(direction = -1) +
+          labs(
+            x = "Normalized Enrichment Score",
+            y = NULL,
+            title = gr_metric
+          ) +
+          theme(
+            axis.text.y = element_blank()
+          )
+      }
     )
   )
 
@@ -1700,6 +2200,9 @@ pwalk(
   }
 )
 ```
+
+1. Share table of enrichment results and go through plots, put them in Dropbox with README
+
 
 ```{r}
 
@@ -1767,12 +2270,109 @@ p <- fgsea_res_p_long %>%
 
 ```
 
+## Differential expression Excel sheets
+
+```{r}
+ykl_de_excel_wbs <- list()
+
+deseq_res_gr_long %>%
+  select(-c(experiment, agent, time)) %>%
+  arrange(padj, pvalue) %>%
+  group_by(gr_correction, cell_line) %>%
+  group_walk(
+    \(df, g) {
+      if (is.null(ykl_de_excel_wbs[[g$gr_correction]])) {
+        ykl_de_excel_wbs[[g$gr_correction]] <<- createWorkbook()
+      }
+      wb <- ykl_de_excel_wbs[[g$gr_correction]]
+      addWorksheet(
+        wb,
+        g$cell_line
+      )
+      writeDataTable(
+        wb,
+        sheet = g$cell_line,
+        x = df,
+        tableStyle = "TableStyleLight8"
+      )
+      # setColWidths(
+      #   ykl_gr_cor_fgsea_excel, g$gr_correction,
+      #   cols = seq_len(ncol(df)),
+      #   widths = "auto"
+      # )
+      walk(
+        which(names(df) == "padj"),
+        \(i) {
+          data_rows <- nrow(df) + 1L  # +1 for header
+          de_col_data <- df[[i]]
+          significant_rows <- which(!is.na(de_col_data) & de_col_data < 0.05) + 1L  # +1 for header
+          if (length(significant_rows) > 0) {
+            addStyle(
+              wb = wb,
+              sheet = g$cell_line,
+              style = significant_style,
+              rows = significant_rows,
+              cols = i,
+              gridExpand = FALSE
+            )
+          }
+        }
+      )
+      walk(
+        which(str_detect(names(df), coll("log2FoldChange"))),
+        \(i) {
+          data_rows <- nrow(df) + 1L  # +1 for header
+          conditionalFormatting(
+            wb = wb,
+            sheet = g$cell_line,
+            cols = i,
+            rows = 2:data_rows,
+            type = "colourScale",
+            style = c("#4575b4", "white", "#d73027"),
+            rule = c(-3, 0, 3)
+          )
+        }
+      )
+      setColWidths(
+        wb, g$cell_line,
+        cols = seq_len(ncol(df)),
+        widths = "auto"
+      )
+    }
+  )
+
+iwalk(
+  ykl_de_excel_wbs,
+  \(wb, gr_correction) {
+    saveWorkbook(
+      wb,
+      file.path("plots_cdk7", paste0("ykl_de_results_", gr_correction, ".xlsx")),
+      overwrite = TRUE
+    )
+  }
+)
+
+
+```
+
+
 ## FGSEA for raw YKL DGE results
 
 
 ```{r}
 selected_des <- ykl_lfc_mat %>%
-  select(gr_correction, data) %>%
+  transmute(
+    gr_correction,
+    data = map2(
+      data, genes_to_keep,
+      \(df, genes) {
+        filter(
+          df,
+          ensembl_gene_id %in% genes
+        )
+      }
+    )
+  ) %>%
   unnest(data) %>%
   drop_na(pvalue) %>%
   group_nest(gr_correction, cell_line) %>%
@@ -1789,21 +2389,55 @@ selected_des <- ykl_lfc_mat %>%
 
 fgsea_res_raw <- selected_des %>%
   mutate(
-    res = map(
+    res_lfc = map(
       de,
-      \(x) fgseaMultilevel(
-        selected_gene_sets_gr$gs,
+      \(x) with_seed(42, quietly(fgseaMultilevel)(
+        selected_gene_sets_list$gs,
         x
-      )
+      ))
     ),
     res_p = map(
       de_p,
-      \(x) fgseaMultilevel(
-        selected_gene_sets_gr$gs,
+      \(x) with_seed(42, quietly(fgseaMultilevel)(
+        selected_gene_sets_list$gs,
         x
-      )
+      ))
+    )
+  ) %>%
+  pivot_longer(
+    c(res_lfc, res_p),
+    names_to = "type",
+    values_to = "res"
+  ) %>%
+  mutate(
+    res_reduced = future_pmap(
+      list(res, de, type),
+      \(res, de, type) {
+        collapsePathways(
+          filter(res$result, padj < .05),
+          selected_gene_sets_list$gs,
+          de
+        )
+      },
+      .progress = TRUE
     )
   )
+
+
+fgsea_res_raw %>%
+  select(gr_correction, cell_line, res, res_p) %>%
+  pivot_longer(
+    c(res, res_p),
+    names_to = "type",
+    values_to = "result"
+  ) %>%
+  mutate(
+    warnings = map_chr(
+      result,
+      \(x) paste(x$warnings, collapse = "; ")
+    )
+  ) %>%
+  pull(warnings)
 
 fgsea_res_p_long <- fgsea_res_raw %>%
   select(cell_line, gr_correction, res_p) %>%
