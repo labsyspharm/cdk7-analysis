@@ -1,0 +1,569 @@
+---
+title: "RNA-seq ascites"
+author: "Clemens Hug"
+date: "2026-01-22"
+output:
+  html_document:
+    theme: flatly
+    toc: yes
+    number_sections: true
+    toc_float:
+      collapsed: false
+    toc_depth: 4
+    code_folding: show
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(conflicted)
+library(tidyverse)
+library(data.table)
+library(qs)
+library(synExtra)
+library(DT)
+library(powerjoin)
+library(here)
+library(openxlsx)
+library(readxl)
+library(DESeq2)
+library(ggrepel)
+
+conflicts_prefer(
+  dplyr::filter,
+  dplyr::select,
+  dplyr::mutate,
+  dplyr::rename,
+  base::setdiff,
+  SummarizedExperiment::rowRanges,
+  dplyr::count,
+  dplyr::slice
+)
+
+synapser::synLogin()
+syn <- synDownloader("~/data", .cache = TRUE)
+```
+
+Only "Vehicle" and "YKL" treated mice sequenced for this analysis.
+
+```{r load-data}
+counts_raw <- syn("syn72382163") |>
+  read_tsv()
+
+meta_raw <- syn("syn72382224") |>
+  read_excel(
+    sheet = "Priority",
+    skip = 1L, na = c("", "NA", "N/A")
+  )
+
+counts_long <- counts_raw |>
+  pivot_longer(
+    cols = -c(gene_id, gene_name, gene_biotype),
+    names_to = "sample_id",
+    values_to = "count"
+  ) |>
+  separate_wider_delim(
+    sample_id,
+    delim = "_",
+    names = c("experiment_id", "sample_id", "count_type")
+  ) |>
+  mutate(
+    species = case_match(
+      str_sub(gene_id, 1, 4),
+      "ENSM" ~ "mouse",
+      "ENSG" ~ "human",
+      .default = NA_character_
+    )
+  )
+
+gene_name_map <- counts_long |>
+  distinct(gene_id, gene_name, gene_biotype, species)
+```
+
+Remove sample 1, not part of the relevant samples.
+
+```{r}
+meta <- meta_raw |>
+  select(-Sample...9) |>
+  rename(Sample = `Sample...1`) |>
+  filter(
+    Group %in% c("Vehicle", "YKL"),
+    Sample != 1
+  ) |>
+  mutate(
+    timepoint_binary = if_else(
+      Timepoint == 0,
+      "initial",
+      "24h"
+    ) |>
+      fct_relevel("initial"),
+    across(Treatment, \(x) replace_na(x, "None")),
+    across(Mouse, \(x) as.factor(as.character(x))),
+    across(Treatment, \(x) fct_relevel(x, "DMSO"))
+  )
+
+counts_df <- counts_long |>
+  filter(
+    count_type == "count"
+  ) |>
+  select(-count_type)
+```
+
+## Total counts per sample
+
+```{r}
+p <- ggplot(
+  counts_df |>
+    drop_na(species) |>
+    group_by(sample_id, species) |>
+    summarise(total_counts = sum(count)),
+  aes(x = sample_id, y = total_counts, fill = species)
+) +
+  geom_col(position = "dodge") +
+  scale_y_log10(
+    expand = expansion(mult = c(0, .05)),
+    n.breaks = 8
+  ) +
+  labs(
+    x = "Sample", y = "Total counts"
+  ) +
+  envalysis::theme_publish()
+
+ggsave(
+  here("ascites", "total_counts_per_sample.pdf"),
+  p, width = 8, height = 4
+)
+
+p
+```
+
+
+## DESeq2 model
+
+We have measurements from multiple mice per group (Vehicle vs. YKL).
+Using approach for nested designs from the DESeq2 vignette:
+
+https://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#group-specific-condition-effects-individuals-nested-within-groups
+
+```{r}
+genes_for_de <- counts_df |>
+  group_by(gene_id) |>
+  summarise(
+    n_samples_expressed = sum(count > 5),
+    .groups = "drop"
+  ) |>
+  filter(
+    n_samples_expressed >= 3
+  ) |>
+  pull(gene_id)
+
+count_mat <- counts_df |>
+  filter(gene_id %in% genes_for_de) |>
+  select(gene_id, sample_id, count) |>
+  pivot_wider(
+    names_from = sample_id,
+    values_from = count,
+    values_fill = 0
+  ) |>
+  arrange(gene_id) |>
+  column_to_rownames("gene_id") |>
+  as.matrix()
+
+meta_deseq <- meta |>
+  filter(
+    Treatment != "None"
+  ) |>
+  group_by(Group) |>
+  mutate(
+    Mouse_nested = factor(as.integer(factor(Mouse)))
+    # The character → factor → integer → character → factor chain normalizes Mouse
+    # so that the nested design (~ Group / Mouse + ...) in the model matrix below
+    # uses a clean, sequential encoding of Mouse within Group for DESeq2.
+  ) |>
+  ungroup()
+
+mm <- model.matrix(
+  ~Group / Mouse_nested + Treatment:Group,
+  data = meta_deseq
+)
+# remove zero columns
+mm <- mm[, colSums(mm) != 0]
+
+de <- DESeqDataSetFromMatrix(
+  round(count_mat[, as.character(meta_deseq$Sample)]),
+  colData = meta_deseq |>
+    column_to_rownames("Sample"),
+  design = mm
+) |>
+  DESeq()
+```
+
+### Normalized counts
+
+```{r}
+all_counts <- list(
+  raw = counts(de, normalized = FALSE),
+  normalized = counts(de, normalized = TRUE),
+  vst = assay(vst(de, blind = TRUE))
+) |>
+  map(\(x) as_tibble(x, rownames = "gene_id")) |>
+  bind_rows(.id = "count_type")
+
+write_csv(
+  all_counts,
+  here("ascites", "all_counts.csv.gz")
+)
+```
+
+### Extract DESeq2 results
+
+```{r}
+extract_deseq_result <- function(de, contrast, name, res_args = list(), shrink_args = list()) {
+  if (missing(contrast)) {
+    res <- rlang::exec(results, de, name = name, !!!res_args)
+  } else {
+    res <- rlang::exec(results, de, contrast = contrast, !!!res_args)
+  }
+  if (!"type" %in% names(shrink_args)) {
+    shrink_args$type <- "ashr"
+  }
+  shrunken <- rlang::exec(lfcShrink, de, res = res, !!!shrink_args)
+  shrunken %>%
+    as_tibble(rownames = "gene_id") %>%
+    left_join(
+      res %>%
+        as_tibble(rownames = "gene_id") %>%
+        select(gene_id, log2FoldChange, lfcSE),
+      by = "gene_id", suffix = c("", "_MLE")
+    )
+}
+
+de_res <- setdiff(
+  resultsNames(de),
+  "Intercept"
+) |>
+  str_subset("Mouse", negate = TRUE) |>
+  set_names() |>
+  map(
+    \(name) extract_deseq_result(de, name = name)
+  ) |>
+  bind_rows(.id = "comparison") |>
+  power_left_join(
+    gene_name_map,
+    by = "gene_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) |>
+  mutate(
+    across(
+      comparison,
+      \(x) recode(
+        x,
+        GroupYKL = "GroupYKL.TreatmentDMSO"
+      )
+    )
+  ) |>
+  separate_wider_regex(
+    comparison,
+    patterns = c(
+      "Group", mouse_treatment = "[A-Za-z]+",
+      "\\.Treatment", treatment = ".*"
+    )
+  ) |>
+  mutate(
+    across(
+      treatment,
+      \(x) recode(
+        x,
+        `RP.6306` = "RP-6306",
+        `YKL.Tala` = "YKL+Tala"
+      )
+    ),
+    comparison = paste0("Mouse ", mouse_treatment, " - ", treatment)
+  )
+
+de_res_between_groups <- meta$Treatment |>
+  setdiff(c("DMSO", "None")) |>
+  set_names(\(n) paste0("YKL vs Vehicle - ", n)) |>
+  map(
+    \(treatment) {
+      treatment_san <- str_replace_all(treatment, "[^A-Za-z0-9]", ".")
+      extract_deseq_result(
+        de,
+        contrast = list(
+          paste0("GroupYKL.Treatment", treatment_san),
+          paste0("GroupVehicle.Treatment", treatment_san)
+        )
+      )
+    }
+  ) |>
+  bind_rows(.id = "comparison") |>
+  power_left_join(
+    gene_name_map,
+    by = "gene_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+```
+
+
+```{r}
+de_res_all <- bind_rows(
+  de_res,
+  de_res_between_groups
+)
+
+write_csv(
+  de_res_all,
+  here("ascites", "deseq2_results.csv.gz")
+)
+```
+
+## Volcano plots
+
+```{r}
+p <- ggplot(
+  de_res |>
+    drop_na(padj) |>
+    filter(
+      gene_biotype == "protein_coding",
+      species == "human"
+    ),
+  aes(
+    x = log2FoldChange, y = -log10(padj)
+  )
+) +
+  ggrastr::rasterize(
+    geom_point(
+      aes(
+        color = padj < .05
+      ),
+      alpha = 0.3,
+      shape = 16
+    ),
+    dpi = 300
+  ) +
+  geom_text_repel(
+    aes(
+      label = gene_name
+    ),
+    data = \(x) group_by(x, comparison, sign(log2FoldChange)) |>
+      slice_min(pvalue, n = 10),
+    # data = \(x) group_by(x, comparison, sign(log2FoldChange)) |>
+    #   arrange(pvalue) |>
+    #   mutate(
+    #     gene_name = if_else(
+    #       seq_len(n()) <= 10 & padj < .05,
+    #       gene_name,
+    #       ""
+    #     )
+    #   ),
+    size = 2,
+    max.overlaps = Inf
+  ) +
+  scale_color_manual(
+    values = c(`FALSE` = "black", `TRUE` = "red"),
+    guide = "none"
+  ) +
+  facet_wrap(
+    ~comparison,
+    axes = "all"
+  ) +
+  labs(
+    x = "Log2 fold change",
+    y = "-Log10 adjusted p-value"
+  ) +
+  envalysis::theme_publish()
+p
+
+dir.create(
+  here("ascites")
+)
+
+ggsave(
+  here("ascites", "volcano_plots.pdf"),
+  p, width = 12, height = 10
+)
+```
+
+
+## PCA plots
+
+```{r}
+pca_raw <- all_counts |>
+  filter(
+    count_type == "vst"
+  ) |>
+  select(-count_type) |>
+  column_to_rownames("gene_id") |>
+  as.matrix() |>
+  t() |>
+  prcomp()
+
+pca_sd <- broom::tidy(pca_raw, "eigenvalues")
+
+pc_sd_map <- with(
+  pca_sd,
+  set_names(percent, paste0("PC", PC))
+)
+
+pca_x <- as_tibble(pca_raw$x, rownames = "sample_id") |>
+  mutate(
+    across(sample_id, as.integer)
+  ) |>
+  power_inner_join(
+    meta,
+    by = c("sample_id" = "Sample"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+pca_x_long <- as_tibble(pca_raw$x, rownames = "sample_id") |>
+  mutate(
+    across(sample_id, as.integer)
+  ) |>
+  pivot_longer(
+    cols = starts_with("PC"),
+    names_to = "component",
+    values_to = "value"
+  )
+```
+
+
+```{r}
+pca_x_vs <- combn(paste0("PC", seq_len(6)), 2) |>
+  t() |>
+  magrittr::set_colnames(paste0("component_", seq_len(2))) |>
+  as_tibble() |>
+  power_inner_join(
+    pca_x_long,
+    by = c("component_1" = "component"),
+    check = check_specs(
+      unmatched_keys_left = "warn"
+    )
+  ) |>
+  power_inner_join(
+    pca_x_long,
+    by = c("component_2" = "component", "sample_id"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    ),
+    suffix = c("_1", "_2")
+  ) |>
+  power_inner_join(
+    meta,
+    by = c("sample_id" = "Sample"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+p <- ggplot(
+  pca_x_vs,
+  aes(
+    x = value_1,
+    y = value_2,
+    color = Treatment,
+    shape = Group
+  )
+) +
+  geom_point(alpha = 0.8) +
+  ggokabeito::scale_color_okabe_ito() +
+  # paletteer::scale_color_paletteer_d(
+  #   "ggthemes::Tableau_10",
+  #   guide = "legend"
+  # ) +
+  facet_wrap(
+    ~paste0(component_1, " (", signif(pc_sd_map[component_1] * 100, 2), "%) vs ", component_2, " (", signif(pc_sd_map[component_2] * 100, 2), "%)"),
+    scales = "free"
+  ) +
+  labs(
+    x = NULL,
+    y = NULL
+  ) +
+  envalysis::theme_publish()
+
+ggsave(
+  here("ascites", "pca_plots.pdf"),
+  p, width = 12, height = 10
+)
+
+p
+```
+
+## Mouse YKL vs Vehicle plots
+
+```{r}
+ykl_vs_vehicle_de_comp <- de_res |>
+  filter(comparison != "Mouse YKL - DMSO") |>
+  select(-comparison) |>
+  mutate(
+    signed_p = -log10(padj) * sign(log2FoldChange)
+  ) |>
+  pivot_wider(
+    names_from = mouse_treatment,
+    values_from = c(
+      log2FoldChange, lfcSE, pvalue, padj, signed_p, log2FoldChange_MLE, lfcSE_MLE
+    )
+  ) |>
+  power_left_join(
+    de_res_between_groups |>
+      select(-c(baseMean, gene_name, gene_biotype, species)) |>
+      mutate(
+        across(
+          comparison,
+          \(x) str_remove(x, coll("YKL vs Vehicle - "))
+        )
+      ),
+    by = c("treatment" = "comparison", "gene_id"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn",
+      duplicate_keys_left = "warn"
+    )
+  )
+
+```
+
+
+```{r}
+p <- ggplot(
+  ykl_vs_vehicle_de_comp,
+  aes(
+    x = log2FoldChange_Vehicle,
+    y = log2FoldChange_YKL,
+    color = padj < .05
+  )
+) +
+  ggrastr::rasterize(geom_point(
+    shape = 16, alpha = .6
+  ), dpi = 300) +
+  scale_color_manual(
+    values = c(`FALSE` = "black", `TRUE` = "red")
+  ) +
+  coord_equal() +
+  facet_wrap(
+    ~treatment
+  ) +
+  labs(
+    x = "Log2 fold change Vehicle",
+    y = "Log2 fold change YKL",
+    color = "Adjusted p < 0.05"
+  )
+
+ggsave(
+  here("ascites", "ykl_vs_vehicle_plots.pdf"),
+  p, width = 8, height = 6
+)
+
+p
+```
