@@ -243,29 +243,12 @@ de_res <- setdiff(
   resultsNames(de),
   "Intercept"
 ) |>
-  str_subset("Mouse", negate = TRUE) |>
+  str_subset("Group.*\\.Treatment.*") |>
   set_names() |>
   map(
     \(name) extract_deseq_result(de, name = name)
   ) |>
   bind_rows(.id = "comparison") |>
-  power_left_join(
-    gene_name_map,
-    by = "gene_id",
-    check = check_specs(
-      unmatched_keys_left = "warn",
-      duplicate_keys_right = "warn"
-    )
-  ) |>
-  mutate(
-    across(
-      comparison,
-      \(x) recode(
-        x,
-        GroupYKL = "GroupYKL.TreatmentDMSO"
-      )
-    )
-  ) |>
   separate_wider_regex(
     comparison,
     patterns = c(
@@ -283,11 +266,29 @@ de_res <- setdiff(
       )
     ),
     comparison = paste0("Mouse ", mouse_treatment, " - ", treatment)
-  )
+  ) |>
+  # Add main comparison Mouse YKL vs Mouse Vehicle
+  bind_rows(
+    extract_deseq_result(
+      de, name = "GroupYKL"
+    ) |>
+     mutate(
+      comparison = "Mouse YKL vs Mouse Vehicle"
+     )
+  ) |>
+  power_left_join(
+    gene_name_map,
+    by = "gene_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) |>
+  select(comparison, mouse_treatment, treatment, gene_id, gene_name, gene_biotype, species, everything())
 
 de_res_between_groups <- meta$Treatment |>
   setdiff(c("DMSO", "None")) |>
-  set_names(\(n) paste0("YKL vs Vehicle - ", n)) |>
+  set_names() |>
   map(
     \(treatment) {
       treatment_san <- str_replace_all(treatment, "[^A-Za-z0-9]", ".")
@@ -300,7 +301,10 @@ de_res_between_groups <- meta$Treatment |>
       )
     }
   ) |>
-  bind_rows(.id = "comparison") |>
+  bind_rows(.id = "treatment") |>
+  mutate(
+    comparison = paste0("YKL vs Vehicle - ", treatment)
+  ) |>
   power_left_join(
     gene_name_map,
     by = "gene_id",
@@ -308,7 +312,8 @@ de_res_between_groups <- meta$Treatment |>
       unmatched_keys_left = "warn",
       duplicate_keys_right = "warn"
     )
-  )
+  ) |>
+  select(comparison, treatment, gene_id, gene_name, gene_biotype, species, everything())
 ```
 
 
@@ -365,6 +370,26 @@ p <- ggplot(
     #   ),
     size = 2,
     max.overlaps = Inf
+  ) +
+  geom_text(
+    aes(
+      label = n,
+      hjust = if_else(direction == "up", 1, 0),
+      x = if_else(direction == "up", Inf, -Inf)
+    ),
+    data = \(x) filter(
+        x, padj < .05
+      ) |>
+      count(
+        comparison,
+        direction = if_else(
+          log2FoldChange > 0,
+          "up",
+          "down"
+        )
+      ),
+    y = Inf,
+    vjust = 1
   ) +
   scale_color_manual(
     values = c(`FALSE` = "black", `TRUE` = "red"),
@@ -504,7 +529,7 @@ p
 
 ```{r}
 ykl_vs_vehicle_de_comp <- de_res |>
-  filter(comparison != "Mouse YKL - DMSO") |>
+  filter(comparison != "Mouse YKL vs Mouse Vehicle") |>
   select(-comparison) |>
   mutate(
     signed_p = -log10(padj) * sign(log2FoldChange)
@@ -517,14 +542,12 @@ ykl_vs_vehicle_de_comp <- de_res |>
   ) |>
   power_left_join(
     de_res_between_groups |>
-      select(-c(baseMean, gene_name, gene_biotype, species)) |>
-      mutate(
-        across(
-          comparison,
-          \(x) str_remove(x, coll("YKL vs Vehicle - "))
-        )
+      select(-c(baseMean, gene_name, gene_biotype, species, comparison)) |>
+      rename_with(
+        .fn = \(x) paste0(x, "_between_groups"),
+        .cols = -c(treatment, gene_id)
       ),
-    by = c("treatment" = "comparison", "gene_id"),
+    by = c("treatment", "gene_id"),
     check = check_specs(
       unmatched_keys_left = "warn",
       duplicate_keys_right = "warn",
@@ -566,4 +589,78 @@ ggsave(
 )
 
 p
+```
+
+## Make Excel sheet
+
+```{r}
+format_p <- function(wb, sheet_name, col_name, table) {
+  data_rows <- nrow(table) + 1  # +1 for header
+  col_idx <- which(names(table) == col_name)
+
+  conditionalFormatting(
+    wb = wb,
+    sheet = sheet_name,
+    cols = col_idx,
+    rows = 2:data_rows,  # Skip header row
+    type = "expression",
+    rule = paste0(
+      "AND(NOT(ISBLANK(", openxlsx::int2col(col_idx), "2)),",
+      "ISNUMBER(", openxlsx::int2col(col_idx), "2),",
+      openxlsx::int2col(col_idx), "2<0.05)"
+    ),
+    style = createStyle(bgFill = "#FF9999")  # Light red background
+  )
+}
+
+format_phenotype <- function(wb, sheet_name, col_name, table, percentile = .001) {
+  data_rows <- nrow(table) + 1  # +1 for header
+  col_idx <- which(names(table) == col_name)
+
+  min_max <- quantile(table[[col_name]], probs = c(percentile, 1 - percentile), na.rm = TRUE) |>
+    abs() |>
+    max()
+
+  conditionalFormatting(
+    wb = wb,
+    sheet = sheet_name,
+    cols = col_idx,
+    rows = 2:data_rows,  # Skip header row
+    type = "colourScale",
+    style = c("blue", "white", "red"),
+    rule = c(-1, 0, 1) * min_max
+  )
+}
+
+add_sheet <- function(wb, sheet_name, table) {
+  addWorksheet(wb, sheet_name)
+  table <- select(table, where(negate(is.list)))
+  writeDataTable(wb, sheet_name, table, tableStyle = "TableStyleLight1")
+  walk(
+    str_subset(names(table), "^padj"),
+    \(col_name) format_p(wb, sheet_name, col_name, table)
+  )
+  walk(
+    str_subset(names(table), "^log2FoldChange|^signed_p"),
+    \(col_name) format_phenotype(wb, sheet_name, col_name, table)
+  )
+  setColWidths(wb, sheet_name, cols = seq_len(ncol(table)), widths = "auto")
+}
+
+wb <- createWorkbook()
+
+list(
+  "Treatments" = de_res |>
+    arrange(padj, pvalue),
+  "Treatments YKL vs Vehicle" = de_res_between_groups |>
+    arrange(padj, pvalue),
+  "Treatments YKL vs Vehicle Wide" = ykl_vs_vehicle_de_comp |>
+    arrange(padj_between_groups, pvalue_between_groups)
+) |>
+  iwalk(\(t, n) add_sheet(wb, n, t))
+
+# Save the workbook
+saveWorkbook(
+  wb, here("ascites", "ascites_de_results.xlsx"), overwrite = TRUE
+)
 ```
