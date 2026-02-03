@@ -433,6 +433,49 @@ shared_position_gene_summary <- enframe(
 dt_default_table(shared_position_gene_summary)
 ```
 
+### Less impactful present anywhere
+
+```{r}
+all_gene_summary <- vcf_filtered |>
+  imap(
+    \(vcf, path) {
+      map(
+        info(vcf)$CSQ[info(vcf)$TLOD > 25],
+        \(x) {
+          csq_split <- str_split_fixed(
+            x,
+            stringr::fixed("|"),
+            n = 5
+          )
+          csq_split[, 4][
+            csq_split[, 3] %in% c("HIGH", "MODERATE") |
+              str_detect(
+                csq_split[, 2],
+                paste(variant_whitelist, collapse = "|")
+              )
+          ]
+        }
+      ) |>
+        purrr::reduce(base::union)
+    }
+  ) |>
+  enframe(
+    name = "sample", value = "gene_symbol"
+  ) |>
+  unchop(gene_symbol) |>
+  group_by(gene_symbol) |>
+  summarise(
+    n_vcfs = n_distinct(sample),
+    n_cell_lines = n_distinct(str_split_fixed(sample, stringr::fixed("-"), 2)[, 1]),
+    affected_vcfs = list(sort(unique(sample))),
+    affected_vcfs_str = map_chr(affected_vcfs, \(x) paste(x, collapse = "; ")),
+    .groups = "drop"
+  ) |>
+  arrange(desc(n_vcfs)) |>
+  join_crispr("gene_symbol")
+
+```
+
 ## Make Excel summary file
 
 ```{r}
@@ -494,7 +537,8 @@ wb <- createWorkbook()
 list(
   "Damaging Variants" = damaging_variants,
   "Damaging Variants Gene Summary" = damaging_variants_gene_summary,
-  "Shared Position Gene Summary" = shared_position_gene_summary
+  "Shared Position Gene Summary" = shared_position_gene_summary,
+  "All Gene Summary" = all_gene_summary
 ) |>
   iwalk(\(t, n) add_sheet(wb, n, t))
 
@@ -502,6 +546,4 @@ list(
 saveWorkbook(
   wb, here("variant-calling", "variant_calling_summary.xlsx"), overwrite = TRUE
 )
-
-
 ```

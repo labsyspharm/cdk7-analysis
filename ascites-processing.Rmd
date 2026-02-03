@@ -43,6 +43,10 @@ conflicts_prefer(
 
 synapser::synLogin()
 syn <- synDownloader("~/data", .cache = TRUE)
+
+dir.create(
+  here("ascites")
+)
 ```
 
 Only "Vehicle" and "YKL" treated mice sequenced for this analysis.
@@ -176,10 +180,8 @@ meta_deseq <- meta |>
   ) |>
   group_by(Group) |>
   mutate(
+    # Code mice as 1, 2, ... within each group for nested design
     Mouse_nested = factor(as.integer(factor(Mouse)))
-    # The character → factor → integer → character → factor chain normalizes Mouse
-    # so that the nested design (~ Group / Mouse + ...) in the model matrix below
-    # uses a clean, sequential encoding of Mouse within Group for DESeq2.
   ) |>
   ungroup()
 
@@ -358,16 +360,8 @@ p <- ggplot(
       label = gene_name
     ),
     data = \(x) group_by(x, comparison, sign(log2FoldChange)) |>
+      filter(padj < .05) |>
       slice_min(pvalue, n = 10),
-    # data = \(x) group_by(x, comparison, sign(log2FoldChange)) |>
-    #   arrange(pvalue) |>
-    #   mutate(
-    #     gene_name = if_else(
-    #       seq_len(n()) <= 10 & padj < .05,
-    #       gene_name,
-    #       ""
-    #     )
-    #   ),
     size = 2,
     max.overlaps = Inf
   ) +
@@ -405,10 +399,6 @@ p <- ggplot(
   ) +
   envalysis::theme_publish()
 p
-
-dir.create(
-  here("ascites")
-)
 
 ggsave(
   here("ascites", "volcano_plots.pdf"),
