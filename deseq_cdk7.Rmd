@@ -114,6 +114,8 @@ prepare_counts <- function(mtx, col_meta, row_meta, gene_mapping) {
 
 ```
 
+## DGE metadata
+
 ```{r}
 raw_synapse_old <- synGlob(
   "syn52226362", "*", "*mtx*"
@@ -160,6 +162,11 @@ meta_all <- bind_rows(meta_old, meta_new) %>%
     sample_id = paste(experiment, plate_id, well, sep = "_"),
     batch = paste(experiment, batch_id)
   )
+
+write_csv(
+  meta_all,
+  file.path("deseq", "dge_combined_meta.csv.gz")
+)
 ```
 
 
@@ -344,11 +351,29 @@ dds <- DESeqDataSetFromMatrix(
   counts_mat,
   colData = meta_deseq,
   design = ~experiment + agent + cell_line + time
+) %>%
+  estimateSizeFactors() %>%
+  estimateDispersions()
+
+dge_all_counts_long <- list(
+  raw = counts(dds, normalized = FALSE),
+  normalized = counts(dds, normalized = TRUE),
+  varstab = varianceStabilizingTransformation(dds) %>%
+    assay()
+) %>%
+  map(\(x) as_tibble(x, rownames = "ensembl_gene_id")) %>%
+  bind_rows(.id = "type") %>%
+  left_join(
+    ensembl_gtf %>%
+      select(ensembl_gene_id, hgnc_symbol, gene_name),
+    by = "ensembl_gene_id"
+  )
+
+write_csv(
+  dge_all_counts_long,
+  file.path("deseq", "dge_counts_long.csv.gz")
 )
 
-vsd <- varianceStabilizingTransformation(dds)
-
-vsd_mat <- assay(vsd)
 ```
 
 ```{r}
@@ -663,10 +688,15 @@ Upload DGE results to Synapse
 syn_analysis <- synMkdir("syn52226362", "analysis")
 
 synStoreMany(
-  c(
-    "deseq/cdk7_deseq_res_long.csv",
-    "deseq/cdk7_deseq_res_lrt_long.csv",
-    file.path("deseq", "cdk7_deseq_res_combined_long.csv")
+  file.path(
+    "deseq",
+    c(
+      "cdk7_deseq_res_long.csv",
+      "cdk7_deseq_res_lrt_long.csv",
+      "cdk7_deseq_res_combined_long.csv",
+      "dge_combined_meta.csv.gz",
+      "dge_counts_long.csv.gz"
+    )
   ),
   syn_analysis,
   forceVersion = FALSE
@@ -880,7 +910,7 @@ p <- ggplot(
   geom_point()
 ```
 
-## Baseline
+## Baseline DGE
 
 ```{r read_gr_metrics}
 gr_raw <- syn("syn52242760") %>%
@@ -910,7 +940,16 @@ qsave(
   de_baseline,
   file.path("deseq", "cdk7_deseq_baseline.qs")
 )
+```
 
+```{r}
+dge_counts_baseline_trans <- list(
+
+)
+```
+
+
+```{r}
 library(emmeans)
 de_baseline_emm <- lm(
   count ~ 0 + cell_line,
@@ -1037,6 +1076,17 @@ ensembl_gtf_old <- rtracklayer::readGFF(
     gene_name = coalesce(hgnc_symbol, ensembl_gene_id)
   )
 
+
+ensembl_gtf_combined <- bind_rows(
+  dge = ensembl_gtf,
+  deep = ensembl_gtf_old,
+  .id = "assay"
+)
+
+write_csv(
+  ensembl_gtf_combined,
+  file.path("data", "ensembl_gtf_combined.csv.gz")
+)
 ```
 
 
@@ -1249,7 +1299,8 @@ synStoreMany(
     file.path("deseq", "deep_baseline_varstab_zscores.csv.gz"),
     file.path("deseq", "deep_baseline_varstab_mad.csv.gz"),
     file.path("deseq", "deep_baseline_naive_log2fc.csv.gz"),
-    file.path("deseq", "deep_baseline_varstab_differences.csv.gz")
+    file.path("deseq", "deep_baseline_varstab_differences.csv.gz"),
+    file.path("data", "ensembl_gtf_combined.csv.gz")
   ),
   parentId = "syn68500169",
   forceVersion = FALSE

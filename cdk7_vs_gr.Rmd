@@ -256,13 +256,13 @@ compute_correlation <- function(gr_mat, lfc_mat, ...) {
 
 baseline_gr_cor_inputs <- tribble(
   ~assay, ~expression_metric, ~expression_data,
-  "dge", "log2FoldChange", deseq_res_baseline %>%
+  "dge", "log2FoldChange", deseq_res_baseline_dge %>%
     transmute(
       cell_line,
       ensembl_gene_id,
       expression_value = log2FoldChange
     ),
-  "dge", "signed_p", deseq_res_baseline %>%
+  "dge", "signed_p", deseq_res_baseline_dge %>%
     transmute(
       cell_line,
       ensembl_gene_id,
@@ -1712,18 +1712,20 @@ ykl_lfc_mat <- deseq_res_gr_long %>%
   group_nest(gr_correction) %>%
   rowwise() %>%
   mutate(
-    genes_to_keep = data %>%
+    gene_data = data %>%
       filter(
         cell_line %in% ykl_cell_lines_to_keep
       ) %>%
       group_by(ensembl_gene_id) %>%
       filter(any(padj < 0.05)) %>%
-      ungroup() %>%
-      pull(ensembl_gene_id) %>%
-      unique() %>%
+      summarize(
+        n_up = sum(log2FoldChange > 0 & padj < 0.05, na.rm = TRUE),
+        n_down = sum(log2FoldChange < 0 & padj < 0.05, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
       list(),
     mat = data %>%
-      filter(ensembl_gene_id %in% genes_to_keep) %>%
+      filter(ensembl_gene_id %in% gene_data$ensembl_gene_id) %>%
       select(ensembl_gene_id, cell_line, log2FoldChange) %>%
       pivot_wider(names_from = cell_line, values_from = log2FoldChange, values_fill = 0) %>%
       column_to_rownames("ensembl_gene_id") %>%
@@ -1778,6 +1780,14 @@ ggsave(
 )
 
 ```
+
+### Checking direction of effect
+
+```{r}
+
+```
+
+### Plotting example correlations
 
 
 ```{r}
