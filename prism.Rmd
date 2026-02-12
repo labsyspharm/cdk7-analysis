@@ -1,0 +1,816 @@
+---
+title: "CDK7 PRISM analysis"
+author: "Clemens Hug"
+date: "2026-02-06"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(powerjoin)
+library(synExtra)
+library(conflicted)
+library(hdf5r)
+library(ggbeeswarm)
+library(here)
+library(lmerTest)
+library(emmeans)
+library(broom.mixed)
+library(furrr)
+library(qs2)
+library(ggrepel)
+library(msigdbr)
+library(fgsea)
+library(openxlsx)
+
+conflicts_prefer(
+  dplyr::filter,
+  dplyr::select,
+  base::setdiff,
+  lmerTest::lmer
+)
+
+synapser::synLogin()
+syn <- synDownloader("~/data", .cache = TRUE)
+
+plot_dir <- here("plots", "prism")
+dir.create(plot_dir, showWarnings = FALSE)
+
+result_dir <- here("prism")
+dir.create(result_dir, showWarnings = FALSE)
+```
+
+PRISM analysis code at https://github.com/theprismlab/sushi/blob/5320078b788fd606ec562ac60ebdb4c9688087f5/scripts/biomarker/biomarker_functions.R#L103
+
+## Load Biomarker data
+
+```{r}
+biomarkers_raw <- syn("syn73615969") |>
+  H5File$new()
+
+expression_col_meta <- biomarkers_raw[["Expression/column_meta"]]$read() |>
+  as_tibble()
+
+expression_row_meta <- biomarkers_raw[["Expression/row_meta"]]$read() |>
+  as_tibble()
+
+expression_mat <- biomarkers_raw[["Expression/mat"]]$read() |>
+  magrittr::set_colnames(
+    expression_col_meta$column_name
+  ) |>
+  magrittr::set_rownames(
+    expression_row_meta$ModelID
+  )
+
+cell_line_meta <- biomarkers_raw[["Lineage_Table/table"]]$read() |>
+  as_tibble()
+
+# for mapping old YKL ccle names to new depmap ids
+cell_line_meta_depmap <- syn("syn73674394") |>
+  read_csv()
+```
+
+```{r}
+prism_raw_zips <- c(
+  mts_30 = "syn73616950",
+  ykl = "syn73616961"
+) |>
+  map(syn)
+
+prism_drc <- list(
+  mts_30 = prism_raw_zips[["mts_30"]] |>
+    unz("drc/MTS030_TINGHU_ZHANG_DRC_TABLE.csv") |>
+    read_csv(),
+  ykl = prism_raw_zips[["ykl"]] |>
+    unz("data/DRC_TABLE.csv") |>
+    read_csv() |>
+    rename(
+      minimum_dose = min_dose,
+      maximum_dose = max_dose,
+      inflection = ec50,
+      log2_ic50 = log2.ic50,
+      frac_var_explained = R2
+    ) |>
+    power_inner_join(
+      distinct(cell_line_meta_depmap, ccle_name = CCLEName, depmap_id = ModelID) |>
+        drop_na(),
+      by = "ccle_name",
+      check = check_specs(
+        unmatched_keys_left = "warn",
+        duplicate_keys_right = "warn"
+      )
+    )
+) |>
+  bind_rows(
+    .id = "dataset"
+  )
+
+
+```
+
+
+## Explore MDR genes
+
+```{r}
+mdr_genes <- c("ABCB1", "ABCG2", "ABCC1")
+
+mdr_expression <- expression_mat[, mdr_genes] |>
+  as_tibble(rownames = "depmap_id") |>
+  pivot_longer(
+    -depmap_id,
+    names_to = "gene",
+    values_to = "expression"
+  ) |>
+  power_left_join(
+    cell_line_meta,
+    by = "depmap_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+p <- ggplot(
+  mdr_expression,
+  aes(
+    x = expression,
+    y = lineage,
+    color = lineage
+  )
+) +
+  geom_quasirandom(
+    shape = 16
+  ) +
+  facet_wrap(
+    ~gene,
+    scales = "free_x",
+    axes = "all", axis.labels = "margins"
+  ) +
+  guides(color = "none") +
+  scale_x_continuous(
+    expand = expansion(mult = c(0.01, .05))
+  ) +
+  envalysis::theme_publish() +
+  labs(
+    x = "Expression", y = "Lineage"
+  )
+p
+
+ggsave(
+  file.path(plot_dir, "mdr_genes_expression.pdf"),
+  p, width = 10, height = 7
+)
+```
+
+A sensible cutoff for ABCB1 seems to be around 1-2. Clear negative population with
+long positive tail. For ABCG2 bit harder to define. Much fatter tail especially
+for lung and skin. ABCC1 doesn't have negative population at all.
+
+Just doing ABCB1 cutoff 2 for now.
+
+## Filter cell lines and genes
+
+```{r}
+cell_lines_n_profiled <- prism_drc |>
+  distinct(depmap_id, pert_name) |>
+  count(depmap_id)
+
+cell_lines_n_profiled |>
+  count(n)
+
+cell_lines_filtered <- cell_line_meta |>
+  semi_join(
+    mdr_expression |>
+      filter(gene == "ABCB1", expression <= 2),
+    by = "depmap_id"
+  ) |>
+  semi_join(
+    cell_lines_n_profiled |>
+      filter(n >= 2),
+    by = "depmap_id"
+  )
+
+
+```
+
+Selecting genes with sufficient variation across cell lines.
+
+```{r}
+eligible_genes <- apply(
+  expression_mat, 2,
+  \(x) quantile(x, .8, names = FALSE)
+) > 1
+
+```
+
+## Fitting model
+
+The goal is to fit a linear model of AUC ~ expression * drug
+
+```{r}
+input_data <- prism_drc |>
+  filter(
+    depmap_id %in% cell_lines_filtered$depmap_id
+  ) |>
+  select(depmap_id, pert_name, auc) |>
+  power_left_join(
+    expression_mat[
+      cell_lines_filtered$depmap_id,
+      eligible_genes
+    ] |>
+      as_tibble(rownames = "depmap_id") |>
+      pivot_longer(
+        -depmap_id,
+        names_to = "gene",
+        values_to = "expression"
+      ),
+    by = "depmap_id",
+    check = check_specs(
+      unmatched_keys_left = "warn"
+    )
+  ) |>
+  group_nest(gene)
+```
+
+```{r}
+run_model <- function(df) {
+  # model <- lm(
+  #   auc ~ expression * pert_name,
+  #   data = df
+  # )
+  model <- lmer(
+    auc ~ expression * pert_name + (1 | depmap_id),
+    data = df
+  )
+
+  emm <- emtrends(
+    model,
+    ~pert_name,
+    var = "expression",
+    adjust = "none"
+  )
+
+  emm_intercepts <- emmeans(
+    model,
+    ~pert_name,
+    at = list(expression = 0),
+    adjust = "none"
+  )
+
+  res_by_compound <- inner_join(
+    tidy(emm_intercepts) |>
+      rename(intercept = estimate) |>
+      select(-c(df, statistic, p.value)),
+    tidy(emm),
+    by = "pert_name",
+    suffix = c("_intercept", "_slope")
+  )
+
+  list(
+    model_stats = glance(model),
+    model_coefs = tidy(model),
+    model_by_compound = res_by_compound,
+    pairwise_res = pairs(
+      emm,
+      adjust = "none"
+    ) |>
+      tidy()
+  )
+}
+
+run_model(input_data$data[[1]])
+
+plan(multicore, workers = 4)
+
+model_res_raw <- input_data |>
+  mutate(
+    model_out = future_map(
+      data,
+      run_model,
+      .progress = TRUE,
+      .options = furrr_options(seed = 42)
+    )
+  )
+
+qd_save(
+  model_res_raw,
+  file.path(result_dir, "model_res_raw.qs")
+)
+# model_res_raw <- qd_read(
+#   file.path(result_dir, "model_res_raw.qs")
+# )
+```
+
+
+```{r}
+model_res_pairwise <- model_res_raw |>
+  transmute(
+    gene,
+    pairwise_res = map(model_out, "pairwise_res")
+  ) |>
+  unnest(pairwise_res) |>
+  mutate(
+    padj = p.adjust(p.value, method = "fdr"),
+    direction = if_else(estimate > 0, "positive", "negative")
+  )
+
+model_slopes <- model_res_raw |>
+  transmute(
+    gene,
+    model_slopes = map(model_out, "model_by_compound")
+  ) |>
+  unnest(model_slopes) |>
+  mutate(
+    padj = p.adjust(p.value, method = "fdr"),
+    direction = if_else(expression.trend > 0, "positive", "negative")
+  )
+```
+
+## Plot
+
+### P-value distribution
+
+```{r}
+p <- bind_rows(
+  `Pairwise comparisons` = model_res_pairwise,
+  `Model slopes` = model_slopes,
+  .id = "result_type"
+) |>
+  ggplot(
+    aes(x = p.value)
+  ) +
+  geom_histogram() +
+  scale_x_continuous(
+    expand = expansion(mult = c(0, .05))
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, .05))
+  ) +
+  facet_wrap(
+    ~result_type,
+    scales = "free_y",
+    axes = "all", axis.labels = "margins"
+  ) +
+  envalysis::theme_publish()
+
+ggsave(
+  file.path(plot_dir, "p_value_distributions.pdf"),
+  p, width = 8, height = 4
+)
+```
+
+
+```{r}
+plot_auc_expression_corr <- function(gene) {
+  scatter_df <- input_data |>
+    filter(.data$gene == .env$gene) |>
+    unnest(data) |>
+    power_inner_join(
+      cell_line_meta,
+      by = "depmap_id",
+      check = check_specs(
+        unmatched_keys_left = "warn",
+        duplicate_keys_right = "warn"
+      )
+    )
+  slope_df <- model_slopes |>
+    filter(.data$gene == .env$gene)
+  ggplot(
+    scatter_df,
+    aes(
+      x = expression,
+      y = auc
+    )
+  ) +
+    geom_point(
+      aes(
+        color = lineage
+      ),
+      alpha = .6,
+      shape = 16
+    ) +
+    geom_abline(
+      aes(
+        slope = expression.trend,
+        intercept = intercept
+      ),
+      data = slope_df
+    ) +
+    ggnewscale::new_scale_color() +
+    geom_text(
+      aes(
+        label = paste0(
+          " b = ", signif(expression.trend, 2),
+          "\n p = ", signif(padj, 2)
+        ),
+        color = padj < 0.05
+      ),
+      data = slope_df,
+      x = -Inf, y = Inf,
+      hjust = 0, vjust = 1
+    ) +
+    scale_color_manual(
+      values = c(
+        "TRUE" = "red",
+        "FALSE" = "black"
+      ),
+      guide = "none"
+    ) +
+    labs(
+      x = "Expression", y = "AUC",
+      color = "Lineage",
+      title = gene
+    ) +
+    envalysis::theme_publish() +
+    facet_wrap(
+      ~pert_name,
+      axes = "all", axis.labels = "margins"
+    )
+}
+
+plot_auc_expression_corr("ABCB1")
+plot_auc_expression_corr("WDR54")
+plot_auc_expression_corr("IFITM1")
+plot_auc_expression_corr("AURKB")
+plot_auc_expression_corr("CDK7")
+plot_auc_expression_corr("MED12L")
+
+input_data |>
+  filter(gene == "ABCB1") |>
+  chuck("data", 1L) |>
+  plot_auc_expression_corr()
+```
+
+Make plots for top 20 hits.
+
+
+```{r}
+dir.create(
+  file.path(plot_dir, "top_hits", "pairwise"),
+  showWarnings = FALSE, recursive = TRUE
+)
+dir.create(
+  file.path(plot_dir, "top_hits", "slopes"),
+  showWarnings = FALSE, recursive = TRUE
+)
+
+model_res_pairwise |>
+  arrange(p.value) |>
+  filter(padj < 0.05) |>
+  group_by(contrast) |>
+  slice_head(n = 20) |>
+  mutate(
+    rank = seq_len(n())
+  ) |>
+  ungroup() |>
+  pwalk(
+    \(gene, contrast, rank, ...) {
+      p <- plot_auc_expression_corr(gene)
+      ggsave(
+        file.path(plot_dir, "top_hits", "pairwise", paste0(contrast, "_", rank, "_", gene, ".pdf")),
+        p, width = 8, height = 6
+      )
+    }
+  )
+
+model_slopes |>
+  arrange(p.value) |>
+  filter(padj < 0.05) |>
+  group_by(pert_name) |>
+  slice_head(n = 20) |>
+  mutate(
+    rank = seq_len(n())
+  ) |>
+  ungroup() |>
+  pwalk(
+    \(gene, pert_name, rank, ...) {
+      p <- plot_auc_expression_corr(gene)
+      ggsave(
+        file.path(plot_dir, "top_hits", "slopes", paste0(pert_name, "_", rank, "_", gene, ".pdf")),
+        p, width = 8, height = 6
+      )
+    }
+  )
+```
+
+
+## Volcano plot
+
+```{r}
+p <- ggplot(
+  model_slopes,
+  aes(
+    x = expression.trend,
+    y = -log10(padj)
+  )
+) +
+  geom_point(
+    aes(
+      color = padj < 0.05
+    ),
+    shape = 16,
+    alpha = .6
+  ) +
+  geom_text_repel(
+    data = \(x) arrange(x, p.value) |>
+      filter(padj < 0.05) |>
+      mutate(
+        direction = if_else(
+          expression.trend > 0, "positive", "negative"
+        )
+      ) |>
+      group_by(pert_name, direction) |>
+      slice_head(n = 20),
+    aes(label = gene),
+    size = 2,
+    max.overlaps = Inf
+  ) +
+  scale_color_manual(
+    values = c(
+      "TRUE" = "red",
+      "FALSE" = "black"
+    ),
+    guide = "none"
+  ) +
+  facet_wrap(
+    ~pert_name,
+    axes = "all", axis.labels = "margins"
+  ) +
+  labs(
+    x = "Slope", y = "-log10(adj. p-value)"
+  ) +
+  envalysis::theme_publish()
+p
+
+ggsave(
+  file.path(plot_dir, "volcano_slopes.pdf"),
+  p, width = 10, height = 5
+)
+```
+
+
+```{r}
+p <- ggplot(
+  model_res_pairwise,
+  aes(
+    x = estimate,
+    y = -log10(padj)
+  )
+) +
+  geom_point(
+    aes(
+      color = padj < 0.05
+    ),
+    shape = 16,
+    alpha = .6
+  ) +
+  geom_text_repel(
+    data = \(x) arrange(x, p.value) |>
+      mutate(
+        direction = if_else(
+          estimate > 0, "positive", "negative"
+        )
+      ) |>
+      filter(padj < 0.05) |>
+      group_by(contrast, direction) |>
+      slice_head(n = 20),
+    aes(label = gene),
+    size = 2,
+    max.overlaps = Inf
+  ) +
+  scale_color_manual(
+    values = c(
+      "TRUE" = "red",
+      "FALSE" = "black"
+    ),
+    guide = "none"
+  ) +
+  facet_wrap(
+    ~contrast,
+    axes = "all", axis.labels = "margins"
+  ) +
+  labs(
+    x = "Slope", y = "-log10(adj. p-value)"
+  ) +
+  envalysis::theme_publish()
+p
+
+ggsave(
+  file.path(plot_dir, "volcano_pairwise.pdf"),
+  p, width = 10, height = 5
+)
+```
+
+## Enrichment analysis
+
+
+```{r}
+database_abbreviations <- c(
+  "REACTOME" = "R",
+  "HALLMARK" = "H",
+  "PID" = "P",
+  "KEGG_MEDICUS" = "K",
+  "GOBP" = "BP",
+  "GOMF" = "MF",
+  "GOCC" = "CC"
+)
+
+abbreviate_prefix <- function(strings, abbr_map = database_abbreviations) {
+  # Create regex pattern from abbreviation names
+  pattern <- paste0("^(", paste(names(abbr_map), collapse = "|"), ")_")
+
+  # Replace matching prefixes with abbreviations
+  str_replace(strings, pattern, function(x) {
+    prefix <- str_remove(x, "_$")
+    paste0(abbr_map[prefix], "_")
+  })
+}
+
+all_gene_sets <- msigdbr(species = "Homo sapiens")
+selected_gene_sets <- all_gene_sets %>%
+  filter(
+    gs_collection %in% c("H") |
+      gs_subcollection %in% c(
+        "CP:REACTOME",
+        "CP:KEGG_MEDICUS"
+      ),
+    !str_detect(gs_name, coll("MEDICUS_PATHOGEN")),
+    !str_detect(gs_name, coll("MEDICUS_VARIANT"))
+  ) %>%
+  mutate(
+    database = str_extract(gs_name, paste0("^(", paste(names(database_abbreviations), collapse = "|"), ")")),
+    pathway = abbreviate_prefix(gs_name)
+  )
+
+selected_gene_sets_list <- selected_gene_sets %>%
+  group_nest(gs_collection, gs_subcollection, gs_name, database, pathway) %>%
+  mutate(
+    gs = map(
+      data,
+      \(x) unique(x$gene_symbol)
+    ) %>%
+      set_names(pathway)
+  )
+
+fora_input_raw <- bind_rows(
+  slopes = model_slopes |>
+    filter(padj < 0.05) |>
+    arrange(p.value) |>
+    group_by(term = pert_name, direction) |>
+    slice_head(n = 500),
+  pairwise = model_res_pairwise |>
+    filter(padj < 0.05) |>
+    arrange(p.value) |>
+    group_by(term = contrast, direction) |>
+    slice_head(n = 500),
+  .id = "de_type"
+) |>
+  ungroup() |>
+  nest(.by = c(term, direction))
+
+gene_universe <- names(eligible_genes)[eligible_genes]
+
+fora_res_raw <- fora_input_raw %>%
+  mutate(
+    res = map(
+      data,
+      \(x) {
+        withr::with_seed(42, fora(
+          selected_gene_sets_list$gs,
+          x$gene,
+          universe = gene_universe
+        ))
+      }
+    ),
+    res_reduced = future_pmap(
+      list(res, data),
+      \(res, data) {
+        collapsePathwaysORA(
+          filter(res, padj < .05),
+          selected_gene_sets_list$gs,
+          data$gene,
+          gene_universe
+        )
+      },
+      .progress = TRUE
+    )
+  )
+
+
+fora_res_long <- fora_res_raw %>%
+  transmute(
+    term, direction,
+    res = map2(
+      res, res_reduced,
+      \(full, reduced) {
+        mutate(
+          full,
+          is_main = pathway %in% reduced$mainPathways,
+          parent_pathway = reduced$parentPathways[pathway]
+        )
+      }
+    )
+  ) %>%
+  unnest(res) |>
+  mutate(
+    signed_padj = if_else(
+      # multiplied by -1
+      direction == "negative", 1, -1
+    ) * log10(padj)
+  )
+
+```
+
+## Make Excel sheet
+
+```{r}
+format_p <- function(wb, sheet_name, col_name, table) {
+  data_rows <- nrow(table) + 1  # +1 for header
+  col_idx <- which(names(table) == col_name)
+
+  conditionalFormatting(
+    wb = wb,
+    sheet = sheet_name,
+    cols = col_idx,
+    rows = 2:data_rows,  # Skip header row
+    type = "expression",
+    rule = paste0(
+      "AND(NOT(ISBLANK(", openxlsx::int2col(col_idx), "2)),",
+      "ISNUMBER(", openxlsx::int2col(col_idx), "2),",
+      openxlsx::int2col(col_idx), "2<0.05)"
+    ),
+    style = createStyle(bgFill = "#FF9999")  # Light red background
+  )
+}
+
+format_phenotype <- function(wb, sheet_name, col_name, table, percentile = .001) {
+  data_rows <- nrow(table) + 1  # +1 for header
+  col_idx <- which(names(table) == col_name)
+
+  min_max <- quantile(table[[col_name]], probs = c(percentile, 1 - percentile), na.rm = TRUE) |>
+    abs() |>
+    max()
+
+  conditionalFormatting(
+    wb = wb,
+    sheet = sheet_name,
+    cols = col_idx,
+    rows = 2:data_rows,  # Skip header row
+    type = "colourScale",
+    style = c("blue", "white", "red"),
+    rule = c(-1, 0, 1) * min_max
+  )
+}
+
+add_sheet <- function(wb, sheet_name, table) {
+  addWorksheet(wb, sheet_name)
+  table <- select(table, where(negate(is.list)))
+  writeDataTable(wb, sheet_name, table, tableStyle = "TableStyleLight1")
+  walk(
+    str_subset(names(table), "^padj"),
+    \(col_name) format_p(wb, sheet_name, col_name, table)
+  )
+  walk(
+    str_subset(names(table), "^estimate|^expression.trend|^foldEnrichment|^signed_padj"),
+    \(col_name) format_phenotype(wb, sheet_name, col_name, table)
+  )
+  setColWidths(wb, sheet_name, cols = seq_len(ncol(table)), widths = "auto")
+}
+
+wb <- createWorkbook()
+
+list(
+  "Slopes" = model_slopes |>
+    arrange(padj, p.value),
+  "Pairwise" = model_res_pairwise |>
+    arrange(padj, p.value)
+) |>
+  iwalk(\(t, n) add_sheet(wb, n, t))
+
+# Save the workbook
+saveWorkbook(
+  wb,
+  file.path(result_dir, "cdk7_prism_expression_model.xlsx"),
+  overwrite = TRUE
+)
+
+wb <- createWorkbook()
+
+fora_res_long |>
+  arrange(padj, pval) |>
+  group_by(term) |>
+  group_walk(\(df, key) {
+    add_sheet(wb, key$term, df)
+  })
+
+# Save the workbook
+saveWorkbook(
+  wb,
+  file.path(result_dir, "cdk7_prism_expression_enrichment.xlsx"),
+  overwrite = TRUE
+)
+```
+
