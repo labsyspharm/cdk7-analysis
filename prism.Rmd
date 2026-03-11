@@ -73,6 +73,11 @@ cell_line_meta_depmap <- syn("syn73674394") |>
   read_csv()
 ```
 
+## To Do
+
+* Check lineage enrichment for highly responsive cell lines. Differences between compounds?
+
+
 ```{r}
 prism_raw_zips <- c(
   mts_30 = "syn73616950",
@@ -165,15 +170,19 @@ ggsave(
 )
 ```
 
+Check correlation of the three
+
 A sensible cutoff for ABCB1 seems to be around 1-2. Clear negative population with
 long positive tail. For ABCG2 bit harder to define. Much fatter tail especially
 for lung and skin. ABCC1 doesn't have negative population at all.
 
-Just doing ABCB1 cutoff 2 for now.
+Just doing ABCB1 cutoff 1 for now.
 
 ## Filter cell lines and genes
 
 ```{r}
+ABCB1_CUTOFF <- 1
+
 cell_lines_n_profiled <- prism_drc |>
   distinct(depmap_id, pert_name) |>
   count(depmap_id)
@@ -184,7 +193,7 @@ cell_lines_n_profiled |>
 cell_lines_filtered <- cell_line_meta |>
   semi_join(
     mdr_expression |>
-      filter(gene == "ABCB1", expression <= 2),
+      filter(gene == "ABCB1", expression <= ABCB1_CUTOFF),
     by = "depmap_id"
   ) |>
   semi_join(
@@ -196,7 +205,7 @@ cell_lines_filtered <- cell_line_meta |>
 
 ```
 
-Selecting genes with sufficient variation across cell lines.
+Selecting genes with sufficient expression in at least some cell lines.
 
 ```{r}
 eligible_genes <- apply(
@@ -206,7 +215,99 @@ eligible_genes <- apply(
 
 ```
 
-## Fitting model
+## Fitting lineage model
+
+```{r}
+prism_drc_lineage <- prism_drc |>
+  filter(
+    depmap_id %in% cell_lines_filtered$depmap_id
+  ) |>
+  select(depmap_id, pert_name, auc) |>
+  power_inner_join(
+    cell_line_meta |>
+      select(depmap_id, lineage),
+    by = "depmap_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+lineage_vector <- cell_line_meta |>
+  group_nest(lineage) |>
+  mutate(
+    gs = set_names(
+      map(data, "depmap_id"),
+      lineage
+    )
+  )
+
+prism_fgsea_res <- prism_drc_lineage |>
+  group_by(pert_name, depmap_id) |>
+  summarize(
+    auc = mean(auc, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  group_by(pert_name) |>
+  summarize(
+    res = fgseaMultilevel(
+      lineage_vector$gs,
+      set_names(scale(auc)[, 1], depmap_id)
+    ) |>
+      list()
+  )
+```
+
+```{r}
+prism_lineage_model <- lm(
+  auc ~ lineage * pert_name,
+  data = prism_drc_lineage
+)
+car::Anova(prism_lineage_model)
+```
+
+
+```{r}
+p <- ggplot(
+  prism_drc_lineage,
+  aes(
+    x = auc,
+    y = lineage,
+    color = lineage
+  )
+) +
+  geom_quasirandom(
+    shape = 16,
+    alpha = .5
+  ) +
+  geom_boxplot(
+    outlier.shape = NA,
+    fill = NA
+  ) +
+  scale_color_discrete(
+    guide = "none"
+  ) +
+  facet_wrap(
+    ~pert_name,
+    scales = "free_x",
+    axes = "all", axis.labels = "margins"
+  ) +
+  labs(
+    x = "AUC", y = NULL
+  ) +
+  # scale_x_continuous(
+  #   expand = expansion(mult = c(0, .05))
+  # ) +
+  envalysis::theme_publish()
+p
+
+ggsave(
+  file.path(plot_dir, "auc_by_lineage.pdf"),
+  p, width = 10, height = 7
+)
+```
+
+## Fitting expression model
 
 The goal is to fit a linear model of AUC ~ expression * drug
 
@@ -215,7 +316,16 @@ input_data <- prism_drc |>
   filter(
     depmap_id %in% cell_lines_filtered$depmap_id
   ) |>
-  select(depmap_id, pert_name, auc) |>
+  select(depmap_id, pert_name, auc)  |>
+  power_inner_join(
+    cell_line_meta |>
+      select(depmap_id, lineage),
+    by = "depmap_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) |>
   power_left_join(
     expression_mat[
       cell_lines_filtered$depmap_id,
@@ -236,28 +346,48 @@ input_data <- prism_drc |>
 ```
 
 ```{r}
-run_model <- function(df) {
-  # model <- lm(
-  #   auc ~ expression * pert_name,
-  #   data = df
-  # )
-  model <- lmer(
-    auc ~ expression * pert_name + (1 | depmap_id),
-    data = df
-  )
+run_model <- function(
+  df, model_formula, random_effects = TRUE,
+  lmer.df = "satterthwaite", REML = FALSE,
+  rank_transform = FALSE
+) {
+  # browser()
+  if (rank_transform) {
+    df <- df |>
+      mutate(
+        across(
+          c(auc, expression),
+          rank
+        )
+      )
+  }
+  if (random_effects) {
+    model <- lmer(
+      formula(model_formula),
+      data = df,
+      REML = REML
+    )
+  } else {
+    model <- lm(
+      formula(model_formula),
+      data = df
+    )
+  }
 
   emm <- emtrends(
     model,
     ~pert_name,
     var = "expression",
-    adjust = "none"
+    adjust = "none",
+    lmer.df = lmer.df
   )
 
   emm_intercepts <- emmeans(
     model,
     ~pert_name,
     at = list(expression = 0),
-    adjust = "none"
+    adjust = "none",
+    lmer.df = lmer.df
   )
 
   res_by_compound <- inner_join(
@@ -281,27 +411,132 @@ run_model <- function(df) {
   )
 }
 
-run_model(input_data$data[[1]])
+```
 
+```{r}
+model_formulas <- tribble(
+  ~model_name, ~model_formula, ~random_effects,
+  "random_lineage", auc ~ expression * pert_name + (1 | lineage), TRUE,
+  "random_cell_line", auc ~ expression * pert_name + (1 | depmap_id), TRUE,
+  "fixed", auc ~ expression * pert_name, FALSE
+)
+
+test_output <- input_data |>
+  slice(1) |>
+  crossing(model_formulas) |>
+  mutate(
+    model_out = pmap(
+      list(data, model_formula, random_effects),
+      \(d, f, r) run_model(
+        d,
+        f,
+        r,
+        REML = FALSE
+      )
+    )
+  )
+
+plan(multicore, workers = 4)
+
+model_res_raw_all <- input_data |>
+  crossing(model_formulas) |>
+  mutate(
+    model_out = future_pmap(
+      list(data, model_formula, random_effects),
+      \(data, model_formula, random_effects) run_model(
+        data,
+        model_formula,
+        random_effects,
+        REML = FALSE
+      ),
+      .progress = TRUE,
+      .options = furrr_options(seed = 42)
+    )
+  )
+
+qs_save(
+  model_res_raw_all,
+  file.path(result_dir, "model_res_all_no_reml.qs")
+)
+# model_res_raw <- qd_read(
+#   file.path(result_dir, "model_res_raw.qs")
+# )
+
+
+model_res_aic <- model_res_raw_all |>
+  transmute(
+    gene, model_name,
+    aic = map_dbl(
+      model_out, \(x) x$model_stats$AIC
+    ),
+    bic = map_dbl(
+      model_out, \(x) x$model_stats$BIC
+    )
+  ) |>
+  group_by(gene) |>
+  mutate(
+    rank_aic = rank(-aic),
+    rank_bic = rank(-bic)
+  ) |>
+  ungroup()
+
+model_res_aic_summary <- model_res_aic |>
+  group_by(model_name) |>
+  summarize(
+    n_best_aic = sum(rank_aic == 1),
+    n_best_bic = sum(rank_bic == 1),
+    mean_aic = mean(rank_aic),
+    mean_bic = mean(rank_bic),
+    .groups = "drop"
+  )
+
+```
+
+  model_name       n_best_aic n_best_bic mean_aic mean_bic
+  <chr>                 <int>      <int>    <dbl>    <dbl>
+1 fixed                  3852         44     1.71     2.00
+2 random_cell_line          0          0     3        3
+3 random_lineage         9424      13232     1.29     1.00
+
+Running the random_lineage model
+
+```{r}
 plan(multicore, workers = 4)
 
 model_res_raw <- input_data |>
   mutate(
     model_out = future_map(
       data,
-      run_model,
+      \(data) run_model(
+        data,
+        auc ~ expression * pert_name + (1 | lineage),
+        random_effects = TRUE,
+        REML = TRUE,
+        lmer.df = "kenward-roger"
+      ),
       .progress = TRUE,
       .options = furrr_options(seed = 42)
     )
   )
 
-qd_save(
-  model_res_raw,
-  file.path(result_dir, "model_res_raw.qs")
-)
-# model_res_raw <- qd_read(
-#   file.path(result_dir, "model_res_raw.qs")
-# )
+
+
+model_res_rank_raw <- input_data |>
+  mutate(
+    model_out = future_map(
+      data,
+      \(data) run_model(
+        data,
+        auc ~ expression * pert_name + (1 | lineage),
+        random_effects = TRUE,
+        REML = TRUE,
+        lmer.df = "kenward-roger",
+        rank_transform = TRUE
+      ),
+      .progress = TRUE,
+      .options = furrr_options(seed = 42)
+    )
+  )
 ```
 
 
@@ -318,6 +553,30 @@ model_res_pairwise <- model_res_raw |>
   )
 
 model_slopes <- model_res_raw |>
+  transmute(
+    gene,
+    model_slopes = map(model_out, "model_by_compound")
+  ) |>
+  unnest(model_slopes) |>
+  mutate(
+    padj = p.adjust(p.value, method = "fdr"),
+    direction = if_else(expression.trend > 0, "positive", "negative")
+  )
+```
+
+```{r}
+model_res_pairwise_rank <- model_res_rank_raw |>
+  transmute(
+    gene,
+    pairwise_res = map(model_out, "pairwise_res")
+  ) |>
+  unnest(pairwise_res) |>
+  mutate(
+    padj = p.adjust(p.value, method = "fdr"),
+    direction = if_else(estimate > 0, "positive", "negative")
+  )
+
+model_slopes_rank <- model_res_rank_raw |>
   transmute(
     gene,
     model_slopes = map(model_out, "model_by_compound")
@@ -364,10 +623,11 @@ ggsave(
 
 
 ```{r}
-plot_auc_expression_corr <- function(gene) {
+plot_auc_expression_corr <- function(gene, rank_transform = FALSE) {
   scatter_df <- input_data |>
     filter(.data$gene == .env$gene) |>
     unnest(data) |>
+    select(-lineage) |>
     power_inner_join(
       cell_line_meta,
       by = "depmap_id",
@@ -376,8 +636,20 @@ plot_auc_expression_corr <- function(gene) {
         duplicate_keys_right = "warn"
       )
     )
-  slope_df <- model_slopes |>
-    filter(.data$gene == .env$gene)
+  if (rank_transform) {
+    scatter_df <- scatter_df |>
+      mutate(
+        across(
+          c(auc, expression),
+          rank
+        )
+      )
+    slope_df <- model_slopes_rank |>
+      filter(.data$gene == .env$gene)
+  } else {
+    slope_df <- model_slopes |>
+      filter(.data$gene == .env$gene)
+  }
   ggplot(
     scatter_df,
     aes(
@@ -437,6 +709,11 @@ plot_auc_expression_corr("IFITM1")
 plot_auc_expression_corr("AURKB")
 plot_auc_expression_corr("CDK7")
 plot_auc_expression_corr("MED12L")
+plot_auc_expression_corr("PPIA")
+plot_auc_expression_corr("IFIT1")
+plot_auc_expression_corr("ZNF775")
+
+plot_auc_expression_corr("PAQR3", rank_transform = TRUE)
 
 input_data |>
   filter(gene == "ABCB1") |>
@@ -593,7 +870,7 @@ p <- ggplot(
     axes = "all", axis.labels = "margins"
   ) +
   labs(
-    x = "Slope", y = "-log10(adj. p-value)"
+    x = "Slope difference", y = "-log10(adj. p-value)"
   ) +
   envalysis::theme_publish()
 p
@@ -699,7 +976,6 @@ fora_res_raw <- fora_input_raw %>%
     )
   )
 
-
 fora_res_long <- fora_res_raw %>%
   transmute(
     term, direction,
@@ -723,6 +999,84 @@ fora_res_long <- fora_res_raw %>%
   )
 
 ```
+
+```{r}
+fora_res_top <- fora_res_long |>
+  filter(padj < 0.05) |>
+  arrange(padj, pval) |>
+  group_by(term, direction) |>
+  slice_head(n = 20) |>
+  ungroup() |>
+  arrange(padj) |>
+  mutate(
+    padj_cut = cut(
+      padj,
+      breaks = c(-Inf, 0.001, 0.01, 0.05, Inf),
+      labels = c("<0.001", "<0.01", "<0.05", "ns")
+    ) |>
+      fct_rev(),
+    logEnrichment = log10(foldEnrichment) * if_else(direction == "negative", -1, 1),
+    pathway_display = str_replace_all(pathway, coll("_"), " ")
+  )
+
+
+ps <- group_nest(
+  fora_res_top,
+  term
+) |>
+  mutate(
+    p = map(
+      data,
+      \(df) {
+        abs_max_est_perc <- max(abs(quantile(df$signed_padj, c(0.025, .975))), na.rm = TRUE)
+        ggplot(
+          df |>
+            mutate(across(pathway_display, \(x) fct_reorder(x, logEnrichment))),
+          aes(
+            x = logEnrichment,
+            y = pathway_display
+          )
+        ) +
+          geom_vline(xintercept = 0, linetype = "dashed") +
+          geom_point(
+            aes(
+              fill = signed_padj,
+              size = padj_cut
+            ),
+            shape = 21,
+            color = "black"
+          ) +
+          paletteer::scale_fill_paletteer_c(
+            "ggthemes::Orange-Blue-White Diverging",
+            limits = c(-abs_max_est_perc, abs_max_est_perc),
+            oob = scales::squish
+          ) +
+          labs(
+            x = "log10(Fold Enrichment)", y = NULL,
+            fill = "log10(adj. p)",
+            size = "Adjusted p"
+          ) +
+          envalysis::theme_publish()
+          # scale_x_log10()
+      }
+    )
+  )
+
+dir.create(
+  file.path(plot_dir, "enrichment"),
+  showWarnings = FALSE, recursive = TRUE
+)
+pwalk(
+  ps,
+  \(term, p, ...) {
+    ggsave(
+      file.path(plot_dir, "enrichment", paste0(term, "_enrichment.pdf")),
+      p, width = 12, height = 7
+    )
+  }
+)
+```
+
 
 ## Make Excel sheet
 
@@ -767,7 +1121,7 @@ format_phenotype <- function(wb, sheet_name, col_name, table, percentile = .001)
 
 add_sheet <- function(wb, sheet_name, table) {
   addWorksheet(wb, sheet_name)
-  table <- select(table, where(negate(is.list)))
+  # table <- select(table, where(negate(is.list)))
   writeDataTable(wb, sheet_name, table, tableStyle = "TableStyleLight1")
   walk(
     str_subset(names(table), "^padj"),
@@ -786,11 +1140,11 @@ list(
   "Slopes" = model_slopes |>
     arrange(padj, p.value),
   "Pairwise" = model_res_pairwise |>
+    select(-term) |>
     arrange(padj, p.value)
 ) |>
   iwalk(\(t, n) add_sheet(wb, n, t))
 
-# Save the workbook
 saveWorkbook(
   wb,
   file.path(result_dir, "cdk7_prism_expression_model.xlsx"),
@@ -801,16 +1155,16 @@ wb <- createWorkbook()
 
 fora_res_long |>
   arrange(padj, pval) |>
+  relocate(signed_padj, .after = padj) |>
+  relocate(overlapGenes, .after = last_col()) |>
   group_by(term) |>
   group_walk(\(df, key) {
     add_sheet(wb, key$term, df)
   })
 
-# Save the workbook
 saveWorkbook(
   wb,
   file.path(result_dir, "cdk7_prism_expression_enrichment.xlsx"),
   overwrite = TRUE
 )
 ```
-
