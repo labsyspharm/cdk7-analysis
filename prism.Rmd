@@ -41,6 +41,13 @@ dir.create(plot_dir, showWarnings = FALSE)
 
 result_dir <- here("prism")
 dir.create(result_dir, showWarnings = FALSE)
+
+set_theme(
+  envalysis::theme_publish(
+    base_family = "Helvetica",
+    base_size = 10
+  )
+)
 ```
 
 PRISM analysis code at https://github.com/theprismlab/sushi/blob/5320078b788fd606ec562ac60ebdb4c9688087f5/scripts/biomarker/biomarker_functions.R#L103
@@ -49,7 +56,7 @@ PRISM analysis code at https://github.com/theprismlab/sushi/blob/5320078b788fd60
 
 ```{r}
 biomarkers_raw <- syn("syn73615969") |>
-  H5File$new()
+  H5File$new(mode = "r")
 
 expression_col_meta <- biomarkers_raw[["Expression/column_meta"]]$read() |>
   as_tibble()
@@ -74,9 +81,6 @@ cell_line_meta_depmap <- syn("syn73674394") |>
 ```
 
 ## To Do
-
-* Check lineage enrichment for highly responsive cell lines. Differences between compounds?
-
 
 ```{r}
 prism_raw_zips <- c(
@@ -139,7 +143,10 @@ mdr_expression <- expression_mat[, mdr_genes] |>
   )
 
 p <- ggplot(
-  mdr_expression,
+  mdr_expression |>
+    mutate(
+      across(lineage, fct_rev)
+    ),
   aes(
     x = expression,
     y = lineage,
@@ -158,15 +165,14 @@ p <- ggplot(
   scale_x_continuous(
     expand = expansion(mult = c(0.01, .05))
   ) +
-  envalysis::theme_publish() +
   labs(
-    x = "Expression", y = "Lineage"
+    x = "Expression", y = NULL
   )
 p
 
 ggsave(
   file.path(plot_dir, "mdr_genes_expression.pdf"),
-  p, width = 10, height = 7
+  p, width = 10, height = 6.5
 )
 ```
 
@@ -215,14 +221,28 @@ eligible_genes <- apply(
 
 ```
 
-## Fitting lineage model
+## Compound correlation
+
+How well are AUC values correlated between the three compounds?
 
 ```{r}
-prism_drc_lineage <- prism_drc |>
-  filter(
-    depmap_id %in% cell_lines_filtered$depmap_id
+auc_comparison <- combn(
+  unique(prism_drc$pert_name), 2
+) |>
+  t() |>
+  magrittr::set_colnames(c("compound_1", "compound_2")) |>
+  as_tibble() |>
+  inner_join(
+    select(prism_drc, depmap_id, pert_name, auc),
+    by = c("compound_1" = "pert_name"),
+    relationship = "many-to-many"
   ) |>
-  select(depmap_id, pert_name, auc) |>
+  inner_join(
+    select(prism_drc, depmap_id, pert_name, auc),
+    by = c("compound_2" = "pert_name", "depmap_id"),
+    suffix = c("_1", "_2"),
+    relationship = "many-to-many"
+  ) |>
   power_inner_join(
     cell_line_meta |>
       select(depmap_id, lineage),
@@ -233,7 +253,82 @@ prism_drc_lineage <- prism_drc |>
     )
   )
 
+p <- ggplot(
+  auc_comparison,
+  aes(
+    x = 1 - auc_1,
+    y = 1 - auc_2,
+    color = lineage
+  )
+) +
+  geom_abline(
+    slope = 1, intercept = 0,
+    linetype = "dashed",
+    color = "grey"
+  ) +
+  geom_point(
+    shape = 16,
+    alpha = .6
+  ) +
+  geom_text(
+    aes(
+      label = r
+    ),
+    data = \(x) group_by(x, compound_1, compound_2) |>
+      drop_na(auc_1, auc_2) |>
+      summarize(
+        r = paste0("  R = ", signif(cor(auc_1, auc_2), 2)),
+        .groups = "drop"
+      ),
+    color = "black",
+    x = -Inf, y = Inf,
+    hjust = 0, vjust = 1
+  ) +
+  facet_wrap(
+    ~paste(compound_1, "vs", compound_2),
+    axes = "all", axis.labels = "margins"
+  ) +
+  labs(
+    x = "AOC Compound 1", y = "AOC Compound 2"
+  ) +
+  coord_equal()
+p
+
+ggsave(
+  file.path(plot_dir, "auc_comparison.pdf"),
+  p, width = 10, height = 7
+)
+```
+
+## Fitting lineage model
+
+Removing lineages that don't have data for all three compounds.
+Otherwise the model won't be able to fit the interaction term properly.
+Only affects few cells lines, Adrenal gland, Eye, and Vulva/Vagina.
+
+```{r}
+prism_drc_lineage <- prism_drc |>
+  select(depmap_id, pert_name, auc) |>
+  power_inner_join(
+    cell_line_meta |>
+      select(depmap_id, lineage),
+    by = "depmap_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) |>
+  group_by(lineage) |>
+  filter(
+    n_distinct(pert_name) == 3
+  ) |>
+  ungroup()
+
 lineage_vector <- cell_line_meta |>
+  semi_join(
+    prism_drc_lineage,
+    by = "depmap_id"
+  ) |>
   group_nest(lineage) |>
   mutate(
     gs = set_names(
@@ -243,9 +338,10 @@ lineage_vector <- cell_line_meta |>
   )
 
 prism_fgsea_res <- prism_drc_lineage |>
+  drop_na(auc) |>
   group_by(pert_name, depmap_id) |>
   summarize(
-    auc = mean(auc, na.rm = TRUE),
+    auc = mean(auc[is.finite(auc)], na.rm = TRUE),
     .groups = "drop"
   ) |>
   group_by(pert_name) |>
@@ -254,6 +350,7 @@ prism_fgsea_res <- prism_drc_lineage |>
       lineage_vector$gs,
       set_names(scale(auc)[, 1], depmap_id)
     ) |>
+      arrange(padj, pval) |>
       list()
   )
 ```
@@ -261,26 +358,98 @@ prism_fgsea_res <- prism_drc_lineage |>
 ```{r}
 prism_lineage_model <- lm(
   auc ~ lineage * pert_name,
-  data = prism_drc_lineage
+  data = prism_drc_lineage |>
+    filter(depmap_id %in% cell_lines_filtered$depmap_id)
 )
 car::Anova(prism_lineage_model)
+
+lineage_emm <- emmeans(
+  prism_lineage_model,
+  ~ lineage | pert_name
+)
+
+lineage_emm_res <- contrast(lineage_emm, method = "eff", adjust = "fdr") |>
+  as_tibble() |>
+  arrange(pert_name, p.value)
+```
+
+
+```{r}
+prism_lineage_model_sans_filtering <- lm(
+  auc ~ lineage * pert_name,
+  data = prism_drc_lineage
+)
+car::Anova(prism_lineage_model_sans_filtering)
+
+lineage_emm_sans_filtering <- emmeans(
+  prism_lineage_model_sans_filtering,
+  ~ lineage | pert_name
+)
+
+lineage_emm_res_sans_filtering <- contrast(lineage_emm_sans_filtering, method = "eff", adjust = "fdr") |>
+  as_tibble() |>
+  arrange(pert_name, p.value)
 ```
 
 
 ```{r}
 p <- ggplot(
-  prism_drc_lineage,
+  prism_drc_lineage |>
+    mutate(
+      across(lineage, fct_rev),
+      filtered = if_else(
+        depmap_id %in% cell_lines_filtered$depmap_id,
+        "Included",
+        "Excluded"
+      )
+    ),
   aes(
-    x = auc,
+    x = 1 - auc,
     y = lineage,
     color = lineage
   )
 ) +
   geom_quasirandom(
-    shape = 16,
-    alpha = .5
+    aes(
+      color = filtered,
+      fill = lineage
+    ),
+    shape = 21
   ) +
+  scale_color_manual(
+    values = c(
+      "Included" = alpha("black", .0),
+      "Excluded" = alpha("red", .8)
+    ),
+    name = "MDR filtering"
+  ) +
+  geom_text(
+    aes(
+      label = paste0(
+        if_else(estimate > 0, "  ", ""),
+        cut(p.value, c(-Inf, 0.001, 0.01, 0.05, Inf), c("***", "**", "*", "")),
+        if_else(estimate > 0, "", "  ")
+      ),
+      x = if_else(estimate > 0, -Inf, Inf),
+      hjust = if_else(estimate > 0, 0, 1),
+    ),
+    data = lineage_emm_res_sans_filtering |>
+      mutate(
+        lineage = str_remove(contrast, " effect") |>
+          str_remove_all("\\(|\\)")
+      ),
+    color = "black",
+    vjust = .5
+  ) +
+  scale_fill_discrete(
+    palette = \(n) scales::alpha(scales::hue_pal()(n), .6),
+    guide = "none"
+  ) +
+  ggnewscale::new_scale_color() +
   geom_boxplot(
+    aes(
+      color = lineage
+    ),
     outlier.shape = NA,
     fill = NA
   ) +
@@ -293,17 +462,14 @@ p <- ggplot(
     axes = "all", axis.labels = "margins"
   ) +
   labs(
-    x = "AUC", y = NULL
-  ) +
-  # scale_x_continuous(
-  #   expand = expansion(mult = c(0, .05))
-  # ) +
-  envalysis::theme_publish()
+    x = "Area over curve (AOC)", y = NULL,
+    color = ""
+  )
 p
 
 ggsave(
   file.path(plot_dir, "auc_by_lineage.pdf"),
-  p, width = 10, height = 7
+  p, width = 8, height = 4.5
 )
 ```
 
@@ -312,6 +478,15 @@ ggsave(
 The goal is to fit a linear model of AUC ~ expression * drug
 
 ```{r}
+expression_mat_ifit_composite <- cbind(
+  expression_mat,
+  expression_mat[, c("IFITM1", "IFITM2", "IFITM3")] |>
+    scale() |>
+    apply(1, mean) |>
+    as.matrix(ncol = 1) |>
+    magrittr::set_colnames("IFITM-composite")
+)
+
 input_data <- prism_drc |>
   filter(
     depmap_id %in% cell_lines_filtered$depmap_id
@@ -327,9 +502,9 @@ input_data <- prism_drc |>
     )
   ) |>
   power_left_join(
-    expression_mat[
+    expression_mat_ifit_composite[
       cell_lines_filtered$depmap_id,
-      eligible_genes
+      c(eligible_genes, c("IFITM-composite" = TRUE))
     ] |>
       as_tibble(rownames = "depmap_id") |>
       pivot_longer(
@@ -501,7 +676,7 @@ model_res_aic_summary <- model_res_aic |>
 Running the random_lineage model
 
 ```{r}
-plan(multicore, workers = 4)
+plan(multicore, workers = 8)
 
 model_res_raw <- input_data |>
   mutate(
@@ -519,7 +694,10 @@ model_res_raw <- input_data |>
     )
   )
 
-
+qs_save(
+  model_res_raw,
+  file.path(result_dir, "model_res_raw.qs")
+)
 
 model_res_rank_raw <- input_data |>
   mutate(
@@ -537,6 +715,11 @@ model_res_rank_raw <- input_data |>
       .options = furrr_options(seed = 42)
     )
   )
+
+qs_save(
+  model_res_rank_raw,
+  file.path(result_dir, "model_res_rank_raw.qs")
+)
 ```
 
 
@@ -588,6 +771,160 @@ model_slopes_rank <- model_res_rank_raw |>
   )
 ```
 
+### Without MDR filtering
+
+```{r}
+cell_lines_sans_mdr_filtering <- cell_line_meta |>
+  filter(
+    depmap_id %in% rownames(expression_mat)
+  ) |>
+  semi_join(
+    cell_lines_n_profiled |>
+      filter(n >= 2),
+    by = "depmap_id"
+  )
+
+input_data_sans_mdr_filtering <- prism_drc |>
+  filter(
+    depmap_id %in% cell_lines_sans_mdr_filtering$depmap_id
+  ) |>
+  select(depmap_id, pert_name, auc)  |>
+  power_inner_join(
+    cell_line_meta |>
+      select(depmap_id, lineage),
+    by = "depmap_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) |>
+  power_left_join(
+    expression_mat_ifit_composite[
+      cell_lines_sans_mdr_filtering$depmap_id,
+      c(eligible_genes, c("IFITM-composite" = TRUE))
+    ] |>
+      as_tibble(rownames = "depmap_id") |>
+      pivot_longer(
+        -depmap_id,
+        names_to = "gene",
+        values_to = "expression"
+      ),
+    by = "depmap_id",
+    check = check_specs(
+      unmatched_keys_left = "warn"
+    )
+  ) |>
+  group_nest(gene)
+
+```
+
+
+```{r}
+plan(multicore, workers = 6)
+
+model_res_raw2 <- input_data_sans_mdr_filtering |>
+  mutate(
+    model_out = future_map(
+      data,
+      \(data) run_model(
+        data,
+        auc ~ expression * pert_name + (1 | lineage),
+        random_effects = TRUE,
+        REML = TRUE,
+        lmer.df = "kenward-roger"
+      ),
+      .progress = TRUE,
+      .options = furrr_options(seed = 42)
+    )
+  )
+qs_save(
+  model_res_raw2,
+  file.path(result_dir, "model_res_raw_no_mdr_filtering.qs")
+)
+# model_res_raw <- qs_read(
+#   file.path(result_dir, "model_res_raw_no_mdr_filtering.qs")
+# )
+
+model_res_rank_raw <- input_data_sans_mdr_filtering |>
+  mutate(
+    model_out = future_map(
+      data,
+      \(data) run_model(
+        data,
+        auc ~ expression * pert_name + (1 | lineage),
+        random_effects = TRUE,
+        REML = TRUE,
+        lmer.df = "kenward-roger",
+        rank_transform = TRUE
+      ),
+      .progress = TRUE,
+      .options = furrr_options(seed = 42)
+    )
+  )
+qs_save(
+  model_res_rank_raw,
+  file.path(result_dir, "model_res_rank_raw_no_mdr_filtering.qs")
+ )
+```
+
+
+* Fraction of cell lines that respond for each compound (AUC < .25)
+* Overview of ABCB1 and IFITM expression
+* ABCB1/AUC correlation
+* Plot correlation IFIT/AUC
+* Make composite IFITM score
+
+
+```{r}
+model_mdr_included_res_pairwise_ <- model_res_raw2 |>
+  transmute(
+    gene,
+    pairwise_res = map(model_out, "pairwise_res")
+  ) |>
+  unnest(pairwise_res) |>
+  mutate(
+    padj = p.adjust(p.value, method = "fdr"),
+    direction = if_else(estimate > 0, "positive", "negative")
+  )
+
+model_mdr_included_slopes <- model_res_raw2 |>
+  transmute(
+    gene,
+    model_slopes = map(model_out, "model_by_compound")
+  ) |>
+  unnest(model_slopes) |>
+  mutate(
+    padj = p.adjust(p.value, method = "fdr"),
+    direction = if_else(expression.trend > 0, "positive", "negative")
+  )
+```
+
+
+```{r}
+model_res_pairwise_rank <- model_res_rank_raw |>
+  transmute(
+    gene,
+    pairwise_res = map(model_out, "pairwise_res")
+  ) |>
+  unnest(pairwise_res) |>
+  mutate(
+    padj = p.adjust(p.value, method = "fdr"),
+    direction = if_else(estimate > 0, "positive", "negative")
+  )
+
+model_slopes_rank <- model_res_rank_raw |>
+  transmute(
+    gene,
+    model_slopes = map(model_out, "model_by_compound")
+  ) |>
+  unnest(model_slopes) |>
+  mutate(
+    padj = p.adjust(p.value, method = "fdr"),
+    direction = if_else(expression.trend > 0, "positive", "negative")
+  )
+```
+
+
 ## Plot
 
 ### P-value distribution
@@ -623,8 +960,13 @@ ggsave(
 
 
 ```{r}
-plot_auc_expression_corr <- function(gene, rank_transform = FALSE) {
-  scatter_df <- input_data |>
+plot_auc_expression_corr <- function(gene, rank_transform = FALSE, mdr_filtering = TRUE) {
+  if (mdr_filtering) {
+    id <- input_data
+  } else {
+    id <- input_data_sans_mdr_filtering
+  }
+  scatter_df <- id |>
     filter(.data$gene == .env$gene) |>
     unnest(data) |>
     select(-lineage) |>
@@ -647,27 +989,32 @@ plot_auc_expression_corr <- function(gene, rank_transform = FALSE) {
     slope_df <- model_slopes_rank |>
       filter(.data$gene == .env$gene)
   } else {
-    slope_df <- model_slopes |>
-      filter(.data$gene == .env$gene)
+    if (mdr_filtering) {
+      slope_df <- model_slopes |>
+        filter(.data$gene == .env$gene)
+    } else {
+      slope_df <- model_mdr_included_slopes |>
+        filter(.data$gene == .env$gene)
+    }
   }
   ggplot(
     scatter_df,
     aes(
       x = expression,
-      y = auc
+      y = 1 - auc
     )
   ) +
     geom_point(
       aes(
         color = lineage
       ),
-      alpha = .6,
+      alpha = .5,
       shape = 16
     ) +
     geom_abline(
       aes(
-        slope = expression.trend,
-        intercept = intercept
+        slope = -expression.trend,
+        intercept = 1 - intercept
       ),
       data = slope_df
     ) +
@@ -675,7 +1022,7 @@ plot_auc_expression_corr <- function(gene, rank_transform = FALSE) {
     geom_text(
       aes(
         label = paste0(
-          " b = ", signif(expression.trend, 2),
+          " b = ", signif(-expression.trend, 2),
           "\n p = ", signif(padj, 2)
         ),
         color = padj < 0.05
@@ -692,18 +1039,18 @@ plot_auc_expression_corr <- function(gene, rank_transform = FALSE) {
       guide = "none"
     ) +
     labs(
-      x = "Expression", y = "AUC",
+      x = "Expression", y = "AOC",
       color = "Lineage",
       title = gene
     ) +
-    envalysis::theme_publish() +
     facet_wrap(
       ~pert_name,
       axes = "all", axis.labels = "margins"
     )
 }
 
-plot_auc_expression_corr("ABCB1")
+plot_auc_expression_corr("ABCB1", mdr_filtering = FALSE)
+plot_auc_expression_corr("IFITM-composite", mdr_filtering = FALSE)
 plot_auc_expression_corr("WDR54")
 plot_auc_expression_corr("IFITM1")
 plot_auc_expression_corr("AURKB")
@@ -719,6 +1066,23 @@ input_data |>
   filter(gene == "ABCB1") |>
   chuck("data", 1L) |>
   plot_auc_expression_corr()
+
+dir.create(
+  file.path(plot_dir, "gene_aoc_correlation"),
+  showWarnings = FALSE, recursive = TRUE
+)
+
+p <- plot_auc_expression_corr("ABCB1", mdr_filtering = FALSE)
+ggsave(
+  file.path(plot_dir, "gene_aoc_correlation", "ABCB1.pdf"),
+  p, width = 7, height = 4
+)
+
+p <- plot_auc_expression_corr("IFITM-composite")
+ggsave(
+  file.path(plot_dir, "gene_aoc_correlation", "IFITM-composite.pdf"),
+  p, width = 7, height = 4
+)
 ```
 
 Make plots for top 20 hits.
@@ -778,7 +1142,140 @@ model_slopes |>
 
 ```{r}
 p <- ggplot(
-  model_slopes,
+  model_slopes |>
+    mutate(
+      p_censored = -log10(padj) > 12,
+      neglog10_padj = pmin(-log10(padj), 12)
+    ),
+  aes(
+    x = expression.trend,
+    y = neglog10_padj
+  )
+) +
+  geom_point(
+    aes(
+      color = padj < 0.05,
+      shape = p_censored
+    ),
+    alpha = .6
+  ) +
+  geom_text_repel(
+    data = \(x) arrange(x, p.value) |>
+      filter(padj < 0.05) |>
+      mutate(
+        direction = if_else(
+          expression.trend > 0, "positive", "negative"
+        )
+      ) |>
+      group_by(pert_name, direction) |>
+      slice_head(n = 20),
+    aes(label = gene),
+    size = 1.5,
+    max.overlaps = Inf,
+    max.iter = 1e6,
+    seed = 42
+  ) +
+  scale_shape_manual(
+    values = c(
+      `TRUE` = 17,
+      `FALSE` = 16
+    ),
+    guide = "none"
+  ) +
+  scale_color_manual(
+    values = c(
+      "TRUE" = "red",
+      "FALSE" = "black"
+    ),
+    guide = "none"
+  ) +
+  facet_wrap(
+    ~pert_name,
+    axes = "all", axis.labels = "margins",
+    scales = "free_y"
+  ) +
+  labs(
+    x = "Slope", y = "-log10(adj. p-value)"
+  )
+p
+
+ggsave(
+  file.path(plot_dir, "volcano_slopes.pdf"),
+  p, width = 7, height = 3.5
+)
+```
+
+```{r}
+p <- ggplot(
+  model_res_pairwise |>
+    mutate(
+      p_censored = -log10(padj) > 10,
+      neglog10_padj = pmin(-log10(padj), 10)
+    ),
+  aes(
+    x = estimate,
+    y = neglog10_padj
+  )
+) +
+  geom_point(
+    aes(
+      color = padj < 0.05,
+      shape = p_censored
+    ),
+    alpha = .6
+  ) +
+  geom_text_repel(
+    data = \(x) arrange(x, p.value) |>
+      mutate(
+        direction = if_else(
+          estimate > 0, "positive", "negative"
+        )
+      ) |>
+      filter(padj < 0.05) |>
+      group_by(contrast, direction) |>
+      slice_head(n = 20),
+    aes(label = gene),
+    size = 1.5,
+    max.overlaps = Inf,
+    max.iter = 1e6,
+    seed = 42
+  ) +
+  scale_shape_manual(
+    values = c(
+      `TRUE` = 17,
+      `FALSE` = 16
+    ),
+    guide = "none"
+  ) +
+  scale_color_manual(
+    values = c(
+      "TRUE" = "red",
+      "FALSE" = "black"
+    ),
+    guide = "none"
+  ) +
+  facet_wrap(
+    ~contrast,
+    axes = "all", axis.labels = "margins",
+    scales = "free_y"
+  ) +
+  labs(
+    x = "Slope difference", y = "-log10(adj. p-value)"
+  )
+p
+
+ggsave(
+  file.path(plot_dir, "volcano_pairwise.pdf"),
+  p, width = 7, height = 3.5
+)
+```
+
+
+### Without MDR filtering
+
+```{r}
+p <- ggplot(
+  model_mdr_included_slopes,
   aes(
     x = expression.trend,
     y = -log10(padj)
@@ -802,7 +1299,7 @@ p <- ggplot(
       group_by(pert_name, direction) |>
       slice_head(n = 20),
     aes(label = gene),
-    size = 2,
+    size = 1.5,
     max.overlaps = Inf
   ) +
   scale_color_manual(
@@ -814,72 +1311,104 @@ p <- ggplot(
   ) +
   facet_wrap(
     ~pert_name,
-    axes = "all", axis.labels = "margins"
+    axes = "all", axis.labels = "margins",
+    scales = "free"
   ) +
   labs(
     x = "Slope", y = "-log10(adj. p-value)"
-  ) +
-  envalysis::theme_publish()
+  )
 p
 
 ggsave(
-  file.path(plot_dir, "volcano_slopes.pdf"),
-  p, width = 10, height = 5
+  file.path(plot_dir, "volcano_slopes_no_filtering.pdf"),
+  p, width = 7, height = 4
 )
 ```
 
+## Compare with and without MDR filtering
 
 ```{r}
+model_slope_comp <- power_inner_join(
+  model_slopes |>
+    mutate(
+      signed_p = if_else(
+        direction == "negative", 1, -1
+      ) * log10(padj)
+    ),
+  model_mdr_included_slopes |>
+    mutate(
+      signed_p = if_else(
+        direction == "negative", 1, -1
+      ) * log10(padj)
+    ),
+  by = c("gene", "pert_name"),
+  suffix = c("_filtered", "_unfiltered"),
+  check = check_specs(
+    unmatched_keys_left = "warn",
+    unmatched_keys_right = "warn"
+  )
+)
+
 p <- ggplot(
-  model_res_pairwise,
+  model_slope_comp,
   aes(
-    x = estimate,
-    y = -log10(padj)
+    x = signed_p_unfiltered,
+    y = signed_p_filtered
   )
 ) +
   geom_point(
-    aes(
-      color = padj < 0.05
-    ),
+    alpha = .6,
     shape = 16,
-    alpha = .6
+    color = "#aaaaaa"
+  ) +
+  geom_abline(
+    linetype = "dashed",
+    slope = 1, intercept = 0
   ) +
   geom_text_repel(
-    data = \(x) arrange(x, p.value) |>
-      mutate(
-        direction = if_else(
-          estimate > 0, "positive", "negative"
-        )
-      ) |>
-      filter(padj < 0.05) |>
-      group_by(contrast, direction) |>
-      slice_head(n = 20),
+    data = \(x) bind_rows(
+      x |> arrange(padj_filtered) |>
+        filter(padj_filtered < 0.05) |>
+        mutate(
+          direction = if_else(
+            direction_filtered == "negative", "negative", "positive"
+          )
+        ) |>
+        group_by(pert_name, direction) |>
+        slice_head(n = 5),
+      x |> arrange(padj_unfiltered) |>
+        filter(padj_unfiltered < 0.05) |>
+        mutate(
+          direction = if_else(
+            direction_unfiltered == "negative", "negative", "positive"
+          )
+        ) |>
+        group_by(pert_name, direction) |>
+        slice_head(n = 5)
+    ) |> distinct(),
     aes(label = gene),
-    size = 2,
-    max.overlaps = Inf
-  ) +
-  scale_color_manual(
-    values = c(
-      "TRUE" = "red",
-      "FALSE" = "black"
-    ),
-    guide = "none"
+    size = 1.5,
+    max.overlaps = Inf,
+    max.iter = 1e6,
+    seed = 42,
+    min.segment.length = 0
   ) +
   facet_wrap(
-    ~contrast,
-    axes = "all", axis.labels = "margins"
+    ~pert_name,
+    axes = "all", axis.labels = "margins",
+    scales = "free"
   ) +
   labs(
-    x = "Slope difference", y = "-log10(adj. p-value)"
-  ) +
-  envalysis::theme_publish()
-p
+    x = "Signed -log10(adj. p-value) without MDR filtering",
+    y = "Signed -log10(adj. p-value) with MDR filtering"
+  )
 
 ggsave(
-  file.path(plot_dir, "volcano_pairwise.pdf"),
-  p, width = 10, height = 5
+  file.path(plot_dir, "slope_p_value_comparison.pdf"),
+  p, width = 10, height = 4
 )
 ```
+
 
 ## Enrichment analysis
 
@@ -932,21 +1461,34 @@ selected_gene_sets_list <- selected_gene_sets %>%
       set_names(pathway)
   )
 
-fora_input_raw <- bind_rows(
-  slopes = model_slopes |>
+fora_input_raw <- tribble(
+  ~model_type, ~de_type, ~data,
+  "linear", "slopes", model_slopes |>
     filter(padj < 0.05) |>
     arrange(p.value) |>
     group_by(term = pert_name, direction) |>
     slice_head(n = 500),
-  pairwise = model_res_pairwise |>
+  "linear", "pairwise", model_res_pairwise |>
     filter(padj < 0.05) |>
     arrange(p.value) |>
     group_by(term = contrast, direction) |>
     slice_head(n = 500),
-  .id = "de_type"
+  # "rank", "slopes", model_slopes_rank |>
+  #   filter(padj < 0.05) |>
+  #   arrange(p.value) |>
+  #   group_by(term = pert_name, direction) |>
+  #   slice_head(n = 500),
+  # "rank", "pairwise", model_res_pairwise_rank |>
+  #   filter(padj < 0.05) |>
+  #   arrange(p.value) |>
+  #   group_by(term = contrast, direction) |>
+  #   slice_head(n = 500)
 ) |>
-  ungroup() |>
-  nest(.by = c(term, direction))
+  mutate(
+    across(data, \(x) map(x, ungroup))
+  ) |>
+  unnest(data) |>
+  nest(.by = c(model_type, de_type, term, direction))
 
 gene_universe <- names(eligible_genes)[eligible_genes]
 
@@ -978,7 +1520,7 @@ fora_res_raw <- fora_input_raw %>%
 
 fora_res_long <- fora_res_raw %>%
   transmute(
-    term, direction,
+    model_type, de_type, term, direction,
     res = map2(
       res, res_reduced,
       \(full, reduced) {
@@ -1004,7 +1546,7 @@ fora_res_long <- fora_res_raw %>%
 fora_res_top <- fora_res_long |>
   filter(padj < 0.05) |>
   arrange(padj, pval) |>
-  group_by(term, direction) |>
+  group_by(model_type, de_type, term, direction) |>
   slice_head(n = 20) |>
   ungroup() |>
   arrange(padj) |>
@@ -1021,8 +1563,7 @@ fora_res_top <- fora_res_long |>
 
 
 ps <- group_nest(
-  fora_res_top,
-  term
+  fora_res_top, model_type, term
 ) |>
   mutate(
     p = map(
@@ -1068,10 +1609,180 @@ dir.create(
 )
 pwalk(
   ps,
-  \(term, p, ...) {
+  \(term, p, model_type, ...) {
     ggsave(
-      file.path(plot_dir, "enrichment", paste0(term, "_enrichment.pdf")),
+      file.path(plot_dir, "enrichment", paste0(model_type, "_", term, "_enrichment.pdf")),
       p, width = 12, height = 7
+    )
+  }
+)
+```
+
+### FGSEA
+
+```{r}
+
+fgsea_input_raw <- tribble(
+  ~model_type, ~de_type, ~data,
+  "linear", "slopes", model_slopes |>
+    mutate(
+      signed_p = if_else(
+        direction == "negative", 1, -1
+      ) * log10(padj)
+    ) |>
+    group_by(term = pert_name) |>
+    summarize(
+      ranks = list(set_names(signed_p, gene)),
+      .groups = "drop"
+    ),
+  "linear", "pairwise", model_res_pairwise |>
+    mutate(
+      signed_p = if_else(
+        direction == "negative", 1, -1
+      ) * log10(padj)
+    ) |>
+    group_by(term = contrast) |>
+    summarize(
+      ranks = list(set_names(signed_p, gene)),
+      .groups = "drop"
+    )
+  # "rank", "slopes", model_slopes_rank |>
+  #   filter(padj < 0.05) |>
+  #   arrange(p.value) |>
+  #   group_by(term = pert_name, direction) |>
+  #   slice_head(n = 500),
+  # "rank", "pairwise", model_res_pairwise_rank |>
+  #   filter(padj < 0.05) |>
+  #   arrange(p.value) |>
+  #   group_by(term = contrast, direction) |>
+  #   slice_head(n = 500)
+) |>
+  mutate(
+    across(data, \(x) map(x, ungroup))
+  ) |>
+  unnest(data)
+
+gene_universe <- names(eligible_genes)[eligible_genes]
+
+fgsea_res_raw <- fgsea_input_raw %>%
+  mutate(
+    res = map(
+      ranks,
+      \(x) {
+        withr::with_seed(42, fgseaMultilevel(
+          selected_gene_sets_list$gs,
+          x
+        ))
+      }
+    ),
+    res_reduced = future_pmap(
+      list(res, ranks),
+      \(res, x) {
+        collapsePathways(
+          filter(res, padj < .05),
+          selected_gene_sets_list$gs,
+          x
+        )
+      },
+      .progress = TRUE
+    )
+  )
+
+fgsea_res_long <- fgsea_res_raw %>%
+  transmute(
+    model_type, de_type, term,
+    res = map2(
+      res, res_reduced,
+      \(full, reduced) {
+        mutate(
+          full,
+          is_main = pathway %in% reduced$mainPathways,
+          parent_pathway = reduced$parentPathways[pathway]
+        )
+      }
+    )
+  ) %>%
+  unnest(res) |>
+  mutate(
+    direction = if_else(NES < 0, "negative", "positive"),
+    signed_p = if_else(
+      direction == "negative", 1, -1
+    ) * log10(padj)
+  )
+
+
+```
+
+
+```{r}
+fgsea_res_top <- fgsea_res_long |>
+  filter(padj < 0.05) |>
+  arrange(padj, pval) |>
+  group_by(model_type, de_type, term, direction) |>
+  slice_head(n = 20) |>
+  ungroup() |>
+  arrange(padj) |>
+  mutate(
+    padj_cut = cut(
+      padj,
+      breaks = c(-Inf, 0.001, 0.01, 0.05, Inf),
+      labels = c("<0.001", "<0.01", "<0.05", "ns")
+    ) |>
+      fct_rev(),
+    pathway_display = str_replace_all(pathway, coll("_"), " ")
+  )
+
+
+ps <- group_nest(
+  fgsea_res_top, model_type, term
+) |>
+  mutate(
+    p = map(
+      data,
+      \(df) {
+        abs_max_est_perc <- max(abs(quantile(df$signed_p, c(0.025, .975))), na.rm = TRUE)
+        ggplot(
+          df |>
+            mutate(across(pathway_display, \(x) fct_reorder(str_trunc(x, 50,), NES))),
+          aes(
+            x = NES,
+            y = pathway_display
+          )
+        ) +
+          geom_vline(xintercept = 0, linetype = "dashed") +
+          geom_point(
+            aes(
+              fill = signed_p,
+              size = padj_cut
+            ),
+            shape = 21,
+            color = "black"
+          ) +
+          paletteer::scale_fill_paletteer_c(
+            "ggthemes::Orange-Blue-White Diverging",
+            limits = c(-abs_max_est_perc, abs_max_est_perc),
+            oob = scales::squish
+          ) +
+          labs(
+            x = "Normalized enrichment score", y = NULL,
+            fill = "log10(adj. p)",
+            size = "Adjusted p"
+          )
+          # scale_x_log10()
+      }
+    )
+  )
+
+dir.create(
+  file.path(plot_dir, "enrichment"),
+  showWarnings = FALSE, recursive = TRUE
+)
+pwalk(
+  ps,
+  \(term, p, model_type, ...) {
+    ggsave(
+      file.path(plot_dir, "enrichment", paste0("fgsea_", model_type, "_", term, "_enrichment.pdf")),
+      p, width = 8, height = 8
     )
   }
 )
