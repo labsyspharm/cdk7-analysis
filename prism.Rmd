@@ -25,6 +25,8 @@ library(ggrepel)
 library(msigdbr)
 library(fgsea)
 library(openxlsx)
+library(ggrastr)
+library(ashr)
 
 conflicts_prefer(
   dplyr::filter,
@@ -80,7 +82,6 @@ cell_line_meta_depmap <- syn("syn73674394") |>
   read_csv()
 ```
 
-## To Do
 
 ```{r}
 prism_raw_zips <- c(
@@ -153,6 +154,14 @@ p <- ggplot(
     color = lineage
   )
 ) +
+  geom_vline(
+    aes(
+      xintercept = xintercept
+    ),
+    data = tibble(gene = "ABCB1", xintercept = 1),
+    linetype = "dashed",
+    color = "black"
+  ) +
   geom_quasirandom(
     shape = 16
   ) +
@@ -251,6 +260,13 @@ auc_comparison <- combn(
       unmatched_keys_left = "warn",
       duplicate_keys_right = "warn"
     )
+  ) |>
+  mutate(
+    filtered = if_else(
+      depmap_id %in% cell_lines_filtered$depmap_id,
+      "Included",
+      "Excluded"
+    )
   )
 
 p <- ggplot(
@@ -267,8 +283,10 @@ p <- ggplot(
     color = "grey"
   ) +
   geom_point(
-    shape = 16,
-    alpha = .6
+    aes(
+      alpha = filtered
+    ),
+    shape = 16
   ) +
   geom_text(
     aes(
@@ -277,12 +295,26 @@ p <- ggplot(
     data = \(x) group_by(x, compound_1, compound_2) |>
       drop_na(auc_1, auc_2) |>
       summarize(
-        r = paste0("  R = ", signif(cor(auc_1, auc_2), 2)),
+        r = paste0(
+          "  R = ", signif(cor(auc_1, auc_2), 2), " (all data)\n",
+          "  R = ", signif(cor(auc_1[filtered == "Included"], auc_2[filtered == "Included"]), 2), " (ABCB1 filtered)"
+        ),
         .groups = "drop"
       ),
     color = "black",
     x = -Inf, y = Inf,
     hjust = 0, vjust = 1
+  ) +
+  scale_color_discrete(
+    palette = \(n) scales::alpha(scales::hue_pal()(n), .6),
+    guide = "none"
+  ) +
+  scale_alpha_manual(
+    values = c(
+      "Included" = .9,
+      "Excluded" = .2
+    ),
+    name = "ABCB1 filtering"
   ) +
   facet_wrap(
     ~paste(compound_1, "vs", compound_2),
@@ -296,7 +328,7 @@ p
 
 ggsave(
   file.path(plot_dir, "auc_comparison.pdf"),
-  p, width = 10, height = 7
+  p, width = 7, height = 4
 )
 ```
 
@@ -411,50 +443,45 @@ p <- ggplot(
 ) +
   geom_quasirandom(
     aes(
-      color = filtered,
-      fill = lineage
+      color = lineage,
+      alpha = filtered
     ),
-    shape = 21
+    shape = 16
   ) +
-  scale_color_manual(
+  scale_alpha_manual(
     values = c(
-      "Included" = alpha("black", .0),
-      "Excluded" = alpha("red", .8)
+      "Included" = .9,
+      "Excluded" = .2
     ),
     name = "MDR filtering"
   ) +
-  geom_text(
-    aes(
-      label = paste0(
-        if_else(estimate > 0, "  ", ""),
-        cut(p.value, c(-Inf, 0.001, 0.01, 0.05, Inf), c("***", "**", "*", "")),
-        if_else(estimate > 0, "", "  ")
-      ),
-      x = if_else(estimate > 0, -Inf, Inf),
-      hjust = if_else(estimate > 0, 0, 1),
-    ),
-    data = lineage_emm_res_sans_filtering |>
-      mutate(
-        lineage = str_remove(contrast, " effect") |>
-          str_remove_all("\\(|\\)")
-      ),
-    color = "black",
-    vjust = .5
-  ) +
-  scale_fill_discrete(
+  # geom_text(
+  #   aes(
+  #     label = paste0(
+  #       if_else(estimate > 0, "  ", ""),
+  #       cut(p.value, c(-Inf, 0.001, 0.01, 0.05, Inf), c("***", "**", "*", "")),
+  #       if_else(estimate > 0, "", "  ")
+  #     ),
+  #     x = if_else(estimate > 0, -Inf, Inf),
+  #     hjust = if_else(estimate > 0, 0, 1),
+  #   ),
+  #   data = lineage_emm_res_sans_filtering |>
+  #     mutate(
+  #       lineage = str_remove(contrast, " effect") |>
+  #         str_remove_all("\\(|\\)")
+  #     ),
+  #   color = "black",
+  #   vjust = .5
+  # ) +
+  scale_color_discrete(
     palette = \(n) scales::alpha(scales::hue_pal()(n), .6),
     guide = "none"
   ) +
-  ggnewscale::new_scale_color() +
   geom_boxplot(
-    aes(
-      color = lineage
-    ),
+    data = \(df) filter(df, depmap_id %in% cell_lines_filtered$depmap_id),
+    color = "black",
     outlier.shape = NA,
     fill = NA
-  ) +
-  scale_color_discrete(
-    guide = "none"
   ) +
   facet_wrap(
     ~pert_name,
@@ -468,7 +495,7 @@ p <- ggplot(
 p
 
 ggsave(
-  file.path(plot_dir, "auc_by_lineage.pdf"),
+  file.path(plot_dir, "auc_by_lineage_alpha.pdf"),
   p, width = 8, height = 4.5
 )
 ```
@@ -698,6 +725,9 @@ qs_save(
   model_res_raw,
   file.path(result_dir, "model_res_raw.qs")
 )
+# model_res_raw <- qs_read(
+#   file.path(result_dir, "model_res_raw.qs")
+# )
 
 model_res_rank_raw <- input_data |>
   mutate(
@@ -724,25 +754,99 @@ qs_save(
 
 
 ```{r}
-model_res_pairwise <- model_res_raw |>
+model_res_pairwise_shrunk <- model_res_raw |>
   transmute(
     gene,
     pairwise_res = map(model_out, "pairwise_res")
   ) |>
   unnest(pairwise_res) |>
+  group_nest(
+    term, contrast
+  ) |>
   mutate(
-    padj = p.adjust(p.value, method = "fdr"),
-    direction = if_else(estimate > 0, "positive", "negative")
+    shrunk_pairwise_res = map(
+      data,
+      \(df) ash(
+        df$estimate, df$std.error,
+        df = NULL,
+        mixcompdist = "uniform"
+      )
+    ),
+    data = map2(
+      data, shrunk_pairwise_res,
+      \(df, ash_res) {
+        df |>
+          mutate(
+            estimate_shrunk = ash_res$result$PosteriorMean,
+            std.error_shrunk = ash_res$result$PosteriorSD,
+            s_value_shrunk = ash_res$result$svalue,
+            q_value_shrunk = ash_res$result$qvalue,
+            padj = p.adjust(p.value, method = "fdr")
+          )
+      }
+    )
   )
 
-model_slopes <- model_res_raw |>
+model_res_pairwise <- model_res_pairwise_shrunk |>
+  transmute(
+    contrast,
+    data
+  ) |>
+  unnest(data) |>
+  mutate(
+    direction = if_else(estimate > 0, "positive", "negative")
+  ) |>
+  separate_wider_delim(
+    contrast, delim = " - ",
+    names = c("pert_name_1", "pert_name_2"),
+    cols_remove = FALSE
+  ) |>
+  mutate(
+    across(
+      starts_with("pert_name"),
+      \(x) str_remove_all(x, "\\(|\\)")
+    )
+  )
+
+
+model_slopes_shrunk <- model_res_raw |>
   transmute(
     gene,
     model_slopes = map(model_out, "model_by_compound")
   ) |>
   unnest(model_slopes) |>
+  group_nest(pert_name) |>
   mutate(
-    padj = p.adjust(p.value, method = "fdr"),
+    shrunk_model_slopes = map(
+      data,
+      \(df) ash(
+        df$expression.trend, df$std.error_slope,
+        df = NULL,
+        mixcompdist = "uniform"
+      )
+    ),
+    data = map2(
+      data, shrunk_model_slopes,
+      \(df, ash_res) {
+        df |>
+          mutate(
+            expression.trend_shrunk = ash_res$result$PosteriorMean,
+            std.error_shrunk = ash_res$result$PosteriorSD,
+            s_value_shrunk = ash_res$result$svalue,
+            q_value_shrunk = ash_res$result$qvalue,
+            padj = p.adjust(p.value, method = "fdr")
+          )
+      }
+    )
+  )
+
+model_slopes <- model_slopes_shrunk |>
+  transmute(
+    pert_name,
+    data
+  ) |>
+  unnest(data) |>
+  mutate(
     direction = if_else(expression.trend > 0, "positive", "negative")
   )
 ```
@@ -841,7 +945,7 @@ qs_save(
   model_res_raw2,
   file.path(result_dir, "model_res_raw_no_mdr_filtering.qs")
 )
-# model_res_raw <- qs_read(
+# model_res_raw2 <- qs_read(
 #   file.path(result_dir, "model_res_raw_no_mdr_filtering.qs")
 # )
 
@@ -888,31 +992,6 @@ model_mdr_included_res_pairwise_ <- model_res_raw2 |>
   )
 
 model_mdr_included_slopes <- model_res_raw2 |>
-  transmute(
-    gene,
-    model_slopes = map(model_out, "model_by_compound")
-  ) |>
-  unnest(model_slopes) |>
-  mutate(
-    padj = p.adjust(p.value, method = "fdr"),
-    direction = if_else(expression.trend > 0, "positive", "negative")
-  )
-```
-
-
-```{r}
-model_res_pairwise_rank <- model_res_rank_raw |>
-  transmute(
-    gene,
-    pairwise_res = map(model_out, "pairwise_res")
-  ) |>
-  unnest(pairwise_res) |>
-  mutate(
-    padj = p.adjust(p.value, method = "fdr"),
-    direction = if_else(estimate > 0, "positive", "negative")
-  )
-
-model_slopes_rank <- model_res_rank_raw |>
   transmute(
     gene,
     model_slopes = map(model_out, "model_by_compound")
@@ -1145,20 +1224,32 @@ p <- ggplot(
   model_slopes |>
     mutate(
       p_censored = -log10(padj) > 12,
-      neglog10_padj = pmin(-log10(padj), 12)
-    ),
+      neglog10_padj = pmin(-log10(padj), 12),
+      signif_direction = case_when(
+        padj > 0.05 ~ "not significant",
+        expression.trend > 0 ~ "positive",
+        expression.trend < 0 ~ "negative",
+        TRUE ~ NA_character_
+      )
+    ) |>
+    arrange(desc(padj), desc(p.value)),
   aes(
     x = expression.trend,
     y = neglog10_padj
   )
 ) +
-  geom_point(
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    color = "grey"
+  ) +
+  rasterize(geom_point(
     aes(
-      color = padj < 0.05,
+      color = signif_direction,
       shape = p_censored
     ),
     alpha = .6
-  ) +
+  ), dpi = 300, dev = "ragg_png") +
   geom_text_repel(
     data = \(x) arrange(x, p.value) |>
       filter(padj < 0.05) |>
@@ -1184,10 +1275,23 @@ p <- ggplot(
   ) +
   scale_color_manual(
     values = c(
-      "TRUE" = "red",
-      "FALSE" = "black"
+      "positive" = paletteer::paletteer_c("ggthemes::Orange-Blue Diverging", 10)[3],
+      "negative" = paletteer::paletteer_c("ggthemes::Orange-Blue Diverging", 10)[10],
+      "not significant" = "black"
     ),
-    guide = "none"
+    guide = guide_legend(
+      override.aes = list(
+        shape = 16
+      )
+    )
+    # values = c(
+    #   "TRUE" = "red",
+    #   "FALSE" = "black"
+    # ),
+    # guide = "none"
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, .05))
   ) +
   facet_wrap(
     ~pert_name,
@@ -1201,7 +1305,7 @@ p
 
 ggsave(
   file.path(plot_dir, "volcano_slopes.pdf"),
-  p, width = 7, height = 3.5
+  p, width = 7, height = 4
 )
 ```
 
@@ -1210,20 +1314,27 @@ p <- ggplot(
   model_res_pairwise |>
     mutate(
       p_censored = -log10(padj) > 10,
-      neglog10_padj = pmin(-log10(padj), 10)
-    ),
+      neglog10_padj = pmin(-log10(padj), 10),
+      signif_direction = case_when(
+        padj > 0.05 ~ "not significant",
+        estimate > 0 ~ "positive",
+        estimate < 0 ~ "negative",
+        TRUE ~ NA_character_
+      )
+    ) |>
+    arrange(desc(padj), desc(p.value)),
   aes(
     x = estimate,
     y = neglog10_padj
   )
 ) +
-  geom_point(
+  rasterize(geom_point(
     aes(
-      color = padj < 0.05,
+      color = signif_direction,
       shape = p_censored
     ),
     alpha = .6
-  ) +
+  ), dpi = 300, dev = "ragg_png") +
   geom_text_repel(
     data = \(x) arrange(x, p.value) |>
       mutate(
@@ -1249,10 +1360,15 @@ p <- ggplot(
   ) +
   scale_color_manual(
     values = c(
-      "TRUE" = "red",
-      "FALSE" = "black"
-    ),
-    guide = "none"
+      "positive" = paletteer::paletteer_c("ggthemes::Orange-Blue Diverging", 10)[3],
+      "negative" = paletteer::paletteer_c("ggthemes::Orange-Blue Diverging", 10)[10],
+      "not significant" = "black"
+    )
+    # values = c(
+    #   "TRUE" = "red",
+    #   "FALSE" = "black"
+    # ),
+    # guide = "none"
   ) +
   facet_wrap(
     ~contrast,
@@ -1281,13 +1397,13 @@ p <- ggplot(
     y = -log10(padj)
   )
 ) +
-  geom_point(
+  rasterize(geom_point(
     aes(
       color = padj < 0.05
     ),
     shape = 16,
     alpha = .6
-  ) +
+  ), dpi = 300, dev = "ragg_png") +
   geom_text_repel(
     data = \(x) arrange(x, p.value) |>
       filter(padj < 0.05) |>
@@ -1323,6 +1439,298 @@ ggsave(
   file.path(plot_dir, "volcano_slopes_no_filtering.pdf"),
   p, width = 7, height = 4
 )
+```
+
+
+## Single compound vs comparison
+
+
+```{r}
+model_res_pairwise_with_rev <- model_res_pairwise |>
+  bind_rows(
+    transmute(
+      model_res_pairwise,
+      gene,
+      pert_name_temp = pert_name_1,
+      pert_name_1 = pert_name_2,
+      pert_name_2 = pert_name_temp,
+      contrast = paste0("(", pert_name_1, ") - (", pert_name_2, ")"),
+      across(
+        c(estimate, estimate_shrunk, statistic),
+        \(x) -x
+      ),
+      null.value, df, std.error, p.value, s_value_shrunk, q_value_shrunk, padj,
+      across(
+        direction,
+        \(x) if_else(x == "positive", "negative", "positive")
+      )
+    ) |>
+      select(-pert_name_temp)
+  )
+
+res_pairs_vs_single <- power_inner_join(
+    model_res_pairwise_with_rev,
+    model_slopes,
+    by = c("gene", "pert_name_1" = "pert_name"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    ),
+    suffix = c("_pairwise", "_slope")
+  ) |>
+  mutate(
+    direction_combined = case_when(
+      padj_pairwise > .05 ~ "not significant",
+      direction_pairwise == "positive" & direction_slope == "positive" ~ "both positive",
+      direction_pairwise == "negative" & direction_slope == "negative" ~ "both negative",
+      direction_pairwise == "positive" & direction_slope == "negative" ~ "positive negative",
+      direction_pairwise == "negative" & direction_slope == "positive" ~ "negative positive",
+      TRUE ~ NA_character_
+    ) |>
+      factor(
+        levels = c(
+          "both positive",
+          "both negative",
+          "positive negative",
+          "negative positive",
+          "not significant"
+        )
+      )
+  )
+
+
+p <- ggplot(
+  res_pairs_vs_single |>
+    filter(
+      pert_name_1 %in% c("YNW-10-135", "YKL-5-124"),
+      pert_name_2 %in% c("YNW-10-135", "YKL-5-124")
+    ) |>
+    arrange(desc(padj_pairwise), desc(p.value_pairwise)),
+  aes(
+    x = expression.trend_shrunk,
+    y = estimate_shrunk
+  )
+) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    color = "grey50"
+  ) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    color = "grey50"
+  ) +
+  rasterize(geom_point(
+    aes(
+      color = direction_combined,
+      text = gene
+    ),
+    alpha = .6,
+    shape = 16
+  ), dpi = 300, dev = "ragg_png") +
+  geom_text_repel(
+    # data = \(df) {
+    #   # browser()
+    #   arrange(df, padj_pairwise, p.value_pairwise) |>
+    #   group_by(pert_name, direction_pairwise, direction_slope) |>
+    #   mutate(
+    #     gene_label = if_else(
+    #       seq_len(n()) <= 10 & padj_pairwise < 0.05,
+    #       gene, ""
+    #     )
+    #   ) |>
+    #   ungroup()
+    # },
+    data = \(df) {
+      arrange(df, padj_pairwise, p.value_pairwise) |>
+        group_by(pert_name_1, pert_name_2, direction_combined) |>
+        filter(padj_pairwise < 0.05) |>
+        slice_head(n = 10) |>
+        ungroup() |>
+        mutate(
+          gene_label = gene
+        )
+    },
+    aes(label = gene_label),
+    size = 1.5,
+    max.overlaps = Inf,
+    max.iter = 1e7,
+    seed = 42,
+    min.segment.length = 0
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(.1, .1))
+  ) +
+  scale_color_manual(
+    values = c(
+      "both positive" = "#e7967d",
+      "both negative" =  "#2B5C8AFF",
+      "positive negative" = "#e84271",
+      "negative positive" = "#266B3EFF",
+      "not significant" = "black"
+    )
+  ) +
+  facet_wrap(
+    ~paste(pert_name_1, "vs", pert_name_2),
+    axes = "all", axis.labels = "margins",
+    scales = "free"
+  ) +
+  labs(
+    x = "Slope\nAOC vs gene expression",
+    y = "Pairwise slope difference\n(YNW-10-135 vs YKL-5-124)"
+  ) +
+  theme(
+    strip.clip = "off"
+  )
+
+ggsave(
+  file.path(plot_dir, "pairwise_vs_slopes.pdf"),
+  p, width = 4, height = 3
+)
+
+library(plotly)
+
+ggplotly(p, tooltip = "text")
+```
+
+```{r}
+
+res_pairs_vs_single_both <- power_inner_join(
+    model_res_pairwise_with_rev,
+    model_slopes,
+    by = c("gene", "pert_name_1" = "pert_name"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    ),
+    suffix = c("_pairwise", "")
+) |>
+  power_inner_join(
+    model_slopes,
+    by = c("gene", "pert_name_2" = "pert_name"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    ),
+    suffix = c("_1", "_2")
+  ) |>
+  mutate(
+    direction_pairwise_sign = case_when(
+      padj_pairwise > .05 | (padj_1 > .05 & padj_2 > .05) ~ "not significant",
+      direction_pairwise == "positive" ~ "positive",
+      direction_pairwise == "negative" ~ "negative",
+      TRUE ~ NA_character_
+    )
+  )
+
+p <- ggplot(
+  res_pairs_vs_single_both |>
+    filter(
+      pert_name_1 == "YNW-10-135",
+      pert_name_2 == "YKL-5-124"
+    ) |>
+    arrange(desc(padj_pairwise), desc(p.value_pairwise)),
+  aes(
+    x = pmax(expression.trend_shrunk_1, -.035),
+    y = expression.trend_shrunk_2
+  )
+) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    color = "grey50"
+  ) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    color = "grey50"
+  ) +
+  rasterize(geom_point(
+    aes(
+      color = direction_pairwise_sign,
+      text = gene,
+      shape = expression.trend_shrunk_1 < -.035
+    ),
+    alpha = .6,
+    size = 2
+  ), dpi = 300, dev = "ragg_png") +
+  geom_text_repel(
+    data = \(df) {
+      # browser()
+      arrange(df, padj_pairwise, p.value_pairwise) |>
+      group_by(pert_name_1, pert_name_2, direction_1, direction_2) |>
+      mutate(
+        gene_label = if_else(
+          seq_len(n()) <= 10 & padj_pairwise < 0.05,
+          gene, ""
+        )
+      ) |>
+      ungroup()
+    },
+    # data = \(df) {
+    #   arrange(df, padj_pairwise, p.value_pairwise) |>
+    #     group_by(pert_name_1, pert_name_2, direction_combined) |>
+    #     filter(padj_pairwise < 0.05) |>
+    #     slice_head(n = 10) |>
+    #     ungroup() |>
+    #     mutate(
+    #       gene_label = gene
+    #     )
+    # },
+    aes(label = gene_label),
+    size = 1.5,
+    max.overlaps = Inf,
+    max.iter = 1e7,
+    seed = 42,
+    # min.segment.length = 0,
+  ) +
+  scale_shape_manual(
+    values = c(
+      `TRUE` = "◀",
+      `FALSE` = "●"
+    ),
+    guide = "none"
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(.1, .1))
+  ) +
+  scale_color_manual(
+    values = c(
+      "positive" = paletteer::paletteer_c("ggthemes::Sunset-Sunrise Diverging", 10)[10],
+      "negative" =  paletteer::paletteer_c("ggthemes::Sunset-Sunrise Diverging", 10)[1],
+      "not significant" = "black"
+    ),
+    guide = guide_legend(
+      override.aes = list(
+        shape = 16
+      )
+    )
+  ) +
+  coord_equal() +
+  labs(
+    x = "AOC vs gene expression\nYNW-10-135",
+    y = "AOC vs gene expression\nYKL-5-124"
+  )
+
+library(Cairo)
+
+CairoPDF(
+  file.path(plot_dir, "slopes_comparison_cairo.pdf"),
+  width = 4, height = 4
+)
+print(p)
+dev.off()
+ggsave(
+  file.path(plot_dir, "slopes_comparison.pdf"),
+  p, width = 4, height = 4,
+  device = cairo_pdf
+)
+
+plotly::ggplotly(p, tooltip = "text")
 ```
 
 ## Compare with and without MDR filtering
@@ -1518,6 +1926,11 @@ fora_res_raw <- fora_input_raw %>%
     )
   )
 
+qs_save(
+  fora_res_raw,
+  file.path(result_dir, "fora_res_raw.qs")
+)
+
 fora_res_long <- fora_res_raw %>%
   transmute(
     model_type, de_type, term, direction,
@@ -1540,6 +1953,10 @@ fora_res_long <- fora_res_raw %>%
     ) * log10(padj)
   )
 
+write_csv(
+  fora_res_long,
+  file.path(result_dir, "fora_res_long.csv.gz")
+)
 ```
 
 ```{r}
@@ -1628,7 +2045,7 @@ fgsea_input_raw <- tribble(
     mutate(
       signed_p = if_else(
         direction == "negative", 1, -1
-      ) * log10(padj)
+      ) * log10(p.value)
     ) |>
     group_by(term = pert_name) |>
     summarize(
@@ -1639,7 +2056,7 @@ fgsea_input_raw <- tribble(
     mutate(
       signed_p = if_else(
         direction == "negative", 1, -1
-      ) * log10(padj)
+      ) * log10(p.value)
     ) |>
     group_by(term = contrast) |>
     summarize(
@@ -1662,19 +2079,22 @@ fgsea_input_raw <- tribble(
   ) |>
   unnest(data)
 
-gene_universe <- names(eligible_genes)[eligible_genes]
-
+plan(multicore, workers = 6)
 fgsea_res_raw <- fgsea_input_raw %>%
   mutate(
-    res = map(
+    res_raw = future_map(
       ranks,
       \(x) {
-        withr::with_seed(42, fgseaMultilevel(
+        withr::with_seed(42, purrr::quietly(fgseaMultilevel)(
           selected_gene_sets_list$gs,
-          x
+          x,
+          nPermSimple = 100000
         ))
-      }
+      },
+      .progress = TRUE,
+      .options = furrr_options(seed = 42)
     ),
+    res = map(res_raw, "result"),
     res_reduced = future_pmap(
       list(res, ranks),
       \(res, x) {
@@ -1684,9 +2104,16 @@ fgsea_res_raw <- fgsea_input_raw %>%
           x
         )
       },
-      .progress = TRUE
-    )
+      .progress = TRUE,
+      .options = furrr_options(seed = 42)
+    ),
+    warnings = map_chr(res_raw, \(x) paste(x$warnings, collapse = "; "))
   )
+
+qs_save(
+  fgsea_res_raw,
+  file.path(result_dir, "fgsea_res_raw.qs")
+)
 
 fgsea_res_long <- fgsea_res_raw %>%
   transmute(
@@ -1704,13 +2131,16 @@ fgsea_res_long <- fgsea_res_raw %>%
   ) %>%
   unnest(res) |>
   mutate(
-    direction = if_else(NES < 0, "negative", "positive"),
+    direction = if_else(ES < 0, "negative", "positive"),
     signed_p = if_else(
       direction == "negative", 1, -1
-    ) * log10(padj)
+    ) * log10(pval)
   )
 
-
+write_csv(
+  fgsea_res_long,
+  file.path(result_dir, "fgsea_res_long.csv.gz")
+)
 ```
 
 
@@ -1753,10 +2183,18 @@ ps <- group_nest(
           geom_point(
             aes(
               fill = signed_p,
-              size = padj_cut
+              size = padj_cut,
+              alpha = is_main
             ),
             shape = 21,
             color = "black"
+          ) +
+          scale_alpha_manual(
+            values = c(
+              `TRUE` = 1,
+              `FALSE` = 0.2
+            ),
+            guide = "none"
           ) +
           paletteer::scale_fill_paletteer_c(
             "ggthemes::Orange-Blue-White Diverging",
@@ -1785,6 +2223,247 @@ pwalk(
       p, width = 8, height = 8
     )
   }
+)
+```
+
+#### Dot plot comparison
+
+```{r}
+library(seriation)
+
+cluster_df <- function(df, row_var, col_var, value_var, values_fill = 0) {
+  # browser()
+  mat <- df %>%
+    select({{row_var}}, {{col_var}}, {{value_var}}) %>%
+    pivot_wider(names_from = {{col_var}}, values_from = {{value_var}}, values_fill = values_fill) %>%
+    column_to_rownames(rlang::as_name(rlang::enquo(row_var)))
+  # browser()
+  if (rlang::is_bare_numeric(pull(df, {{value_var}}))) {
+    dist_rows <- dist(mat, method = "euclidian")
+    dist_cols <- dist(t(mat), method = "euclidian")
+  } else {
+    # browser()
+    dist_rows <- cluster::daisy(mat, metric = "gower")
+    dist_cols <- t(mat) %>%
+      as.data.frame() %>%
+      mutate(across(everything(), \(x) factor(x, levels = levels(pull(df, {{value_var}}))))) %>%
+      cluster::daisy(metric = "gower")
+  }
+  clust_rows <- hclust(dist_rows, method = "average") %>%
+      reorder(dist_rows, method = "olo")
+  clust_cols <- hclust(dist_cols, method = "average") %>%
+      reorder(dist_cols, method = "olo")
+  df %>%
+    mutate(
+      "{{row_var}}" := factor({{row_var}}, levels = clust_rows$labels[clust_rows$order]),
+      "{{col_var}}" := factor({{col_var}}, levels = clust_cols$labels[clust_cols$order])
+    )
+}
+```
+
+```{r}
+fgsea_res_long_relevant <- fgsea_res_long |>
+  filter(
+    model_type == "linear",
+    term %in% c("YKL-5-124", "YNW-10-135"),
+    !str_detect(pathway, coll("SARS")),
+    !str_detect(pathway, coll("INFLUENZA")),
+  )
+
+fgsea_res_top_comp <- fgsea_res_long_relevant |>
+  semi_join(
+    fgsea_res_long_relevant |>
+      group_by(term) |>
+      arrange(padj, pval) |>
+      filter(
+        padj < 0.05,
+        is_main
+      ) |>
+      slice_head(n = 20),
+    by = "pathway"
+  ) |>
+  mutate(
+    padj_cut = cut(
+      padj,
+      breaks = c(-Inf, 0.001, 0.01, 0.05, Inf),
+      labels = c("<0.001", "<0.01", "<0.05", "ns")
+    ) |>
+      fct_rev(),
+    pathway_display = str_replace_all(pathway, coll("_"), " ") |>
+      str_sub(start = 3) |>
+      str_wrap(width = 50)
+      # str_trunc(width = 60)
+  ) |>
+  drop_na(signed_p) |>
+  cluster_df(
+    pathway_display, term, signed_p
+  )
+
+
+p <- ggplot(
+  fgsea_res_top_comp,
+  aes(
+    x = term,
+    y = pathway_display
+  )
+) +
+  geom_point(
+    aes(
+      color = NES,
+      size = padj_cut
+    ),
+    shape = 16,
+    alpha = 1
+  ) +
+  paletteer::scale_color_paletteer_c(
+    "ggthemes::Red-Blue Diverging",
+    limits = c(-max(abs(fgsea_res_top_comp$NES)), max(abs(fgsea_res_top_comp$NES))),
+    oob = scales::squish,
+    direction = -1
+  ) +
+  scale_size_manual(
+    values = c(
+      "<0.001" = 3,
+      "<0.01" = 1.5,
+      "<0.05" = 1,
+      "ns" = 0.5
+    )
+  ) +
+  labs(
+    x = NULL, y = NULL,
+    color = "Normalized enrichment score",
+    size = "Adjusted p"
+  ) +
+  scale_x_discrete(position = "top") +
+  theme_minimal(base_size = 10) +
+  theme(
+    text = element_text(color = "black"),
+    axis.text.x = element_text(angle = 45, hjust = 0, vjust = 0),
+    panel.grid.major.x = element_blank(),
+    # axis.line.x = element_blank(),
+    axis.text.y = element_text(
+      color = "black",
+      lineheight = .65
+    ),
+    legend.position = "bottom",
+    legend.box = "vertical"
+  )
+
+p
+
+ggsave(
+  file.path(plot_dir, "enrichment", "fgsea_slopes_comparison_ykl_5_124_vs_ynw_10_135.pdf"),
+  p, width = 4.2, height = 7.5
+)
+
+# plotEnrichment(
+#   selected_gene_sets_list$gs[["R_RRNA_PROCESSING"]],
+#   fgsea_input_raw$ranks[[3]]
+# )
+
+# fgsea_res_long_relevant |>
+#   filter(pathway == "R_RRNA_PROCESSING")
+
+# fgseaMultilevel(
+#   selected_gene_sets_list$gs["R_RRNA_PROCESSING"],
+#   fgsea_input_raw$ranks[[3]],
+#   nPermSimple = 1000000
+# )
+```
+
+
+```{r}
+
+fgsea_res_long_relevant <- fgsea_res_long |>
+  filter(
+    model_type == "linear",
+    term %in% c("YKL-5-124", "YNW-10-135", "(YKL-5-124) - (YNW-10-135)"),
+    !str_detect(pathway, coll("SARS")),
+    !str_detect(pathway, coll("INFLUENZA")),
+  )
+
+fgsea_res_top_comp <- fgsea_res_long_relevant |>
+  semi_join(
+    fgsea_res_long_relevant |>
+      group_by(term) |>
+      arrange(padj, pval) |>
+      filter(
+        padj < 0.05,
+        is_main
+      ) |>
+      slice_head(n = 20),
+    by = "pathway"
+  ) |>
+  mutate(
+    padj_cut = cut(
+      padj,
+      breaks = c(-Inf, 0.001, 0.01, 0.05, Inf),
+      labels = c("<0.001", "<0.01", "<0.05", "ns")
+    ) |>
+      fct_rev(),
+    pathway_display = str_replace_all(pathway, coll("_"), " ") |>
+      str_sub(start = 3) |>
+      str_wrap(width = 50)
+      # str_trunc(width = 60)
+  ) |>
+  drop_na(signed_p) |>
+  cluster_df(
+    pathway_display, term, signed_p
+  )
+
+
+p <- ggplot(
+  fgsea_res_top_comp,
+  aes(
+    x = term,
+    y = pathway_display
+  )
+) +
+  geom_point(
+    aes(
+      color = NES,
+      size = padj_cut
+    ),
+    shape = 16,
+    alpha = 1
+  ) +
+  paletteer::scale_color_paletteer_c(
+    "ggthemes::Red-Blue Diverging",
+    limits = c(-max(abs(fgsea_res_top_comp$NES)), max(abs(fgsea_res_top_comp$NES))),
+    oob = scales::squish,
+    direction = -1
+  ) +
+  scale_size_manual(
+    values = c(
+      "<0.001" = 3,
+      "<0.01" = 1.5,
+      "<0.05" = 1,
+      "ns" = 0.5
+    )
+  ) +
+  labs(
+    x = NULL, y = NULL,
+    color = "Normalized enrichment score",
+    size = "Adjusted p"
+  ) +
+  scale_x_discrete(position = "top") +
+  theme_minimal(base_size = 10) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 0, vjust = 0),
+    panel.grid.major.x = element_blank(),
+    # axis.line.x = element_blank(),
+    axis.text.y = element_text(
+      lineheight = .65
+    ),
+    legend.position = "bottom",
+    legend.box = "vertical"
+  )
+
+p
+
+ggsave(
+  file.path(plot_dir, "enrichment", "fgsea_slopes_comparison_ykl_5_124_vs_ynw_10_135.pdf"),
+  p, width = 4.2, height = 7.5
 )
 ```
 
@@ -1879,3 +2558,7 @@ saveWorkbook(
   overwrite = TRUE
 )
 ```
+
+* Color points in Volcano by direction
+* Plot comparison between slopes separately for both compounds, slope in compound
+  vs slope difference YKL vs YNW
