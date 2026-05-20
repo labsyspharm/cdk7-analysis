@@ -27,6 +27,7 @@ library(fgsea)
 library(openxlsx)
 library(ggrastr)
 library(ashr)
+library(systemfonts)
 
 conflicts_prefer(
   dplyr::filter,
@@ -60,19 +61,23 @@ PRISM analysis code at https://github.com/theprismlab/sushi/blob/5320078b788fd60
 biomarkers_raw <- syn("syn73615969") |>
   H5File$new(mode = "r")
 
-expression_col_meta <- biomarkers_raw[["Expression/column_meta"]]$read() |>
-  as_tibble()
+read_biomarker_mat <- function(group, dataset) {
+  col_meta <- group[[paste0(dataset, "/column_meta")]]$read() |>
+    as_tibble()
+  row_meta <- group[[paste0(dataset, "/row_meta")]]$read() |>
+    as_tibble()
+  mat <- group[[paste0(dataset, "/mat")]]$read() |>
+    magrittr::set_colnames(
+      col_meta$column_name
+    ) |>
+    magrittr::set_rownames(
+      row_meta$ModelID
+    )
+  mat
+}
 
-expression_row_meta <- biomarkers_raw[["Expression/row_meta"]]$read() |>
-  as_tibble()
-
-expression_mat <- biomarkers_raw[["Expression/mat"]]$read() |>
-  magrittr::set_colnames(
-    expression_col_meta$column_name
-  ) |>
-  magrittr::set_rownames(
-    expression_row_meta$ModelID
-  )
+expression_mat <- read_biomarker_mat(biomarkers_raw, "Expression")
+crispr_mat <- read_biomarker_mat(biomarkers_raw, "CRISPR")
 
 cell_line_meta <- biomarkers_raw[["Lineage_Table/table"]]$read() |>
   as_tibble()
@@ -82,10 +87,13 @@ cell_line_meta_depmap <- syn("syn73674394") |>
   read_csv()
 ```
 
+Use YNW-042 from the MTS31 experiment, the one in the MTS30 experiment
+was using a toxic high dose.
 
 ```{r}
 prism_raw_zips <- c(
   mts_30 = "syn73616950",
+  mts_31 = "syn74766124",
   ykl = "syn73616961"
 ) |>
   map(syn)
@@ -93,6 +101,10 @@ prism_raw_zips <- c(
 prism_drc <- list(
   mts_30 = prism_raw_zips[["mts_30"]] |>
     unz("drc/MTS030_TINGHU_ZHANG_DRC_TABLE.csv") |>
+    read_csv() |>
+    filter(pert_name != "YNW-042"),
+  mts_31 = prism_raw_zips[["mts_31"]] |>
+    unz("drc/MTS031_TINGHU_ZHANG_DRC_TABLE.csv") |>
     read_csv(),
   ykl = prism_raw_zips[["ykl"]] |>
     unz("data/DRC_TABLE.csv") |>
@@ -311,7 +323,7 @@ p <- ggplot(
   ) +
   scale_alpha_manual(
     values = c(
-      "Included" = .9,
+      "Included" = .6,
       "Excluded" = .2
     ),
     name = "ABCB1 filtering"
@@ -327,7 +339,7 @@ p <- ggplot(
 p
 
 ggsave(
-  file.path(plot_dir, "auc_comparison.pdf"),
+  file.path(plot_dir, "auc_comparison_v2.pdf"),
   p, width = 7, height = 4
 )
 ```
@@ -495,7 +507,7 @@ p <- ggplot(
 p
 
 ggsave(
-  file.path(plot_dir, "auc_by_lineage_alpha.pdf"),
+  file.path(plot_dir, "auc_by_lineage_alpha_v2.pdf"),
   p, width = 8, height = 4.5
 )
 ```
@@ -546,6 +558,7 @@ input_data <- prism_drc |>
   ) |>
   group_nest(gene)
 ```
+
 
 ```{r}
 run_model <- function(
@@ -602,6 +615,7 @@ run_model <- function(
   )
 
   list(
+    model = model,
     model_stats = glance(model),
     model_coefs = tidy(model),
     model_by_compound = res_by_compound,
@@ -610,6 +624,11 @@ run_model <- function(
       adjust = "none"
     ) |>
       tidy()
+    # model_equivalence = test(
+    #   emm,
+    #   delta = min_delta
+    # ) |>
+    #   tidy()
   )
 }
 
@@ -702,6 +721,8 @@ model_res_aic_summary <- model_res_aic |>
 
 Running the random_lineage model
 
+
+
 ```{r}
 plan(multicore, workers = 8)
 
@@ -723,10 +744,10 @@ model_res_raw <- input_data |>
 
 qs_save(
   model_res_raw,
-  file.path(result_dir, "model_res_raw.qs")
+  file.path(result_dir, "model_res_raw_v2.qs2")
 )
 # model_res_raw <- qs_read(
-#   file.path(result_dir, "model_res_raw.qs")
+#   file.path(result_dir, "model_res_raw_v2.qs2")
 # )
 
 model_res_rank_raw <- input_data |>
@@ -749,6 +770,19 @@ model_res_rank_raw <- input_data |>
 qs_save(
   model_res_rank_raw,
   file.path(result_dir, "model_res_rank_raw.qs")
+)
+```
+
+
+```{r}
+m <- model_res_raw$model_out[[1]]$model
+
+em <- emtrends(
+  m,
+  ~pert_name,
+  var = "expression",
+  adjust = "none",
+  lmer.df = "kenward-roger"
 )
 ```
 
@@ -848,6 +882,55 @@ model_slopes <- model_slopes_shrunk |>
   unnest(data) |>
   mutate(
     direction = if_else(expression.trend > 0, "positive", "negative")
+  )
+```
+
+equivalence test for slopes indistinguishable from 0, use empirical null
+distribution from ashr, where the mini
+
+```{r}
+# min_delta <- model_slopes_shrunk |>
+#   filter(
+#     pert_name %in% c("YKL-5-124", "YNW-10-135")
+#   ) |>
+#   pull(shrunk_model_slopes) |>
+#   map_dbl(
+#     \(x) {
+#       g <- x$fitted_g
+#       browser()
+#       min_a <- g$a[g$pi > 0 & g$a < 0]
+#       min_b <- g$b[g$pi > 0 & g$b > 0]
+#       min(abs(c(min_a, min_b)))
+#     }
+#   ) |>
+#   min()
+min_delta <- model_slopes |>
+      filter(padj > 0.1
+      ) |> summarize(null_quant = quantile(expression.trend, .975))
+
+model_equivalence <- model_res_raw |>
+  transmute(
+    gene,
+    model_equivalence = map(
+      model_out,
+      \(m) {
+        test(
+          emtrends(
+            m$model,
+            ~pert_name,
+            var = "expression",
+            adjust = "none",
+            lmer.df = "kenward-roger"
+          ),
+          delta = min_delta$null_quant
+        ) |>
+          tidy()
+      }
+    )
+  ) |>
+  unnest(model_equivalence) |>
+  mutate(
+    padj = p.adjust(p.value, method = "fdr")
   )
 ```
 
@@ -1032,7 +1115,7 @@ p <- bind_rows(
   envalysis::theme_publish()
 
 ggsave(
-  file.path(plot_dir, "p_value_distributions.pdf"),
+  file.path(plot_dir, "p_value_distributions_v2.pdf"),
   p, width = 8, height = 4
 )
 ```
@@ -1129,7 +1212,7 @@ plot_auc_expression_corr <- function(gene, rank_transform = FALSE, mdr_filtering
 }
 
 plot_auc_expression_corr("ABCB1", mdr_filtering = FALSE)
-plot_auc_expression_corr("IFITM-composite", mdr_filtering = FALSE)
+plot_auc_expression_corr("IFITM-composite", mdr_filtering = TRUE)
 plot_auc_expression_corr("WDR54")
 plot_auc_expression_corr("IFITM1")
 plot_auc_expression_corr("AURKB")
@@ -1219,6 +1302,8 @@ model_slopes |>
 
 ## Volcano plot
 
+### Slopes
+
 ```{r}
 p <- ggplot(
   model_slopes |>
@@ -1304,10 +1389,107 @@ p <- ggplot(
 p
 
 ggsave(
+  file.path(plot_dir, "volcano_slopes_v2.pdf"),
+  p, width = 7, height = 4
+)
+```
+
+Color YKL and YNW separately
+
+```{r}
+model_slopes_classes <- model_slopes |>
+  mutate(
+    p_censored = -log10(padj) > 12,
+    neglog10_padj = pmin(-log10(padj), 12),
+    signif_direction = case_when(
+      padj > 0.05 ~ "not significant",
+      expression.trend > 0 ~ "positive",
+      expression.trend < 0 ~ "negative",
+      TRUE ~ NA_character_
+    )
+  ) |>
+  arrange(desc(padj), desc(p.value))
+
+p <- ggplot(
+  model_slopes_classes,
+  aes(
+    x = expression.trend,
+    y = neglog10_padj
+  )
+) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    color = "grey"
+  ) +
+  rasterize(geom_point(
+    aes(
+      color = signif_direction,
+      shape = p_censored
+    ),
+    alpha = .6
+  ), dpi = 300, dev = "ragg_png") +
+  geom_text_repel(
+    data = \(x) arrange(x, p.value) |>
+      filter(padj < 0.05) |>
+      mutate(
+        direction = if_else(
+          expression.trend > 0, "positive", "negative"
+        )
+      ) |>
+      group_by(pert_name, direction) |>
+      slice_head(n = 20),
+    aes(label = gene),
+    size = 1.5,
+    max.overlaps = Inf,
+    max.iter = 1e6,
+    seed = 42
+  ) +
+  scale_shape_manual(
+    values = c(
+      `TRUE` = 17,
+      `FALSE` = 16
+    ),
+    guide = "none"
+  ) +
+  scale_color_manual(
+    values = c(
+      "positive" = paletteer::paletteer_c("ggthemes::Orange-Blue Diverging", 10)[3],
+      "negative" = paletteer::paletteer_c("ggthemes::Orange-Blue Diverging", 10)[10],
+      "not significant" = "black"
+    ),
+    guide = guide_legend(
+      override.aes = list(
+        shape = 16
+      )
+    )
+    # values = c(
+    #   "TRUE" = "red",
+    #   "FALSE" = "black"
+    # ),
+    # guide = "none"
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, .05))
+  ) +
+  facet_wrap(
+    ~pert_name,
+    axes = "all", axis.labels = "margins",
+    scales = "free_y"
+  ) +
+  labs(
+    x = "Slope", y = "-log10(adj. p-value)"
+  )
+p
+
+ggsave(
   file.path(plot_dir, "volcano_slopes.pdf"),
   p, width = 7, height = 4
 )
 ```
+
+
+### Slope differences (pairwise comparisons)
 
 ```{r}
 p <- ggplot(
@@ -1444,6 +1626,7 @@ ggsave(
 
 ## Single compound vs comparison
 
+### Single slope vs slope difference
 
 ```{r}
 model_res_pairwise_with_rev <- model_res_pairwise |>
@@ -1595,6 +1778,8 @@ library(plotly)
 ggplotly(p, tooltip = "text")
 ```
 
+### Slope comparison for both compounds
+
 ```{r}
 
 res_pairs_vs_single_both <- power_inner_join(
@@ -1649,14 +1834,26 @@ p <- ggplot(
     linetype = "dashed",
     color = "grey50"
   ) +
-  rasterize(geom_point(
+  rasterize(geom_text(
     aes(
       color = direction_pairwise_sign,
-      text = gene,
-      shape = expression.trend_shrunk_1 < -.035
+      label = if_else(
+        expression.trend_shrunk_1 < -.035,
+        "◀",
+        "●"
+        # "\uf0d9",   # fa-caret-left
+        # "\uf111"    # fa-circle
+        # "caret-left",
+        # "circle"
+      ),
+      size = if_else(
+        expression.trend_shrunk_1 < -.035,
+        4,
+        6
+      )
     ),
     alpha = .6,
-    size = 2
+    size.unit = "pt"
   ), dpi = 300, dev = "ragg_png") +
   geom_text_repel(
     data = \(df) {
@@ -1685,18 +1882,14 @@ p <- ggplot(
     size = 1.5,
     max.overlaps = Inf,
     max.iter = 1e7,
-    seed = 42,
+    seed = 42
     # min.segment.length = 0,
   ) +
-  scale_shape_manual(
-    values = c(
-      `TRUE` = "◀",
-      `FALSE` = "●"
-    ),
-    guide = "none"
+  scale_x_continuous(
+    expand = expansion(mult = c(.01, .01))
   ) +
   scale_y_continuous(
-    expand = expansion(mult = c(.1, .1))
+    expand = expansion(mult = c(.05, .05))
   ) +
   scale_color_manual(
     values = c(
@@ -1706,32 +1899,204 @@ p <- ggplot(
     ),
     guide = guide_legend(
       override.aes = list(
-        shape = 16
+        label = "."
       )
     )
   ) +
-  coord_equal() +
+  scale_size_identity() +
+  # coord_equal() +
   labs(
     x = "AOC vs gene expression\nYNW-10-135",
     y = "AOC vs gene expression\nYKL-5-124"
   )
 
-library(Cairo)
 
-CairoPDF(
-  file.path(plot_dir, "slopes_comparison_cairo.pdf"),
-  width = 4, height = 4
-)
-print(p)
-dev.off()
 ggsave(
   file.path(plot_dir, "slopes_comparison.pdf"),
-  p, width = 4, height = 4,
-  device = cairo_pdf
+  p, width = 4.5, height = 4
 )
 
-plotly::ggplotly(p, tooltip = "text")
+# plotly::ggplotly(p, tooltip = "text")
 ```
+
+Color by initial volcano classes
+
+In some rare cases there is a significant difference between compounds
+(pairwise padj < .05) but neither for compound A nor B the individual
+slopes are significant, also making them gray
+
+```{r}
+res_pairs_vs_single_both <- power_inner_join(
+    model_res_pairwise_with_rev,
+    model_slopes,
+    by = c("gene", "pert_name_1" = "pert_name"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    ),
+    suffix = c("_pairwise", "")
+) |>
+  power_inner_join(
+    model_slopes,
+    by = c("gene", "pert_name_2" = "pert_name"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    ),
+    suffix = c("_1", "_2")
+  ) |>
+  mutate(
+    direction_pairwise_sign = if_else(
+      padj_pairwise > .05,
+      "ns",
+      direction_pairwise
+    ),
+    direction_1_sign = if_else(
+      padj_1 > .05,
+      "ns",
+      direction_1
+    ),
+    direction_2_sign = if_else(
+      padj_2 > .05,
+      "ns",
+      direction_2
+    ),
+    direction_combined = case_when(
+      padj_pairwise > .05 ~ "not significant",
+      padj_1 > .05 & padj_2 > .05 ~ "not significant",
+      TRUE ~ paste(direction_1_sign, direction_2_sign, sep = " ")
+    )
+  )
+
+direction_combined_colors <- res_pairs_vs_single_both$direction_combined |>
+  setdiff("not significant") |>
+  unique() %>% {
+    set_names(
+      paletteer::paletteer_d("colorblindr::OkabeIto", length(.)),
+      .
+    )
+  } |>
+  c(
+    c(
+      "not significant" = "gray"
+    )
+  )
+
+p <- ggplot(
+  res_pairs_vs_single_both |>
+    filter(
+      pert_name_1 == "YNW-10-135",
+      pert_name_2 == "YKL-5-124"
+    ) |>
+    arrange(desc(padj_pairwise), desc(p.value_pairwise)),
+  aes(
+    x = pmax(expression.trend_shrunk_1, -.035),
+    y = expression.trend_shrunk_2
+  )
+) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    color = "grey50"
+  ) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    color = "grey50"
+  ) +
+  rasterize(geom_text(
+    aes(
+      color = direction_combined,
+      label = if_else(
+        expression.trend_shrunk_1 < -.035,
+        "◀",
+        "●"
+        # "\uf0d9",   # fa-caret-left
+        # "\uf111"    # fa-circle
+        # "caret-left",
+        # "circle"
+      ),
+      size = case_when(
+        expression.trend_shrunk_1 < -.035 ~ 4,
+        direction_combined == "not significant" ~ 4,
+        TRUE ~ 6
+      )
+      # size = if_else(
+      #   expression.trend_shrunk_1 < -.035,
+      #   4,
+      #   6
+      # )
+    ),
+    alpha = .6,
+    size.unit = "pt"
+  ), dpi = 300, dev = "ragg_png") +
+  geom_text_repel(
+    data = \(df) {
+      # browser()
+      arrange(df, padj_pairwise, p.value_pairwise) |>
+      group_by(pert_name_1, pert_name_2, direction_1, direction_2) |>
+      mutate(
+        gene_label = if_else(
+          direction_combined != "not significant" & cumsum(padj_pairwise < 0.05) <= 10,
+          # seq_len(n()) <= 10 & padj_pairwise < 0.05,
+          gene, ""
+        )
+      ) |>
+      ungroup()
+    },
+    # data = \(df) {
+    #   arrange(df, padj_pairwise, p.value_pairwise) |>
+    #     group_by(pert_name_1, pert_name_2, direction_combined) |>
+    #     filter(padj_pairwise < 0.05) |>
+    #     slice_head(n = 10) |>
+    #     ungroup() |>
+    #     mutate(
+    #       gene_label = gene
+    #     )
+    # },
+    aes(label = gene_label),
+    size = 1.5,
+    max.overlaps = Inf,
+    max.iter = 1e7,
+    seed = 42
+    # min.segment.length = 0,
+  ) +
+  scale_x_continuous(
+    expand = expansion(mult = c(.01, .01))
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(.05, .05))
+  ) +
+  scale_color_manual(
+    values = direction_combined_colors,
+    guide = "none"
+    # guide = guide_legend(
+    #   override.aes = list(
+    #     label = ".",
+    #     size = 10
+    #   )
+    # )
+  ) +
+  scale_size_identity() +
+  coord_equal() +
+  labs(
+    x = "AOC vs gene expression\nYNW-10-135",
+    y = "AOC vs gene expression\nYKL-5-124"
+  )
+p
+
+ggsave(
+  file.path(plot_dir, "slopes_comparison_colored_classes.pdf"),
+  p, width = 4.5, height = 4
+)
+
+library(plotly)
+ggplotly(p) |>
+  toWebGL()
+```
+
 
 ## Compare with and without MDR filtering
 
@@ -1928,7 +2293,7 @@ fora_res_raw <- fora_input_raw %>%
 
 qs_save(
   fora_res_raw,
-  file.path(result_dir, "fora_res_raw.qs")
+  file.path(result_dir, "fora_res_raw_v2.qs")
 )
 
 fora_res_long <- fora_res_raw %>%
@@ -1955,7 +2320,7 @@ fora_res_long <- fora_res_raw %>%
 
 write_csv(
   fora_res_long,
-  file.path(result_dir, "fora_res_long.csv.gz")
+  file.path(result_dir, "fora_res_long_v2.csv.gz")
 )
 ```
 
@@ -2028,7 +2393,7 @@ pwalk(
   ps,
   \(term, p, model_type, ...) {
     ggsave(
-      file.path(plot_dir, "enrichment", paste0(model_type, "_", term, "_enrichment.pdf")),
+      file.path(plot_dir, "enrichment", paste0(model_type, "_", term, "_enrichment_v2.pdf")),
       p, width = 12, height = 7
     )
   }
