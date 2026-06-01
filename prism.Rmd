@@ -58,6 +58,16 @@ PRISM analysis code at https://github.com/theprismlab/sushi/blob/5320078b788fd60
 ## Load Biomarker data
 
 ```{r}
+Sys.setenv("VROOM_CONNECTION_SIZE" = 131072 * 10)
+
+gene_dependency_mat <- syn("syn75113176") |>
+  read_csv(show_col_types = FALSE) |>
+  column_to_rownames("...1") |>
+  set_names(
+    \(x) str_remove(x, " \\([0-9]+\\)$")
+  ) |>
+  as.matrix()
+
 biomarkers_raw <- syn("syn73615969") |>
   H5File$new(mode = "r")
 
@@ -526,52 +536,98 @@ expression_mat_ifit_composite <- cbind(
     magrittr::set_colnames("IFITM-composite")
 )
 
-input_data <- prism_drc |>
+input_datasets <- tribble(
+  ~dataset, ~mat,
+  "Expression", expression_mat_ifit_composite,
+  "CRISPR", crispr_mat,
+  "Dependency", gene_dependency_mat
+)
+
+pwalk(
+  input_datasets,
+  \(dataset, mat, ...) {
+    overlap <- intersect(rownames(mat), cell_lines_filtered$depmap_id)
+    missing <- setdiff(cell_lines_filtered$depmap_id, rownames(mat))
+    if (length(missing) > 0) {
+      warning(
+        length(missing), " cell lines are missing in ", dataset
+      )
+    }
+  }
+)
+
+cell_lines_sans_mdr_filtering <- cell_line_meta |>
   filter(
-    depmap_id %in% cell_lines_filtered$depmap_id
+    depmap_id %in% rownames(expression_mat)
   ) |>
-  select(depmap_id, pert_name, auc)  |>
-  power_inner_join(
-    cell_line_meta |>
-      select(depmap_id, lineage),
-    by = "depmap_id",
-    check = check_specs(
-      unmatched_keys_left = "warn",
-      duplicate_keys_right = "warn"
-    )
-  ) |>
-  power_left_join(
-    expression_mat_ifit_composite[
-      cell_lines_filtered$depmap_id,
-      c(eligible_genes, c("IFITM-composite" = TRUE))
-    ] |>
-      as_tibble(rownames = "depmap_id") |>
-      pivot_longer(
-        -depmap_id,
-        names_to = "gene",
-        values_to = "expression"
-      ),
-    by = "depmap_id",
-    check = check_specs(
-      unmatched_keys_left = "warn"
-    )
-  ) |>
-  group_nest(gene)
+  semi_join(
+    cell_lines_n_profiled |>
+      filter(n >= 2),
+    by = "depmap_id"
+  )
+
+get_model_input_data <- function(
+  dataset, eligible_genes, eligible_cell_lines
+) {
+  mat <- input_datasets$mat[input_datasets$dataset == dataset][[1]]
+  cell_lines_intersect <- intersect(rownames(mat), eligible_cell_lines)
+  genes_intersect <- intersect(colnames(mat), eligible_genes)
+  mat_filtered <- mat[cell_lines_intersect, genes_intersect, drop = FALSE]
+  prism_drc |>
+    transmute(depmap_id, pert_name, aoc = 1 - auc)  |>
+    power_inner_join(
+      cell_line_meta |>
+        filter(
+          depmap_id %in% cell_lines_intersect
+        ) |>
+        select(depmap_id, lineage),
+      by = "depmap_id",
+      check = check_specs(
+        duplicate_keys_right = "warn"
+      )
+    ) |>
+    power_left_join(
+      mat_filtered |>
+        as_tibble(rownames = "depmap_id") |>
+        pivot_longer(
+          -depmap_id,
+          names_to = "gene",
+          values_to = "assay_value"
+        ) |>
+        drop_na(),
+      by = "depmap_id",
+      check = check_specs(
+        unmatched_keys_left = "warn"
+      )
+    ) |>
+    group_by(gene, pert_name) |>
+    filter(n() >= 3) |>
+    ungroup() |>
+    group_nest(gene)
+}
+
 ```
 
+### Visualize predictors
+
+```{r}
+
+```
+
+### Model function
 
 ```{r}
 run_model <- function(
   df, model_formula, random_effects = TRUE,
   lmer.df = "satterthwaite", REML = FALSE,
-  rank_transform = FALSE
+  rank_transform = FALSE, return_model = FALSE
 ) {
   # browser()
   if (rank_transform) {
     df <- df |>
       mutate(
         across(
-          c(auc, expression),
+          c(auc, assay_value),
           rank
         )
       )
@@ -592,7 +648,7 @@ run_model <- function(
   emm <- emtrends(
     model,
     ~pert_name,
-    var = "expression",
+    var = "assay_value",
     adjust = "none",
     lmer.df = lmer.df
   )
@@ -600,7 +656,7 @@ run_model <- function(
   emm_intercepts <- emmeans(
     model,
     ~pert_name,
-    at = list(expression = 0),
+    at = list(assay_value = 0),
     adjust = "none",
     lmer.df = lmer.df
   )
@@ -614,8 +670,7 @@ run_model <- function(
     suffix = c("_intercept", "_slope")
   )
 
-  list(
-    model = model,
+  res <- list(
     model_stats = glance(model),
     model_coefs = tidy(model),
     model_by_compound = res_by_compound,
@@ -630,6 +685,10 @@ run_model <- function(
     # ) |>
     #   tidy()
   )
+  if (return_model) {
+    res$model <- model
+  }
+  res
 }
 
 ```
@@ -637,13 +696,15 @@ run_model <- function(
 ```{r}
 model_formulas <- tribble(
   ~model_name, ~model_formula, ~random_effects,
-  "random_lineage", auc ~ expression * pert_name + (1 | lineage), TRUE,
-  "random_cell_line", auc ~ expression * pert_name + (1 | depmap_id), TRUE,
-  "fixed", auc ~ expression * pert_name, FALSE
+  "random_lineage", aoc ~ assay_value * pert_name + (1 | lineage), TRUE,
+  "random_cell_line", aoc ~ assay_value * pert_name + (1 | depmap_id), TRUE,
+  "fixed", aoc ~ assay_value * pert_name, FALSE
 )
 
 test_output <- input_data |>
-  slice(1) |>
+  group_by(dataset) |>
+  slice_head(n = 1) |>
+  ungroup() |>
   crossing(model_formulas) |>
   mutate(
     model_out = pmap(
@@ -657,7 +718,7 @@ test_output <- input_data |>
     )
   )
 
-plan(multicore, workers = 4)
+plan(multicore, workers = 11)
 
 model_res_raw_all <- input_data |>
   crossing(model_formulas) |>
@@ -724,23 +785,63 @@ Running the random_lineage model
 
 
 ```{r}
-plan(multicore, workers = 8)
+plan(multicore, workers = 11)
 
-model_res_raw <- input_data |>
-  mutate(
-    model_out = future_map(
-      data,
-      \(data) run_model(
-        data,
-        auc ~ expression * pert_name + (1 | lineage),
-        random_effects = TRUE,
-        REML = TRUE,
-        lmer.df = "kenward-roger"
-      ),
-      .progress = TRUE,
-      .options = furrr_options(seed = 42)
+x <- get_model_input_data(
+  "Dependency",
+  c(names(eligible_genes)[eligible_genes], "IFITM-composite"),
+  cell_lines_filtered$depmap_id
+)
+
+run_model(
+  x$data[[924]],
+  aoc ~ assay_value * pert_name + (1 | lineage),
+  random_effects = TRUE,
+  REML = TRUE,
+  lmer.df = "kenward-roger",
+  return_model = TRUE
+)
+
+model_res_raw <- map(
+  set_names(input_datasets$dataset),
+  \(dataset) {
+    if (file.exists(file.path(result_dir, paste0("model_res_raw_", dataset, ".qs2")))) {
+      message("Skipping ", dataset, " as results already exist")
+      return(
+        qs_read(
+          file.path(result_dir, paste0("model_res_raw_", dataset, ".qs2"))
+        )
+      )
+    }
+    message("Running model for dataset ", dataset)
+    input_data <- get_model_input_data(
+      dataset,
+      c(names(eligible_genes)[eligible_genes], "IFITM-composite"),
+      cell_lines_filtered$depmap_id
     )
-  )
+    res <- mutate(
+      input_data,
+      model_out = future_map(
+        data,
+        \(data) possibly(run_model)(
+          data,
+          aoc ~ assay_value * pert_name + (1 | lineage),
+          random_effects = TRUE,
+          REML = TRUE,
+          lmer.df = "kenward-roger",
+          return_model = FALSE
+        ),
+        .progress = TRUE,
+        .options = furrr_options(seed = 42)
+      )
+    )
+    qs_save(
+      res,
+      file.path(result_dir, paste0("model_res_raw_", dataset, ".qs2"))
+    )
+    res
+  }
+)
 
 qs_save(
   model_res_raw,
@@ -756,7 +857,7 @@ model_res_rank_raw <- input_data |>
       data,
       \(data) run_model(
         data,
-        auc ~ expression * pert_name + (1 | lineage),
+        aoc ~ expression * pert_name + (1 | lineage),
         random_effects = TRUE,
         REML = TRUE,
         lmer.df = "kenward-roger",
@@ -789,13 +890,16 @@ em <- emtrends(
 
 ```{r}
 model_res_pairwise_shrunk <- model_res_raw |>
+  bind_rows(.id = "dataset") |>
   transmute(
+    dataset,
     gene,
     pairwise_res = map(model_out, "pairwise_res")
   ) |>
+  filter(map_lgl(pairwise_res, negate(is.null))) |>
   unnest(pairwise_res) |>
   group_nest(
-    term, contrast
+    dataset, term, contrast
   ) |>
   mutate(
     shrunk_pairwise_res = map(
@@ -823,6 +927,7 @@ model_res_pairwise_shrunk <- model_res_raw |>
 
 model_res_pairwise <- model_res_pairwise_shrunk |>
   transmute(
+    dataset,
     contrast,
     data
   ) |>
@@ -844,20 +949,27 @@ model_res_pairwise <- model_res_pairwise_shrunk |>
 
 
 model_slopes_shrunk <- model_res_raw |>
+  bind_rows(.id = "dataset") |>
   transmute(
+    dataset,
     gene,
     model_slopes = map(model_out, "model_by_compound")
   ) |>
+  filter(map_lgl(model_slopes, negate(is.null))) |>
   unnest(model_slopes) |>
-  group_nest(pert_name) |>
+  group_nest(
+    dataset, pert_name
+  ) |>
   mutate(
     shrunk_model_slopes = map(
       data,
-      \(df) ash(
-        df$expression.trend, df$std.error_slope,
-        df = NULL,
-        mixcompdist = "uniform"
-      )
+      \(df) {
+        ash(
+          df$assay_value.trend, df$std.error_slope,
+          df = NULL,
+          mixcompdist = "uniform"
+        )
+      }
     ),
     data = map2(
       data, shrunk_model_slopes,
@@ -876,12 +988,13 @@ model_slopes_shrunk <- model_res_raw |>
 
 model_slopes <- model_slopes_shrunk |>
   transmute(
+    dataset,
     pert_name,
     data
   ) |>
   unnest(data) |>
   mutate(
-    direction = if_else(expression.trend > 0, "positive", "negative")
+    direction = if_else(assay_value.trend > 0, "positive", "negative")
   )
 ```
 
@@ -970,67 +1083,57 @@ cell_lines_sans_mdr_filtering <- cell_line_meta |>
       filter(n >= 2),
     by = "depmap_id"
   )
-
-input_data_sans_mdr_filtering <- prism_drc |>
-  filter(
-    depmap_id %in% cell_lines_sans_mdr_filtering$depmap_id
-  ) |>
-  select(depmap_id, pert_name, auc)  |>
-  power_inner_join(
-    cell_line_meta |>
-      select(depmap_id, lineage),
-    by = "depmap_id",
-    check = check_specs(
-      unmatched_keys_left = "warn",
-      duplicate_keys_right = "warn"
-    )
-  ) |>
-  power_left_join(
-    expression_mat_ifit_composite[
-      cell_lines_sans_mdr_filtering$depmap_id,
-      c(eligible_genes, c("IFITM-composite" = TRUE))
-    ] |>
-      as_tibble(rownames = "depmap_id") |>
-      pivot_longer(
-        -depmap_id,
-        names_to = "gene",
-        values_to = "expression"
-      ),
-    by = "depmap_id",
-    check = check_specs(
-      unmatched_keys_left = "warn"
-    )
-  ) |>
-  group_nest(gene)
-
 ```
 
 
 ```{r}
-plan(multicore, workers = 6)
+plan(multicore, workers = 11)
 
-model_res_raw2 <- input_data_sans_mdr_filtering |>
-  mutate(
-    model_out = future_map(
-      data,
-      \(data) run_model(
-        data,
-        auc ~ expression * pert_name + (1 | lineage),
-        random_effects = TRUE,
-        REML = TRUE,
-        lmer.df = "kenward-roger"
-      ),
-      .progress = TRUE,
-      .options = furrr_options(seed = 42)
+model_res_raw_sans_mdr_filtering <- map(
+  set_names(input_datasets$dataset),
+  \(dataset) {
+    if (file.exists(file.path(result_dir, paste0("model_res_raw_sans_mdr_filtering_", dataset, ".qs2")))) {
+      message("Skipping ", dataset, " as results already exist")
+      return(
+        qs_read(
+          file.path(result_dir, paste0("model_res_raw_sans_mdr_filtering_", dataset, ".qs2"))
+        )
+      )
+    }
+    message("Running model for dataset ", dataset)
+    input_data <- get_model_input_data(
+      dataset,
+      c(names(eligible_genes)[eligible_genes], "IFITM-composite"),
+      cell_lines_sans_mdr_filtering$depmap_id
     )
-  )
-qs_save(
-  model_res_raw2,
-  file.path(result_dir, "model_res_raw_no_mdr_filtering.qs")
+    res <- mutate(
+      input_data,
+      model_out = future_map(
+        data,
+        \(data) possibly(run_model)(
+          data,
+          aoc ~ assay_value * pert_name + (1 | lineage),
+          random_effects = TRUE,
+          REML = TRUE,
+          lmer.df = "kenward-roger",
+          return_model = FALSE
+        ),
+        .progress = TRUE,
+        .options = furrr_options(seed = 42)
+      )
+    )
+    qs_save(
+      res,
+      file.path(result_dir, paste0("model_res_raw_sans_mdr_filtering_", dataset, ".qs2"))
+    )
+    res
+  }
 )
-# model_res_raw2 <- qs_read(
-#   file.path(result_dir, "model_res_raw_no_mdr_filtering.qs")
-# )
+
+qs_save(
+  model_res_raw_sans_mdr_filtering,
+  file.path(result_dir, "model_res_raw_sans_mdr_filtering.qs2")
+)
 
 model_res_rank_raw <- input_data_sans_mdr_filtering |>
   mutate(
@@ -1108,7 +1211,7 @@ p <- bind_rows(
     expand = expansion(mult = c(0, .05))
   ) +
   facet_wrap(
-    ~result_type,
+    ~dataset + result_type,
     scales = "free_y",
     axes = "all", axis.labels = "margins"
   ) +
@@ -1122,9 +1225,13 @@ ggsave(
 
 
 ```{r}
-plot_auc_expression_corr <- function(gene, rank_transform = FALSE, mdr_filtering = TRUE) {
+plot_auc_expression_corr <- function(gene, dataset = "Expression", rank_transform = FALSE, mdr_filtering = TRUE) {
   if (mdr_filtering) {
-    id <- input_data
+    id <- get_model_input_data(
+      dataset,
+      gene,
+      cell_lines_filtered$depmap_id
+    )
   } else {
     id <- input_data_sans_mdr_filtering
   }
@@ -1144,26 +1251,35 @@ plot_auc_expression_corr <- function(gene, rank_transform = FALSE, mdr_filtering
     scatter_df <- scatter_df |>
       mutate(
         across(
-          c(auc, expression),
+          c(aoc, expression),
           rank
         )
       )
     slope_df <- model_slopes_rank |>
-      filter(.data$gene == .env$gene)
+      filter(
+        .data$dataset == .env$dataset,
+        .data$gene == .env$gene
+      )
   } else {
     if (mdr_filtering) {
       slope_df <- model_slopes |>
-        filter(.data$gene == .env$gene)
+        filter(
+          .data$gene == .env$gene,
+          .data$dataset == .env$dataset
+        )
     } else {
       slope_df <- model_mdr_included_slopes |>
-        filter(.data$gene == .env$gene)
+        filter(
+          .data$dataset == .env$dataset,
+          .data$gene == .env$gene
+        )
     }
   }
   ggplot(
     scatter_df,
     aes(
-      x = expression,
-      y = 1 - auc
+      x = assay_value,
+      y = aoc
     )
   ) +
     geom_point(
@@ -1175,8 +1291,8 @@ plot_auc_expression_corr <- function(gene, rank_transform = FALSE, mdr_filtering
     ) +
     geom_abline(
       aes(
-        slope = -expression.trend,
-        intercept = 1 - intercept
+        slope = assay_value.trend,
+        intercept = intercept
       ),
       data = slope_df
     ) +
@@ -1184,7 +1300,7 @@ plot_auc_expression_corr <- function(gene, rank_transform = FALSE, mdr_filtering
     geom_text(
       aes(
         label = paste0(
-          " b = ", signif(-expression.trend, 2),
+          " b = ", signif(assay_value.trend, 2),
           "\n p = ", signif(padj, 2)
         ),
         color = padj < 0.05
@@ -1236,7 +1352,7 @@ dir.create(
 
 p <- plot_auc_expression_corr("ABCB1", mdr_filtering = FALSE)
 ggsave(
-  file.path(plot_dir, "gene_aoc_correlation", "ABCB1.pdf"),
+  file.path(plot_dir, "gene_aoc_correlation", "ABCB1_v2.pdf"),
   p, width = 7, height = 4
 )
 
@@ -1305,92 +1421,112 @@ model_slopes |>
 ### Slopes
 
 ```{r}
-p <- ggplot(
-  model_slopes |>
-    mutate(
-      p_censored = -log10(padj) > 12,
-      neglog10_padj = pmin(-log10(padj), 12),
-      signif_direction = case_when(
-        padj > 0.05 ~ "not significant",
-        expression.trend > 0 ~ "positive",
-        expression.trend < 0 ~ "negative",
-        TRUE ~ NA_character_
+ps <- group_modify(
+  group_by(model_slopes, dataset),
+  \(df, key) {
+    p <- ggplot(
+      df |>
+        mutate(
+          p_censored = -log10(padj) > 9,
+          neglog10_padj = pmin(-log10(padj), 9),
+          signif_direction = case_when(
+            padj > 0.05 ~ "not significant",
+            assay_value.trend > 0 ~ "positive",
+            assay_value.trend < 0 ~ "negative",
+            TRUE ~ NA_character_
+          ),
+          assay_value.trend = case_when(
+            assay_value.trend < -10 ~ min(assay_value.trend[assay_value.trend > -10], na.rm = TRUE),
+            assay_value.trend > 10 ~ max(assay_value.trend[assay_value.trend < 10], na.rm = TRUE),
+            TRUE ~ assay_value.trend
+          )
+        ) |>
+        arrange(desc(padj), desc(p.value)),
+      aes(
+        x = assay_value.trend,
+        y = neglog10_padj
       )
-    ) |>
-    arrange(desc(padj), desc(p.value)),
-  aes(
-    x = expression.trend,
-    y = neglog10_padj
-  )
-) +
-  geom_vline(
-    xintercept = 0,
-    linetype = "dashed",
-    color = "grey"
-  ) +
-  rasterize(geom_point(
-    aes(
-      color = signif_direction,
-      shape = p_censored
-    ),
-    alpha = .6
-  ), dpi = 300, dev = "ragg_png") +
-  geom_text_repel(
-    data = \(x) arrange(x, p.value) |>
-      filter(padj < 0.05) |>
-      mutate(
-        direction = if_else(
-          expression.trend > 0, "positive", "negative"
+    ) +
+      geom_vline(
+        xintercept = 0,
+        linetype = "dashed",
+        color = "grey"
+      ) +
+      rasterize(geom_point(
+        aes(
+          color = signif_direction,
+          shape = p_censored
+        ),
+        alpha = .6
+      ), dpi = 300, dev = "ragg_png") +
+      geom_text_repel(
+        data = \(x) arrange(x, p.value) |>
+          filter(padj < 0.05) |>
+          mutate(
+            direction = if_else(
+              assay_value.trend > 0, "positive", "negative"
+            )
+          ) |>
+          group_by(pert_name, direction) |>
+          slice_head(n = 20),
+        aes(label = gene),
+        size = 1.5,
+        max.overlaps = Inf,
+        max.iter = 1e6,
+        seed = 42
+      ) +
+      scale_shape_manual(
+        values = c(
+          `TRUE` = 17,
+          `FALSE` = 16
+        ),
+        guide = "none"
+      ) +
+      scale_color_manual(
+        values = c(
+          "positive" = paletteer::paletteer_c("ggthemes::Orange-Blue Diverging", 10)[3],
+          "negative" = paletteer::paletteer_c("ggthemes::Orange-Blue Diverging", 10)[10],
+          "not significant" = "black"
+        ),
+        guide = guide_legend(
+          override.aes = list(
+            shape = 16
+          )
         )
-      ) |>
-      group_by(pert_name, direction) |>
-      slice_head(n = 20),
-    aes(label = gene),
-    size = 1.5,
-    max.overlaps = Inf,
-    max.iter = 1e6,
-    seed = 42
-  ) +
-  scale_shape_manual(
-    values = c(
-      `TRUE` = 17,
-      `FALSE` = 16
-    ),
-    guide = "none"
-  ) +
-  scale_color_manual(
-    values = c(
-      "positive" = paletteer::paletteer_c("ggthemes::Orange-Blue Diverging", 10)[3],
-      "negative" = paletteer::paletteer_c("ggthemes::Orange-Blue Diverging", 10)[10],
-      "not significant" = "black"
-    ),
-    guide = guide_legend(
-      override.aes = list(
-        shape = 16
+        # values = c(
+        #   "TRUE" = "red",
+        #   "FALSE" = "black"
+        # ),
+        # guide = "none"
+      ) +
+      scale_y_continuous(
+        expand = expansion(mult = c(0, .05))
+      ) +
+      facet_wrap(
+        ~pert_name,
+        axes = "all", axis.labels = "margins",
+        scales = "free_y"
+      ) +
+      labs(
+        x = "Slope", y = "-log10(adj. p-value)"
       )
+    tibble(p = list(p))
+  }
+)
+
+pwalk(
+  ps,
+  \(dataset, p) {
+    ggsave(
+      file.path(plot_dir, "volcano_slopes", paste0(dataset, "_volcano_slopes.pdf")),
+      p, width = 7, height = 4
     )
-    # values = c(
-    #   "TRUE" = "red",
-    #   "FALSE" = "black"
-    # ),
-    # guide = "none"
-  ) +
-  scale_y_continuous(
-    expand = expansion(mult = c(0, .05))
-  ) +
-  facet_wrap(
-    ~pert_name,
-    axes = "all", axis.labels = "margins",
-    scales = "free_y"
-  ) +
-  labs(
-    x = "Slope", y = "-log10(adj. p-value)"
-  )
-p
+  }
+)
 
 ggsave(
-  file.path(plot_dir, "volcano_slopes_v2.pdf"),
-  p, width = 7, height = 4
+  file.path(plot_dir, "volcano_slopes_v3.pdf"),
+  p, width = 7, height = 10
 )
 ```
 
@@ -1633,6 +1769,7 @@ model_res_pairwise_with_rev <- model_res_pairwise |>
   bind_rows(
     transmute(
       model_res_pairwise,
+      dataset,
       gene,
       pert_name_temp = pert_name_1,
       pert_name_1 = pert_name_2,
@@ -1785,7 +1922,7 @@ ggplotly(p, tooltip = "text")
 res_pairs_vs_single_both <- power_inner_join(
     model_res_pairwise_with_rev,
     model_slopes,
-    by = c("gene", "pert_name_1" = "pert_name"),
+    by = c("dataset", "gene", "pert_name_1" = "pert_name"),
     check = check_specs(
       unmatched_keys_left = "warn",
       unmatched_keys_right = "warn",
@@ -1795,7 +1932,7 @@ res_pairs_vs_single_both <- power_inner_join(
 ) |>
   power_inner_join(
     model_slopes,
-    by = c("gene", "pert_name_2" = "pert_name"),
+    by = c("dataset", "gene", "pert_name_2" = "pert_name"),
     check = check_specs(
       unmatched_keys_left = "warn",
       unmatched_keys_right = "warn",
@@ -1929,7 +2066,7 @@ slopes are significant, also making them gray
 res_pairs_vs_single_both <- power_inner_join(
     model_res_pairwise_with_rev,
     model_slopes,
-    by = c("gene", "pert_name_1" = "pert_name"),
+    by = c("dataset", "gene", "pert_name_1" = "pert_name"),
     check = check_specs(
       unmatched_keys_left = "warn",
       unmatched_keys_right = "warn",
@@ -1939,7 +2076,7 @@ res_pairs_vs_single_both <- power_inner_join(
 ) |>
   power_inner_join(
     model_slopes,
-    by = c("gene", "pert_name_2" = "pert_name"),
+    by = c("dataset", "gene", "pert_name_2" = "pert_name"),
     check = check_specs(
       unmatched_keys_left = "warn",
       unmatched_keys_right = "warn",
@@ -1947,6 +2084,7 @@ res_pairs_vs_single_both <- power_inner_join(
     ),
     suffix = c("_1", "_2")
   ) |>
+  drop_na(padj_1, padj_2, padj_pairwise) |>
   mutate(
     direction_pairwise_sign = if_else(
       padj_pairwise > .05,
@@ -1966,130 +2104,130 @@ res_pairs_vs_single_both <- power_inner_join(
     direction_combined = case_when(
       padj_pairwise > .05 ~ "not significant",
       padj_1 > .05 & padj_2 > .05 ~ "not significant",
+      direction_1_sign == direction_2_sign ~ "not significant",
       TRUE ~ paste(direction_1_sign, direction_2_sign, sep = " ")
     )
   )
 
-direction_combined_colors <- res_pairs_vs_single_both$direction_combined |>
-  setdiff("not significant") |>
-  unique() %>% {
-    set_names(
-      paletteer::paletteer_d("colorblindr::OkabeIto", length(.)),
-      .
-    )
-  } |>
+
+direction_combined_colors <- c(
+  "#db6d00", "#ff6db6", "#24ff24", "#0a0a0a", "#000000", "#490092"
+) |>
+  set_names(
+    setdiff(res_pairs_vs_single_both$direction_combined, "not significant")
+  ) |>
   c(
     c(
       "not significant" = "gray"
     )
   )
 
-p <- ggplot(
-  res_pairs_vs_single_both |>
-    filter(
-      pert_name_1 == "YNW-10-135",
-      pert_name_2 == "YKL-5-124"
-    ) |>
-    arrange(desc(padj_pairwise), desc(p.value_pairwise)),
-  aes(
-    x = pmax(expression.trend_shrunk_1, -.035),
-    y = expression.trend_shrunk_2
-  )
-) +
-  geom_vline(
-    xintercept = 0,
-    linetype = "dashed",
-    color = "grey50"
-  ) +
-  geom_hline(
-    yintercept = 0,
-    linetype = "dashed",
-    color = "grey50"
-  ) +
-  rasterize(geom_text(
-    aes(
-      color = direction_combined,
-      label = if_else(
-        expression.trend_shrunk_1 < -.035,
-        "◀",
-        "●"
-        # "\uf0d9",   # fa-caret-left
-        # "\uf111"    # fa-circle
-        # "caret-left",
-        # "circle"
-      ),
-      size = case_when(
-        expression.trend_shrunk_1 < -.035 ~ 4,
-        direction_combined == "not significant" ~ 4,
-        TRUE ~ 6
+ps <- group_modify(
+  group_by(res_pairs_vs_single_both, dataset),
+  \(df, key) {
+    p <- ggplot(
+      df |>
+        filter(
+          pert_name_1 == "YNW-10-135",
+          pert_name_2 == "YKL-5-124"
+        ) |>
+        mutate(
+          censored = case_when(
+            expression.trend_shrunk_1 < -.04 ~ "left",
+            expression.trend_shrunk_1 > .04 ~ "right",
+            TRUE ~ "no"
+          )
+        ) |>
+        arrange(desc(padj_pairwise), desc(p.value_pairwise)),
+      aes(
+        x = pmax(expression.trend_shrunk_1, -.04) |>
+          pmin(.04),
+        y = expression.trend_shrunk_2
       )
-      # size = if_else(
-      #   expression.trend_shrunk_1 < -.035,
-      #   4,
-      #   6
-      # )
-    ),
-    alpha = .6,
-    size.unit = "pt"
-  ), dpi = 300, dev = "ragg_png") +
-  geom_text_repel(
-    data = \(df) {
-      # browser()
-      arrange(df, padj_pairwise, p.value_pairwise) |>
-      group_by(pert_name_1, pert_name_2, direction_1, direction_2) |>
-      mutate(
-        gene_label = if_else(
-          direction_combined != "not significant" & cumsum(padj_pairwise < 0.05) <= 10,
-          # seq_len(n()) <= 10 & padj_pairwise < 0.05,
-          gene, ""
-        )
-      ) |>
-      ungroup()
-    },
-    # data = \(df) {
-    #   arrange(df, padj_pairwise, p.value_pairwise) |>
-    #     group_by(pert_name_1, pert_name_2, direction_combined) |>
-    #     filter(padj_pairwise < 0.05) |>
-    #     slice_head(n = 10) |>
-    #     ungroup() |>
-    #     mutate(
-    #       gene_label = gene
-    #     )
-    # },
-    aes(label = gene_label),
-    size = 1.5,
-    max.overlaps = Inf,
-    max.iter = 1e7,
-    seed = 42
-    # min.segment.length = 0,
-  ) +
-  scale_x_continuous(
-    expand = expansion(mult = c(.01, .01))
-  ) +
-  scale_y_continuous(
-    expand = expansion(mult = c(.05, .05))
-  ) +
-  scale_color_manual(
-    values = direction_combined_colors,
-    guide = "none"
-    # guide = guide_legend(
-    #   override.aes = list(
-    #     label = ".",
-    #     size = 10
-    #   )
-    # )
-  ) +
-  scale_size_identity() +
-  coord_equal() +
-  labs(
-    x = "AOC vs gene expression\nYNW-10-135",
-    y = "AOC vs gene expression\nYKL-5-124"
-  )
-p
+    ) +
+      geom_vline(
+        xintercept = 0,
+        linetype = "dashed",
+        color = "grey50"
+      ) +
+      geom_hline(
+        yintercept = 0,
+        linetype = "dashed",
+        color = "grey50"
+      ) +
+      rasterize(geom_text(
+        aes(
+          color = direction_combined,
+          label = recode_values(
+            censored,
+            "left" ~ "◀",
+            "right" ~ "▶",
+            "no" ~ "●"
+          ),
+          size = case_when(
+            censored %in% c("left", "right") ~ 4,
+            direction_combined == "not significant" ~ 4,
+            TRUE ~ 6
+          )
+        ),
+        alpha = .8,
+        size.unit = "pt"
+      ), dpi = 300, dev = "ragg_png") +
+      geom_text_repel(
+        data = \(df) {
+          # browser()
+          arrange(df, padj_pairwise, p.value_pairwise) |>
+          group_by(pert_name_1, pert_name_2, direction_1, direction_2) |>
+          mutate(
+            gene_label = if_else(
+              direction_combined != "not significant" & cumsum(padj_pairwise < 0.05) <= 10,
+              # seq_len(n()) <= 10 & padj_pairwise < 0.05,
+              gene, ""
+            )
+          ) |>
+          ungroup()
+        },
+        aes(label = gene_label),
+        size = 1.5,
+        max.overlaps = Inf,
+        max.iter = 5e7,
+        seed = 42
+        # min.segment.length = 0,
+      ) +
+      scale_x_continuous(
+        expand = expansion(mult = c(.01, .01))
+      ) +
+      scale_y_continuous(
+        expand = expansion(mult = c(.05, .05))
+      ) +
+      scale_color_manual(
+        values = direction_combined_colors,
+        guide = "none"
+        # guide = guide_legend(
+        #   override.aes = list(
+        #     label = ".",
+        #     size = 10
+        #   )
+        # )
+      ) +
+      scale_size_identity() +
+      coord_equal() +
+      labs(
+        x = "AOC vs gene expression\nYNW-10-135",
+        y = "AOC vs gene expression\nYKL-5-124"
+      )
+    tibble(p = list(p))
+  }
+)
 
-ggsave(
-  file.path(plot_dir, "slopes_comparison_colored_classes.pdf"),
-  p, width = 4.5, height = 4
+pwalk(
+  ps,
+  \(p, dataset) {
+    ggsave(
+      file.path(plot_dir, paste0("slopes_comparison_colored_classes_", dataset, ".pdf")),
+      p, width = 5, height = 3.5
+    )
+  }
 )
 
 library(plotly)
