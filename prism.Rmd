@@ -2538,6 +2538,156 @@ pwalk(
 )
 ```
 
+
+### FORA on compound-specific sets
+
+```{r}
+fora_input_direction_combined <- res_pairs_vs_single_both |>
+  filter(direction_combined != "not significant") |>
+  arrange(p.value_pairwise) |>
+  group_by(dataset, contrast, direction_combined) |>
+  slice_head(n = 500) |>
+  ungroup() |>
+  nest(.by = c(dataset, contrast, direction_combined))
+
+plan(multicore, workers = 11)
+fora_res_direction_combined_raw <- fora_input_direction_combined |>
+  mutate(
+    res = map(
+      data,
+      \(x) {
+        withr::with_seed(42, fora(
+          selected_gene_sets_list$gs,
+          x$gene,
+          universe = gene_universe
+        ))
+      }
+    ),
+    res_reduced = future_pmap(
+      list(res, data),
+      \(res, data) {
+        collapsePathwaysORA(
+          filter(res, padj < .05),
+          selected_gene_sets_list$gs,
+          data$gene,
+          gene_universe
+        )
+      },
+      .progress = TRUE
+    )
+  )
+
+qs_save(
+  fora_res_direction_combined_raw,
+  file.path(result_dir, "fora_res_direction_combined_raw.qs")
+)
+
+fora_res_direction_combined_long <- fora_res_direction_combined_raw |>
+  transmute(
+    dataset, contrast, direction_combined,
+    res = map2(
+      res, res_reduced,
+      \(full, reduced) {
+        mutate(
+          full,
+          is_main = pathway %in% reduced$mainPathways,
+          parent_pathway = reduced$parentPathways[pathway]
+        )
+      }
+    )
+  ) |>
+  unnest(res) |>
+  mutate(
+    direction_sign = str_extract(direction_combined, "negative|positive"),
+    signed_padj = if_else(
+      direction_sign == "negative", 1, -1
+    ) * log10(padj)
+  )
+
+write_csv(
+  fora_res_direction_combined_long,
+  file.path(result_dir, "fora_res_direction_combined_long.csv.gz")
+)
+```
+
+```{r}
+fora_res_direction_combined_top <- fora_res_direction_combined_long |>
+  filter(padj < 0.05) |>
+  arrange(padj, pval) |>
+  group_by(dataset, contrast, direction_combined) |>
+  slice_head(n = 20) |>
+  ungroup() |>
+  arrange(padj) |>
+  mutate(
+    padj_cut = cut(
+      padj,
+      breaks = c(-Inf, 0.001, 0.01, 0.05, Inf),
+      labels = c("<0.001", "<0.01", "<0.05", "ns")
+    ) |>
+      fct_rev(),
+    logEnrichment = log10(foldEnrichment) * if_else(direction_sign == "negative", -1, 1),
+    pathway_display = str_replace_all(pathway, coll("_"), " ")
+  )
+
+ps_direction_combined <- group_nest(
+  fora_res_direction_combined_top, dataset, contrast
+) |>
+  mutate(
+    p = map(
+      data,
+      \(df) {
+        abs_max_est_perc <- max(abs(quantile(df$signed_padj, c(0.025, .975))), na.rm = TRUE)
+        ggplot(
+          df |>
+            mutate(across(pathway_display, \(x) fct_reorder(x, logEnrichment))),
+          aes(
+            x = logEnrichment,
+            y = pathway_display
+          )
+        ) +
+          geom_vline(xintercept = 0, linetype = "dashed") +
+          geom_point(
+            aes(
+              fill = signed_padj,
+              size = padj_cut
+            ),
+            shape = 21,
+            color = "black"
+          ) +
+          paletteer::scale_fill_paletteer_c(
+            "ggthemes::Orange-Blue-White Diverging",
+            limits = c(-abs_max_est_perc, abs_max_est_perc),
+            oob = scales::squish
+          ) +
+          labs(
+            x = "log10(Fold Enrichment)", y = NULL,
+            fill = "log10(adj. p)",
+            size = "Adjusted p"
+          ) +
+          facet_wrap(~direction_combined, scales = "free_y") +
+          envalysis::theme_publish()
+      }
+    )
+  )
+
+dir.create(
+  file.path(plot_dir, "enrichment_direction_combined"),
+  showWarnings = FALSE, recursive = TRUE
+)
+pwalk(
+  ps_direction_combined,
+  \(dataset, contrast, p, ...) {
+    ggsave(
+      file.path(
+        plot_dir, "enrichment_direction_combined",
+        paste0(dataset, "_", contrast, "_enrichment.pdf")
+      ),
+      p, width = 14, height = 8
+    )
+  }
+)
+```
+
 ### FGSEA
 
 ```{r}
@@ -2550,7 +2700,8 @@ fgsea_input_raw <- tribble(
         direction == "negative", 1, -1
       ) * log10(p.value)
     ) |>
-    group_by(term = pert_name) |>
+    filter(is.finite(signed_p)) |>
+    group_by(dataset, term = pert_name) |>
     summarize(
       ranks = list(set_names(signed_p, gene)),
       .groups = "drop"
@@ -2561,7 +2712,8 @@ fgsea_input_raw <- tribble(
         direction == "negative", 1, -1
       ) * log10(p.value)
     ) |>
-    group_by(term = contrast) |>
+    filter(is.finite(signed_p)) |>
+    group_by(dataset, term = contrast) |>
     summarize(
       ranks = list(set_names(signed_p, gene)),
       .groups = "drop"
@@ -2615,12 +2767,13 @@ fgsea_res_raw <- fgsea_input_raw %>%
 
 qs_save(
   fgsea_res_raw,
-  file.path(result_dir, "fgsea_res_raw.qs")
+  file.path(result_dir, "fgsea_res_raw_v2.qs")
 )
 
 fgsea_res_long <- fgsea_res_raw %>%
   transmute(
-    model_type, de_type, term,
+    model_type, de_type,
+    dataset, term,
     res = map2(
       res, res_reduced,
       \(full, reduced) {
@@ -2642,7 +2795,7 @@ fgsea_res_long <- fgsea_res_raw %>%
 
 write_csv(
   fgsea_res_long,
-  file.path(result_dir, "fgsea_res_long.csv.gz")
+  file.path(result_dir, "fgsea_res_long_v2.csv.gz")
 )
 ```
 
@@ -2651,7 +2804,7 @@ write_csv(
 fgsea_res_top <- fgsea_res_long |>
   filter(padj < 0.05) |>
   arrange(padj, pval) |>
-  group_by(model_type, de_type, term, direction) |>
+  group_by(model_type, de_type, dataset, term, direction) |>
   slice_head(n = 20) |>
   ungroup() |>
   arrange(padj) |>
@@ -2667,7 +2820,7 @@ fgsea_res_top <- fgsea_res_long |>
 
 
 ps <- group_nest(
-  fgsea_res_top, model_type, term
+  fgsea_res_top, model_type, dataset, term
 ) |>
   mutate(
     p = map(
@@ -2720,9 +2873,9 @@ dir.create(
 )
 pwalk(
   ps,
-  \(term, p, model_type, ...) {
+  \(dataset, term, p, model_type, ...) {
     ggsave(
-      file.path(plot_dir, "enrichment", paste0("fgsea_", model_type, "_", term, "_enrichment.pdf")),
+      file.path(plot_dir, "enrichment", paste0("fgsea_", model_type, "_", dataset, "_", term, "_enrichment.pdf")),
       p, width = 8, height = 8
     )
   }
@@ -2769,6 +2922,7 @@ fgsea_res_long_relevant <- fgsea_res_long |>
   filter(
     model_type == "linear",
     term %in% c("YKL-5-124", "YNW-10-135"),
+    dataset == "Expression",
     !str_detect(pathway, coll("SARS")),
     !str_detect(pathway, coll("INFLUENZA")),
   )
@@ -2807,7 +2961,7 @@ p <- ggplot(
   fgsea_res_top_comp,
   aes(
     x = term,
-    y = pathway_display
+    y = fct_rev(pathway_display)
   )
 ) +
   geom_point(
@@ -2841,7 +2995,7 @@ p <- ggplot(
   theme_minimal(base_size = 10) +
   theme(
     text = element_text(color = "black"),
-    axis.text.x = element_text(angle = 45, hjust = 0, vjust = 0),
+    axis.text.x = element_text(angle = 90),
     panel.grid.major.x = element_blank(),
     # axis.line.x = element_blank(),
     axis.text.y = element_text(
