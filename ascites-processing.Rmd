@@ -29,6 +29,9 @@ library(openxlsx)
 library(readxl)
 library(DESeq2)
 library(ggrepel)
+library(ComplexHeatmap)
+library(chelpers)
+library(seriation)
 
 conflicts_prefer(
   dplyr::filter,
@@ -38,30 +41,93 @@ conflicts_prefer(
   base::setdiff,
   SummarizedExperiment::rowRanges,
   dplyr::count,
-  dplyr::slice
+  dplyr::slice,
+  purrr::reduce,
+  generics::as.factor
 )
 
 synapser::synLogin()
 syn <- synDownloader("~/data", .cache = TRUE)
 
 dir.create(
-  here("ascites")
+  here("ascites"),
+  showWarnings = FALSE
 )
 ```
 
 Only "Vehicle" and "YKL" treated mice sequenced for this analysis.
 
 ```{r load-data}
-counts_raw <- syn("syn72382163") |>
-  read_tsv()
+counts_raw <- c(
+  X2QY7B = "syn72382163",
+  F3XVCY = "syn75824014"
+) |>
+  map(syn) |>
+  map(read_tsv)
 
-meta_raw <- syn("syn72382224") |>
-  read_excel(
-    sheet = "Priority",
-    skip = 1L, na = c("", "NA", "N/A")
+bridge_sample_ids <- c(3, 15, 18, 32)
+
+meta_raw <- list(
+  X2QY7B = syn("syn72382224") |>
+    read_excel(
+      sheet = "Priority",
+      skip = 1L, na = c("", "NA", "N/A")
+    ) |>
+    select(-Sample...9) |>
+    rename(Sample = `Sample...1`) |>
+    mutate(
+      experiment_batch = "X2QY7B",
+      across(Sample, as.character),
+      sample_id_seq = seq_len(n()),
+      bridge_sample = as.integer(Sample) %in% bridge_sample_ids
+    ),
+  F3XVCY = syn("syn75824024") |>
+    read_csv() |>
+    filter(Sample != "BRIDGE SAMPLES") |>
+    drop_na(Sample) |>
+    mutate(
+      bridge_sample = as.integer(Sample) %in% bridge_sample_ids,
+      experiment_batch = if_else(
+        bridge_sample,
+        "X2QY7B",
+        "F3XVCY"
+      ),
+      sample_id_seq = seq_len(n())
+    )
+)
+
+meta_raw_combined <- bind_rows(
+  meta_raw,
+  .id = "sequencing_batch"
+) |>
+  mutate(
+    sample_id_unique = paste0(sequencing_batch, "_", sample_id_seq)
   )
 
+View(meta_raw_combined)
+
+write_csv(
+  meta_raw_combined,
+  here("ascites", "metadata_combined.csv")
+)
+```
+
+Sample ids for F3XVCY go from 58-87, remapping from 1-34
+
+```{r}
 counts_long <- counts_raw |>
+  reduce(
+    \(left, right) power_full_join(
+      left, right,
+      by = c("gene_id", "gene_name", "gene_biotype"),
+      check = check_specs(
+        unmatched_keys_left = "warn",
+        unmatched_keys_right = "warn",
+        duplicate_keys_left = "warn",
+        duplicate_keys_right = "warn"
+      )
+    )
+  ) |>
   pivot_longer(
     cols = -c(gene_id, gene_name, gene_biotype),
     names_to = "sample_id",
@@ -70,7 +136,7 @@ counts_long <- counts_raw |>
   separate_wider_delim(
     sample_id,
     delim = "_",
-    names = c("experiment_id", "sample_id", "count_type")
+    names = c("sequencing_batch", "sample_id_seq", "count_type")
   ) |>
   mutate(
     species = case_match(
@@ -78,6 +144,16 @@ counts_long <- counts_raw |>
       "ENSM" ~ "mouse",
       "ENSG" ~ "human",
       .default = NA_character_
+    ),
+    across(sample_id_seq, as.integer)
+  ) |>
+  power_inner_join(
+    select(meta_raw_combined, sequencing_batch, sample_id_seq, sample_id = Sample, sample_id_unique, bridge_sample),
+    by = c("sequencing_batch", "sample_id_seq"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
     )
   )
 
@@ -88,23 +164,21 @@ gene_name_map <- counts_long |>
 Remove sample 1, not part of the relevant samples.
 
 ```{r}
-meta <- meta_raw |>
-  select(-Sample...9) |>
-  rename(Sample = `Sample...1`) |>
+meta <- meta_raw_combined |>
   filter(
     Group %in% c("Vehicle", "YKL"),
     Sample != 1
   ) |>
   mutate(
-    timepoint_binary = if_else(
-      Timepoint == 0,
-      "initial",
-      "24h"
+    timepoint_factor = recode_values(
+      Timepoint,
+      0 ~ "initial",
+      24 ~ "24h",
+      120 ~ "120h",
     ) |>
       fct_relevel("initial"),
-    across(Treatment, \(x) replace_na(x, "None")),
-    across(Mouse, \(x) as.factor(as.character(x))),
-    across(Treatment, \(x) fct_relevel(x, "DMSO"))
+    across(Treatment, \(x) replace_na(x, "None") |> fct_relevel("DMSO")),
+    across(c(Mouse, sequencing_batch, experiment_batch), \(x) as.factor(as.character(x)))
   )
 
 counts_df <- counts_long |>
@@ -120,14 +194,18 @@ counts_df <- counts_long |>
 p <- ggplot(
   counts_df |>
     drop_na(species) |>
-    group_by(sample_id, species) |>
-    summarise(total_counts = sum(count)),
+    group_by(sequencing_batch, sample_id, species) |>
+    summarise(total_counts = sum(count), .groups = "drop"),
   aes(x = sample_id, y = total_counts, fill = species)
 ) +
   geom_col(position = "dodge") +
   scale_y_log10(
     expand = expansion(mult = c(0, .05)),
     n.breaks = 8
+  ) +
+  facet_wrap(
+    ~sequencing_batch,
+    scales = "free_x"
   ) +
   labs(
     x = "Sample", y = "Total counts"
@@ -136,7 +214,7 @@ p <- ggplot(
 
 ggsave(
   here("ascites", "total_counts_per_sample.pdf"),
-  p, width = 8, height = 4
+  p, width = 12, height = 4
 )
 
 p
@@ -164,9 +242,9 @@ genes_for_de <- counts_df |>
 
 count_mat <- counts_df |>
   filter(gene_id %in% genes_for_de) |>
-  select(gene_id, sample_id, count) |>
+  select(gene_id, sample_id_unique, count) |>
   pivot_wider(
-    names_from = sample_id,
+    names_from = sample_id_unique,
     values_from = count,
     values_fill = 0
   ) |>
@@ -183,31 +261,61 @@ meta_deseq <- meta |>
     # Code mice as 1, 2, ... within each group for nested design
     Mouse_nested = factor(as.integer(factor(Mouse)))
   ) |>
-  ungroup()
+  ungroup() |>
+  select(
+    sample_id_unique,
+    sequencing_batch,
+    experiment_batch,
+    Group,
+    Mouse_nested,
+    Treatment,
+    timepoint_factor
+  )
 
 mm <- model.matrix(
-  ~Group / Mouse_nested + Treatment:Group,
+  ~(Group / Mouse_nested) + (Treatment:Group:timepoint_factor),
   data = meta_deseq
 )
+
 # remove zero columns
 mm <- mm[, colSums(mm) != 0]
 
+qr(mm)$rank
+ncol(mm)
+
 de <- DESeqDataSetFromMatrix(
-  round(count_mat[, as.character(meta_deseq$Sample)]),
+  round(count_mat[, as.character(meta_deseq$sample_id_unique)]),
   colData = meta_deseq |>
-    column_to_rownames("Sample"),
+    column_to_rownames("sample_id_unique"),
   design = mm
 ) |>
   DESeq()
 ```
 
+Getting rank deficient model matrix, trying instead to process two experiments
+separately. Making VST counts with simplified model matrix.
+
+
+
 ### Normalized counts
 
 ```{r}
+de_combined_simple <- DESeqDataSetFromMatrix(
+  round(count_mat[, as.character(meta_deseq$sample_id_unique)]),
+  colData = meta_deseq |>
+    column_to_rownames("sample_id_unique"),
+  design = ~1
+) |>
+  estimateSizeFactors() |>
+  estimateDispersions()
+
+```
+
+```{r}
 all_counts <- list(
-  raw = counts(de, normalized = FALSE),
-  normalized = counts(de, normalized = TRUE),
-  vst = assay(vst(de, blind = TRUE))
+  raw = counts(de_combined_simple, normalized = FALSE),
+  normalized = counts(de_combined_simple, normalized = TRUE),
+  vst = assay(vst(de_combined_simple, blind = TRUE))
 ) |>
   map(\(x) as_tibble(x, rownames = "gene_id")) |>
   bind_rows(.id = "count_type")
@@ -217,6 +325,56 @@ write_csv(
   here("ascites", "all_counts.csv.gz")
 )
 ```
+
+```{r}
+des <- meta |>
+  filter(
+    Treatment != "None",
+    sequencing_batch == experiment_batch
+  ) |>
+  group_by(Group) |>
+  mutate(
+    # Code mice as 1, 2, ... within each group for nested design
+    Mouse_nested = factor(as.integer(factor(Mouse)))
+  ) |>
+  ungroup() |>
+  select(
+    sample_id_unique,
+    sequencing_batch,
+    experiment_batch,
+    Group,
+    Mouse_nested,
+    Treatment,
+    timepoint_factor
+  ) |>
+  group_nest(experiment_batch, timepoint_factor) |>
+  mutate(
+    mm = map(
+      data,
+      \(df) {
+        mm <- model.matrix(
+          ~(Group / Mouse_nested) + (Treatment:Group),
+          data = df
+        )
+        # remove zero columns
+        mm <- mm[, colSums(mm) != 0]
+        mm
+      }
+    ),
+    de = map2(
+      data, mm,
+      \(df, mm) DESeqDataSetFromMatrix(
+        round(count_mat[, df$sample_id_unique]),
+        colData = df |>
+          column_to_rownames("sample_id_unique"),
+        design = mm
+      ) |>
+        DESeq()
+    )
+  )
+```
+
+
 
 ### Extract DESeq2 results
 
@@ -241,72 +399,53 @@ extract_deseq_result <- function(de, contrast, name, res_args = list(), shrink_a
     )
 }
 
-de_res <- setdiff(
-  resultsNames(de),
-  "Intercept"
-) |>
-  str_subset("Group.*\\.Treatment.*") |>
-  set_names() |>
-  map(
-    \(name) extract_deseq_result(de, name = name)
-  ) |>
-  bind_rows(.id = "comparison") |>
-  separate_wider_regex(
-    comparison,
-    patterns = c(
-      "Group", mouse_treatment = "[A-Za-z]+",
-      "\\.Treatment", treatment = ".*"
-    )
-  ) |>
-  mutate(
-    across(
-      treatment,
-      \(x) recode(
-        x,
-        `RP.6306` = "RP-6306",
-        `YKL.Tala` = "YKL+Tala"
-      )
-    ),
-    comparison = paste0("Mouse ", mouse_treatment, " - ", treatment)
-  ) |>
-  # Add main comparison Mouse YKL vs Mouse Vehicle
-  bind_rows(
-    extract_deseq_result(
-      de, name = "GroupYKL"
-    ) |>
-     mutate(
-      comparison = "Mouse YKL vs Mouse Vehicle"
-     )
-  ) |>
-  power_left_join(
-    gene_name_map,
-    by = "gene_id",
-    check = check_specs(
-      unmatched_keys_left = "warn",
-      duplicate_keys_right = "warn"
-    )
-  ) |>
-  select(comparison, mouse_treatment, treatment, gene_id, gene_name, gene_biotype, species, everything())
-
-de_res_between_groups <- meta$Treatment |>
-  setdiff(c("DMSO", "None")) |>
-  set_names() |>
-  map(
-    \(treatment) {
-      treatment_san <- str_replace_all(treatment, "[^A-Za-z0-9]", ".")
-      extract_deseq_result(
-        de,
-        contrast = list(
-          paste0("GroupYKL.Treatment", treatment_san),
-          paste0("GroupVehicle.Treatment", treatment_san)
+de_res <- transmute(
+  des,
+  experiment_batch, timepoint_factor, de,
+  comparisons = map(
+    de,
+    \(de) {
+      setdiff(
+        resultsNames(de),
+        "Intercept"
+      ) |>
+        str_subset("Group.*\\.Treatment.*") |>
+        enframe(value = "covariate") |>
+        select(-name) |>
+        separate_wider_regex(
+          covariate,
+          patterns = c(
+            "Group", mouse_treatment = "[A-Za-z]+",
+            "\\.Treatment", treatment = ".*"
+          ),
+          cols_remove = FALSE
+        ) |>
+        mutate(
+          across(
+            treatment,
+            \(x) recode(
+              x,
+              `RP.6306` = "RP-6306",
+              `YKL.Tala` = "YKL+Tala"
+            )
+          ),
+          comparison = paste0("Mouse ", mouse_treatment, " - ", treatment)
         )
-      )
     }
-  ) |>
-  bind_rows(.id = "treatment") |>
+  )
+) |>
+  unnest(comparisons) |>
   mutate(
-    comparison = paste0("YKL vs Vehicle - ", treatment)
+    de_res = map2(
+      de, covariate,
+      \(de, covariate) extract_deseq_result(
+        de,
+        name = covariate
+      )
+    )
   ) |>
+  select(experiment_batch, timepoint_factor, comparison, mouse_treatment, treatment, de_res) |>
+  unnest(de_res) |>
   power_left_join(
     gene_name_map,
     by = "gene_id",
@@ -315,7 +454,48 @@ de_res_between_groups <- meta$Treatment |>
       duplicate_keys_right = "warn"
     )
   ) |>
-  select(comparison, treatment, gene_id, gene_name, gene_biotype, species, everything())
+  select(experiment_batch, timepoint_factor, comparison, mouse_treatment, treatment, gene_id, gene_name, gene_biotype, species, everything())
+
+de_res_between_groups <- transmute(
+  des,
+  experiment_batch, timepoint_factor, de,
+  res = map(
+    de,
+    \(de) {
+      meta$Treatment |>
+        setdiff(c("DMSO", "None")) |>
+        set_names() |>
+        map(
+          \(treatment) {
+            treatment_san <- str_replace_all(treatment, "[^A-Za-z0-9]", ".")
+            extract_deseq_result(
+              de,
+              contrast = list(
+                paste0("GroupYKL.Treatment", treatment_san),
+                paste0("GroupVehicle.Treatment", treatment_san)
+              )
+            )
+          }
+        ) |>
+        bind_rows(.id = "treatment") |>
+        mutate(
+          comparison = paste0("YKL vs Vehicle - ", treatment)
+        ) |>
+        select(comparison, treatment, gene_id, everything())
+    }
+  )
+) |>
+  select(experiment_batch, timepoint_factor, res) |>
+  unnest(res) |>
+  power_left_join(
+    gene_name_map,
+    by = "gene_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) |>
+  select(experiment_batch, timepoint_factor, comparison, treatment, gene_id, gene_name, gene_biotype, species, everything())
 ```
 
 
@@ -410,13 +590,15 @@ ggsave(
 ## PCA plots
 
 ```{r}
-pca_raw <- all_counts |>
+vst_count_mat <- all_counts |>
   filter(
     count_type == "vst"
   ) |>
   select(-count_type) |>
   column_to_rownames("gene_id") |>
-  as.matrix() |>
+  as.matrix()
+
+pca_raw <- vst_count_mat |>
   t() |>
   prcomp()
 
@@ -427,23 +609,17 @@ pc_sd_map <- with(
   set_names(percent, paste0("PC", PC))
 )
 
-pca_x <- as_tibble(pca_raw$x, rownames = "sample_id") |>
-  mutate(
-    across(sample_id, as.integer)
-  ) |>
+pca_x <- as_tibble(pca_raw$x, rownames = "sample_id_unique") |>
   power_inner_join(
     meta,
-    by = c("sample_id" = "Sample"),
+    by = c("sample_id_unique"),
     check = check_specs(
       unmatched_keys_left = "warn",
       duplicate_keys_right = "warn"
     )
   )
 
-pca_x_long <- as_tibble(pca_raw$x, rownames = "sample_id") |>
-  mutate(
-    across(sample_id, as.integer)
-  ) |>
+pca_x_long <- as_tibble(pca_raw$x, rownames = "sample_id_unique") |>
   pivot_longer(
     cols = starts_with("PC"),
     names_to = "component",
@@ -466,7 +642,7 @@ pca_x_vs <- combn(paste0("PC", seq_len(6)), 2) |>
   ) |>
   power_inner_join(
     pca_x_long,
-    by = c("component_2" = "component", "sample_id"),
+    by = c("component_2" = "component", "sample_id_unique"),
     check = check_specs(
       unmatched_keys_left = "warn",
       duplicate_keys_right = "warn"
@@ -475,7 +651,7 @@ pca_x_vs <- combn(paste0("PC", seq_len(6)), 2) |>
   ) |>
   power_inner_join(
     meta,
-    by = c("sample_id" = "Sample"),
+    by = c("sample_id_unique"),
     check = check_specs(
       unmatched_keys_left = "warn",
       duplicate_keys_right = "warn"
@@ -488,10 +664,14 @@ p <- ggplot(
     x = value_1,
     y = value_2,
     color = Treatment,
-    shape = Group
+    shape = Group,
+    size = timepoint_factor
   )
 ) +
   geom_point(alpha = 0.8) +
+  scale_size_manual(
+    values = c("initial" = 1, "24h" = 2, "120h" = 4)
+  ) +
   ggokabeito::scale_color_okabe_ito() +
   # paletteer::scale_color_paletteer_d(
   #   "ggthemes::Tableau_10",
@@ -514,6 +694,42 @@ ggsave(
 
 p
 ```
+
+## Clustering
+
+```{r}
+cluster_fun <- \(mat) {
+  dist_mat <- dist(mat)
+  clust <- hclust(dist_mat, method = "ward.D2")
+  reorder(clust, dist_mat, method = "OLO")
+}
+
+vst_cor_mat <- cor(vst_count_mat)
+
+hm <- Heatmap(
+  vst_cor_mat[meta_deseq$sample_id_unique, meta_deseq$sample_id_unique],
+  name = "Correlation",
+  show_row_names = TRUE,
+  show_column_names = FALSE,
+  cluster_rows = cluster_fun,
+  cluster_columns = cluster_fun,
+  top_annotation = create_heatmap_annotation(
+    select(
+      meta_deseq,
+      sample_id_unique, Group, Treatment, timepoint_factor, sequencing_batch
+    ) |>
+      column_to_rownames("sample_id_unique") |>
+      as.data.frame(),
+    colors = list(
+      Treatment = \(n) paletteer::paletteer_d(
+        "ggthemes::Tableau_10", n
+      )
+    )
+  )
+)
+hm
+```
+
 
 ## Mouse YKL vs Vehicle plots
 
